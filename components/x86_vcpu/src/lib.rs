@@ -29,6 +29,7 @@ compile_error!("features `vmx` and `svm` are mutually exclusive");
 #[cfg(test)]
 mod test_utils;
 
+mod boot_mode;
 pub(crate) mod msr;
 #[cfg(feature = "vmx")]
 #[macro_use]
@@ -38,6 +39,8 @@ mod ept;
 pub(crate) mod regs;
 #[cfg(any(feature = "vmx", feature = "svm"))]
 pub(crate) mod xstate;
+
+pub use boot_mode::{X86BootMode, X86VCpuSetupConfig};
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "vmx")] {

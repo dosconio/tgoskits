@@ -83,6 +83,9 @@ pub fn get_vm_config_template(params: VmTemplateParams) -> AxVMCrateConfig {
             disk_path: None,         // No disk image by default
             memory_regions: vec![],  // Memory regions to be defined per architecture
             configured_memory_region_count: 0,
+            boot_mode: Default::default(), // Default to trampoline boot
+            pflash0: None,                 // No pflash by default
+            pflash1: None,                 // No pflash by default
         },
         // Device configuration - starts empty, can be customized
         devices: VMDevicesConfig {

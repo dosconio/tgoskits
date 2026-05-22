@@ -316,6 +316,9 @@ fn test_default_implementations() {
     assert!(vm_kernel_config.cmdline.is_none());
     assert!(vm_kernel_config.disk_path.is_none());
     assert!(vm_kernel_config.memory_regions.is_empty());
+    assert_eq!(vm_kernel_config.boot_mode, crate::VMBootMode::Trampoline);
+    assert!(vm_kernel_config.pflash0.is_none());
+    assert!(vm_kernel_config.pflash1.is_none());
 
     let vm_devices_config = VMDevicesConfig::default();
     assert!(vm_devices_config.emu_devices.is_empty());

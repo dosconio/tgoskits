@@ -48,8 +48,14 @@ use super::{
     },
 };
 use crate::{
-    ept::GuestPageWalkInfo, msr::Msr, regs::GeneralRegisters, restore_host_interrupt_flag,
+    boot_mode::{X86BootMode, X86VCpuSetupConfig},
+    
+    ept::GuestPageWalkInfo,
+    msr::Msr,
+    regs::GeneralRegisters,
+    restore_host_interrupt_flag,
     xstate::XState,
+,
 };
 
 const VMX_PREEMPTION_TIMER_SET_VALUE: u32 = 1_000_000;
@@ -144,8 +150,13 @@ impl VmxVcpu {
     }
 
     /// Set the new [`VmxVcpu`] context from guest OS.
-    pub fn setup(&mut self, ept_root: HostPhysAddr, entry: GuestPhysAddr) -> AxResult {
-        self.setup_vmcs(entry, ept_root)?;
+    pub fn setup(
+        &mut self,
+        ept_root: HostPhysAddr,
+        entry: GuestPhysAddr,
+        boot_mode: X86BootMode,
+    ) -> AxResult {
+        self.setup_vmcs(entry, ept_root, boot_mode)?;
         Ok(())
     }
 
@@ -453,14 +464,19 @@ impl VmxVcpu {
         Ok(())
     }
 
-    fn setup_vmcs(&mut self, entry: GuestPhysAddr, ept_root: HostPhysAddr) -> AxResult {
+    fn setup_vmcs(
+        &mut self,
+        entry: GuestPhysAddr,
+        ept_root: HostPhysAddr,
+        boot_mode: X86BootMode,
+    ) -> AxResult {
         let paddr = self.vmcs.phys_addr().as_usize() as u64;
         unsafe {
             vmx::vmclear(paddr).map_err(as_axerr)?;
         }
         self.bind_to_current_processor()?;
         self.setup_msr_bitmap()?;
-        self.setup_vmcs_guest(entry)?;
+        self.setup_vmcs_guest(entry, boot_mode)?;
         self.setup_vmcs_control(ept_root, true)?;
         self.unbind_from_current_processor()?;
         Ok(())
@@ -503,7 +519,7 @@ impl VmxVcpu {
         Ok(())
     }
 
-    fn setup_vmcs_guest(&mut self, entry: GuestPhysAddr) -> AxResult {
+    fn setup_vmcs_guest(&mut self, entry: GuestPhysAddr, boot_mode: X86BootMode) -> AxResult {
         let cr0_val: Cr0Flags =
             Cr0Flags::NOT_WRITE_THROUGH | Cr0Flags::CACHE_DISABLE | Cr0Flags::EXTENSION_TYPE;
         self.set_cr(0, cr0_val.bits());
@@ -523,6 +539,9 @@ impl VmxVcpu {
             }};
         }
 
+        // Both trampoline and UEFI modes start in real mode.
+        // UEFI mode starts at the x86 reset vector (0xFFFFFFF0);
+        // OVMF firmware handles the mode transitions itself.
         set_guest_segment!(ES, 0x93); // 16-bit, present, data, read/write, accessed
         set_guest_segment!(CS, 0x9b); // 16-bit, present, code, exec/read, accessed
         set_guest_segment!(SS, 0x93);
@@ -531,6 +550,13 @@ impl VmxVcpu {
         set_guest_segment!(GS, 0x93);
         set_guest_segment!(TR, 0x8b); // present, system, 32-bit TSS busy
         set_guest_segment!(LDTR, 0x82); // present, system, LDT
+
+        // In UEFI mode, the reset vector is at 0xFFFFFFF0 which is near the top
+        // of the 4GB address space. CS base must be set to 0xFFFF0000 so that
+        // the linear address (CS_base + IP) = 0xFFFF0000 + 0xFFF0 = 0xFFFFFFF0.
+        if boot_mode == X86BootMode::Uefi {
+            VmcsGuestNW::CS_BASE.write(0xFFFF0000)?;
+        }
 
         VmcsGuestNW::GDTR_BASE.write(0)?;
         VmcsGuest32::GDTR_LIMIT.write(0xffff)?;
@@ -1188,7 +1214,7 @@ impl Debug for VmxVcpu {
 impl AxArchVCpu for VmxVcpu {
     type CreateConfig = ();
 
-    type SetupConfig = ();
+    type SetupConfig = X86VCpuSetupConfig;
 
     fn new(vm_id: VMId, vcpu_id: VCpuId, _config: Self::CreateConfig) -> AxResult<Self> {
         Self::new(vm_id, vcpu_id)
@@ -1204,8 +1230,12 @@ impl AxArchVCpu for VmxVcpu {
         Ok(())
     }
 
-    fn setup(&mut self, _config: Self::SetupConfig) -> AxResult {
-        self.setup_vmcs(self.entry.unwrap(), self.ept_root.unwrap())
+    fn setup(&mut self, config: Self::SetupConfig) -> AxResult {
+        self.setup_vmcs(
+            self.entry.unwrap(),
+            self.ept_root.unwrap(),
+            config.boot_mode,
+        )
     }
 
     fn run(&mut self) -> AxResult<AxVCpuExitReason> {

@@ -17,6 +17,7 @@ use axaddrspace::GuestPhysAddr;
 
 use axvm::VMMemoryRegion;
 use axvm::config::AxVMCrateConfig;
+use axvm::config::VMBootMode;
 use byte_unit::Byte;
 
 use crate::hal::CacheOp;
@@ -61,6 +62,8 @@ pub struct ImageLoader {
     kernel_load_gpa: GuestPhysAddr,
     bios_load_gpa: Option<GuestPhysAddr>,
     dtb_load_gpa: Option<GuestPhysAddr>,
+    pflash0_load_gpa: Option<GuestPhysAddr>,
+    pflash1_load_gpa: Option<GuestPhysAddr>,
 }
 
 impl ImageLoader {
@@ -72,6 +75,8 @@ impl ImageLoader {
             kernel_load_gpa: GuestPhysAddr::default(),
             bios_load_gpa: None,
             dtb_load_gpa: None,
+            pflash0_load_gpa: None,
+            pflash1_load_gpa: None,
         }
     }
 
@@ -88,15 +93,20 @@ impl ImageLoader {
             self.kernel_load_gpa = config.image_config.kernel_load_gpa;
             self.dtb_load_gpa = config.image_config.dtb_load_gpa;
             self.bios_load_gpa = config.image_config.bios_load_gpa;
+            self.pflash0_load_gpa = config.image_config.pflash0_load_gpa;
+            self.pflash1_load_gpa = config.image_config.pflash1_load_gpa;
         });
 
-        match self.config.kernel.image_location.as_deref() {
-            Some("memory") => self.load_vm_images_from_memory(),
-            #[cfg(feature = "fs")]
-            Some("fs") => fs::load_vm_images_from_filesystem(self),
-            _ => unimplemented!(
-                "Check your \"image_location\" in config.toml, \"memory\" and \"fs\" are supported,\n NOTE: \"fs\" feature should be enabled if you want to load images from filesystem. (APP_FEATURES=fs)"
-            ),
+        match self.config.kernel.boot_mode {
+            VMBootMode::Trampoline => match self.config.kernel.image_location.as_deref() {
+                Some("memory") => self.load_vm_images_from_memory(),
+                #[cfg(feature = "fs")]
+                Some("fs") => fs::load_vm_images_from_filesystem(self),
+                _ => unimplemented!(
+                    "Check your \"image_location\" in config.toml, \"memory\" and \"fs\" are supported,\n NOTE: \"fs\" feature should be enabled if you want to load images from filesystem. (APP_FEATURES=fs)"
+                ),
+            },
+            VMBootMode::Uefi => self.load_vm_images_uefi(),
         }
     }
 
@@ -243,6 +253,112 @@ impl ImageLoader {
             load_gpa.as_usize()
         );
         load_vm_image_from_memory(ramdisk, load_gpa, self.vm.clone())
+    }
+
+    /// Load VM images for UEFI boot mode.
+    ///
+    /// Loads OVMF_CODE and OVMF_VARS as pflash regions, then optionally loads
+    /// the kernel and ramdisk. The reset vector mapping at 0xFFFFFFF0 is handled
+    /// by EPT setup elsewhere (the pflash0 region must include the firmware image
+    /// whose last 16 bytes contain the reset vector jump instruction).
+    fn load_vm_images_uefi(&self) -> AxResult {
+        info!("Loading VM[{}] images in UEFI mode", self.config.base.id);
+
+        // Load OVMF_CODE (pflash0) — read-only firmware code
+        if let (Some(pflash0_path), Some(pflash0_gpa)) =
+            (&self.config.kernel.pflash0, self.pflash0_load_gpa)
+        {
+            info!(
+                "Loading pflash0 (OVMF_CODE) from {} into GPA @{:#x}",
+                pflash0_path.path,
+                pflash0_gpa.as_usize()
+            );
+            #[cfg(feature = "fs")]
+            {
+                fs::load_vm_image(&pflash0_path.path, pflash0_gpa, self.vm.clone())?;
+            }
+            #[cfg(not(feature = "fs"))]
+            {
+                let _ = (pflash0_path, pflash0_gpa);
+                return Err(ax_errno::ax_err_type!(
+                    Unsupported,
+                    "UEFI boot requires fs feature for loading OVMF images"
+                ));
+            }
+        } else {
+            return Err(ax_errno::ax_err_type!(
+                InvalidInput,
+                "UEFI boot mode requires pflash0 (OVMF_CODE) configuration"
+            ));
+        }
+
+        // Load OVMF_VARS (pflash1) — read-write UEFI variable store
+        if let (Some(pflash1_path), Some(pflash1_gpa)) =
+            (&self.config.kernel.pflash1, self.pflash1_load_gpa)
+        {
+            info!(
+                "Loading pflash1 (OVMF_VARS) from {} into GPA @{:#x}",
+                pflash1_path.path,
+                pflash1_gpa.as_usize()
+            );
+            #[cfg(feature = "fs")]
+            {
+                fs::load_vm_image(&pflash1_path.path, pflash1_gpa, self.vm.clone())?;
+            }
+            #[cfg(not(feature = "fs"))]
+            {
+                let _ = (pflash1_path, pflash1_gpa);
+            }
+        } else {
+            warn!(
+                "UEFI boot mode: pflash1 (OVMF_VARS) not configured, OVMF may use default variables"
+            );
+        }
+
+        // Load kernel image (optional in UEFI mode — OVMF can load from disk)
+        if !self.config.kernel.kernel_path.is_empty() {
+            match self.config.kernel.image_location.as_deref() {
+                Some("memory") => {
+                    let vm_imags = config::get_memory_images()
+                        .iter()
+                        .find(|&v| v.id == self.config.base.id)
+                        .expect("VM images is missed");
+                    if !vm_imags.kernel.is_empty() {
+                        load_vm_image_from_memory(
+                            vm_imags.kernel,
+                            self.kernel_load_gpa,
+                            self.vm.clone(),
+                        )?;
+                    }
+                }
+                #[cfg(feature = "fs")]
+                Some("fs") => {
+                    fs::load_vm_image(
+                        &self.config.kernel.kernel_path,
+                        self.kernel_load_gpa,
+                        self.vm.clone(),
+                    )?;
+                }
+                _ => {}
+            }
+        }
+
+        // Load ramdisk if provided
+        if let Some(ramdisk_path) = &self.config.kernel.ramdisk_path {
+            #[cfg(feature = "fs")]
+            {
+                self.load_ramdisk_from_filesystem(ramdisk_path)?;
+            }
+            #[cfg(not(feature = "fs"))]
+            {
+                let _ = ramdisk_path;
+            }
+        }
+
+        // TODO (Phase 2): Create fw_cfg device and inject boot info
+        // TODO (Phase 2): Generate ACPI tables and write to guest memory
+
+        Ok(())
     }
 
     #[cfg(feature = "fs")]

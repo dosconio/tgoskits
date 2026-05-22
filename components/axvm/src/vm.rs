@@ -356,7 +356,16 @@ impl AxVM {
                     passthrough_timer: passthrough,
                 }
             };
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(target_arch = "x86_64")]
+            let setup_config = {
+                use axvmconfig::VMBootMode;
+                let boot_mode = match inner_mut.config.boot_mode() {
+                    VMBootMode::Trampoline => x86_vcpu::X86BootMode::Trampoline,
+                    VMBootMode::Uefi => x86_vcpu::X86BootMode::Uefi,
+                };
+                crate::vcpu::AxVCpuSetupConfig { boot_mode }
+            };
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
             #[allow(clippy::let_unit_value)]
             let setup_config = <AxArchVCpuImpl as axvcpu::AxArchVCpu>::SetupConfig::default();
 

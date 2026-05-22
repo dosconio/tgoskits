@@ -22,7 +22,7 @@ use super::{
     structs::{IOPm, MSRPm, VmcbFrame},
     vmcb::{InterceptCrRw, InterceptExceptions, NestedCtl, VmcbTlbControl, set_vmcb_segment},
 };
-use crate::{msr::Msr, regs::GeneralRegisters, restore_host_interrupt_flag, xstate::XState};
+use crate::{boot_mode::X86VCpuSetupConfig, msr::Msr, regs::GeneralRegisters, restore_host_interrupt_flag, xstate::XState};
 
 const QEMU_EXIT_PORT: u16 = 0x604;
 const QEMU_EXIT_MAGIC: u64 = 0x2000;
@@ -741,7 +741,7 @@ impl Debug for SvmVcpu {
 
 impl AxArchVCpu for SvmVcpu {
     type CreateConfig = ();
-    type SetupConfig = ();
+    type SetupConfig = X86VCpuSetupConfig;
 
     fn new(vm_id: VMId, vcpu_id: VCpuId, _config: Self::CreateConfig) -> AxResult<Self> {
         Self::create(vm_id, vcpu_id)

@@ -1,0 +1,66 @@
+# UEFI VM configuration for x86_64 QEMU
+# This configuration tests UEFI boot mode with OVMF firmware.
+#
+# Prerequisites:
+# - OVMF_CODE.fd and OVMF_VARS.fd must be available on the host
+#   On Ubuntu/Debian: sudo apt install ovmf
+#   Default path: /usr/share/OVMF/OVMF_CODE.fd and OVMF_VARS.fd
+#
+# Note: This is a Stage 1 verification config. Full UEFI boot requires
+# Stage 2 (fw_cfg, ACPI tables) and Stage 3 (PCI/virtio devices).
+# OVMF will likely hang waiting for these devices.
+
+[base]
+id = 1
+name = "uefi-vm"
+vm_type = 1
+cpu_num = 1
+phys_cpu_sets = [1]
+
+[kernel]
+# Entry point is ignored in UEFI mode; BSP starts at 0xFFFFFFF0 (reset vector)
+entry_point = 0x10000000
+image_location = "fs"
+# Kernel path is empty - OVMF will load kernel from disk (e.g., EFI partition)
+kernel_path = ""
+kernel_load_addr = 0x10000000
+
+# UEFI boot mode - uses OVMF firmware instead of axvm-bios
+boot_mode = "uefi"
+
+# Memory regions with format (`base_paddr`, `size`, `flags`, `map_type`).
+# For `map_type`, 0 means `MAP_ALLOC`, 1 means `MAP_IDENTICAL`, 2 means `MAP_RESERVED`.
+# Memory layout:
+# 0x0000_0000 - 0x00FF_FFFF: Low RAM (16 MiB) for OVMF scratch space
+# 0x1000_0000 - 0x101F_FFFF: pflash0 (OVMF_CODE) - 2 MiB (actual OVMF size)
+# 0x1020_0000 - 0x103F_FFFF: pflash1 (OVMF_VARS) - 2 MiB
+memory_regions = [
+  [0x0000_0000, 0x100_0000, 0x7, 0],   # Low RAM 16 MiB R|W|X
+  [0x1000_0000, 0x20_0000, 0x5, 0],    # pflash0 (OVMF_CODE) 2 MiB R|X
+  [0x1020_0000, 0x20_0000, 0x3, 0],    # pflash1 (OVMF_VARS) 2 MiB R|W
+]
+
+# OVMF_CODE (pflash0) - Read-only firmware code
+# OVMF images are typically 2 MiB (OVMF_CODE.fd) or 4 MiB (OVMF_CODE_4M.fd)
+pflash0 = { path = "/guest/ovmf/OVMF_CODE.fd", base_gpa = 0x10000000, size = 0x200000, read_only = true }
+
+# OVMF_VARS (pflash1) - Read-write UEFI variable store
+pflash1 = { path = "/guest/ovmf/OVMF_VARS.fd", base_gpa = 0x10200000, size = 0x200000, read_only = false }
+
+#
+# Device specifications
+#
+[devices]
+interrupt_mode = "passthrough"
+
+# TODO: Stage 2 will add fw_cfg device here
+# TODO: Stage 2 will add ACPI table generation
+# TODO: Stage 3 will add PCI/virtio devices
+
+emu_devices = []
+
+passthrough_devices = [
+  ["IO APIC", 0xfec0_0000, 0xfec0_0000, 0x1000, 0x1],
+  ["Local APIC", 0xfee0_0000, 0xfee0_0000, 0x1000, 0x1],
+  ["HPET", 0xfed0_0000, 0xfed0_0000, 0x1000, 0x1],
+]

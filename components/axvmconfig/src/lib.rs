@@ -320,6 +320,42 @@ pub struct VMBaseConfig {
     pub phys_cpu_sets: Option<Vec<usize>>,
 }
 
+/// Boot mode for the guest VM.
+///
+/// Determines how the guest VM is started and what firmware is loaded.
+#[cfg_attr(all(feature = "std", any(windows, unix)), derive(schemars::JsonSchema))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum VMBootMode {
+    /// Traditional BIOS/trampoline boot: load a BIOS image at a low address
+    /// and start execution from `entry_point`.
+    #[default]
+    #[serde(rename = "trampoline")]
+    Trampoline,
+    /// UEFI boot: load OVMF_CODE and OVMF_VARS as pflash regions,
+    /// start execution from the x86 reset vector (0xFFFFFFF0).
+    #[serde(rename = "uefi")]
+    Uefi,
+}
+
+/// Configuration for a pflash (platform flash) region.
+///
+/// Used to describe OVMF firmware regions (OVMF_CODE and OVMF_VARS)
+/// that are mapped into the guest physical address space.
+#[cfg_attr(all(feature = "std", any(windows, unix)), derive(schemars::JsonSchema))]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PflashConfig {
+    /// File path of the pflash image (e.g. OVMF_CODE.fd or OVMF_VARS.fd).
+    pub path: String,
+    /// Base GPA where the pflash region is mapped.
+    pub base_gpa: usize,
+    /// Size of the pflash region in bytes.
+    pub size: usize,
+    /// Whether the pflash region is read-only.
+    /// OVMF_CODE is typically read-only, OVMF_VARS is read-write.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
 /// The configuration structure for the guest VM kernel.
 #[cfg_attr(all(feature = "std", any(windows, unix)), derive(schemars::JsonSchema))]
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -356,6 +392,15 @@ pub struct VMKernelConfig {
     /// Number of memory_regions that came directly from the user-provided config.
     #[serde(skip)]
     pub configured_memory_region_count: usize,
+    /// Boot mode: "trampoline" (default) or "uefi".
+    #[serde(default)]
+    pub boot_mode: VMBootMode,
+    /// Pflash region 0 (OVMF_CODE): read-only firmware code.
+    #[serde(default)]
+    pub pflash0: Option<PflashConfig>,
+    /// Pflash region 1 (OVMF_VARS): read-write UEFI variable store.
+    #[serde(default)]
+    pub pflash1: Option<PflashConfig>,
 }
 
 /// Specifies how the VM should handle interrupts and interrupt controllers.

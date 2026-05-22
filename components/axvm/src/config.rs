@@ -20,7 +20,7 @@ use alloc::{string::String, vec::Vec};
 use axaddrspace::GuestPhysAddr;
 pub use axvmconfig::{
     AxVMCrateConfig, EmulatedDeviceConfig, PassThroughAddressConfig, PassThroughDeviceConfig,
-    VMInterruptMode, VMType, VmMemConfig, VmMemMappingType,
+    PflashConfig, VMBootMode, VMInterruptMode, VMType, VmMemConfig, VmMemMappingType,
 };
 
 use crate::VMMemoryRegion;
@@ -47,6 +47,8 @@ pub struct AxVCpuConfig {
     pub bsp_entry: GuestPhysAddr,
     /// The entry address in GPA for the Application Processor (AP).
     pub ap_entry: GuestPhysAddr,
+    /// Boot mode for the VM, affects vCPU initial state setup.
+    pub boot_mode: VMBootMode,
 }
 
 /// Ramdisk image information.
@@ -69,6 +71,10 @@ pub struct VMImageConfig {
     pub dtb_load_gpa: Option<GuestPhysAddr>,
     /// Ramdisk image info, `None` if not used.
     pub ramdisk: Option<RamdiskInfo>,
+    /// The load address in GPA for pflash0 (OVMF_CODE), `None` if not used.
+    pub pflash0_load_gpa: Option<GuestPhysAddr>,
+    /// The load address in GPA for pflash1 (OVMF_VARS), `None` if not used.
+    pub pflash1_load_gpa: Option<GuestPhysAddr>,
 }
 
 /// A part of `AxVMCrateConfig`, which represents a `VM`.
@@ -105,8 +111,15 @@ impl From<AxVMCrateConfig> for AxVMConfig {
                 phys_cpu_sets: cfg.base.phys_cpu_sets,
             },
             cpu_config: AxVCpuConfig {
-                bsp_entry: GuestPhysAddr::from(cfg.kernel.entry_point),
+                bsp_entry: match cfg.kernel.boot_mode {
+                    VMBootMode::Trampoline => GuestPhysAddr::from(cfg.kernel.entry_point),
+                    VMBootMode::Uefi => {
+                        // UEFI mode: BSP starts from x86 reset vector at 0xFFFFFFF0
+                        GuestPhysAddr::from(0xFFFFFFF0usize)
+                    }
+                },
                 ap_entry: GuestPhysAddr::from(cfg.kernel.entry_point),
+                boot_mode: cfg.kernel.boot_mode,
             },
             image_config: VMImageConfig {
                 kernel_load_gpa: GuestPhysAddr::from(cfg.kernel.kernel_load_addr),
@@ -116,6 +129,8 @@ impl From<AxVMCrateConfig> for AxVMConfig {
                     load_gpa: GuestPhysAddr::from(addr),
                     size: None,
                 }),
+                pflash0_load_gpa: cfg.kernel.pflash0.map(|p| GuestPhysAddr::from(p.base_gpa)),
+                pflash1_load_gpa: cfg.kernel.pflash1.map(|p| GuestPhysAddr::from(p.base_gpa)),
             },
             // memory_regions: cfg.kernel.memory_regions,
             emu_devices: cfg.devices.emu_devices,
@@ -257,6 +272,11 @@ impl AxVMConfig {
     /// Returns the interrupt mode of the VM.
     pub fn interrupt_mode(&self) -> VMInterruptMode {
         self.interrupt_mode
+    }
+
+    /// Returns the boot mode of the VM.
+    pub fn boot_mode(&self) -> VMBootMode {
+        self.cpu_config.boot_mode
     }
 
     /// Relocate the guest kernel image while preserving the configured
