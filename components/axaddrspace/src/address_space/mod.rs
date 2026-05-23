@@ -200,6 +200,10 @@ impl<H: PagingHandler> AddrSpace<H> {
         len: usize,
     ) -> Option<Vec<&'static mut [u8]>> {
         if !self.va_range.contains(vaddr) {
+            warn!(
+                "[translated_byte_buffer] vaddr {:?} not in va_range {:?}",
+                vaddr, self.va_range
+            );
             return None;
         }
         if let Some(area) = self.areas.find(vaddr) {
@@ -238,6 +242,10 @@ impl<H: PagingHandler> AddrSpace<H> {
             }
             Some(v)
         } else {
+            warn!(
+                "[translated_byte_buffer] vaddr {:?} not found in areas",
+                vaddr
+            );
             None
         }
     }

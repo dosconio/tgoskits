@@ -64,6 +64,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "acpi_tables"
+version = "0.1.0"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1897,6 +1904,7 @@ name = "axvisor"
 version = "0.5.7"
 dependencies = [
  "aarch64-cpu-ext",
+ "acpi_tables",
  "anyhow",
  "arm-gic-driver",
  "ax-config",
@@ -1932,6 +1940,7 @@ dependencies = [
  "clap",
  "extern-trait",
  "fdt-parser",
+ "fw_cfg",
  "hashbrown 0.14.5",
  "lazy_static",
  "log",
@@ -3955,6 +3964,17 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "fw_cfg"
+version = "0.1.0"
+dependencies = [
+ "ax-errno",
+ "axaddrspace",
+ "axdevice_base",
+ "log",
+ "spin 0.10.0",
 ]
 
 [[package]]

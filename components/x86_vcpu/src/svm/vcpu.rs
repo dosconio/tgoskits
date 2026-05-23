@@ -343,6 +343,12 @@ impl SvmVcpu {
         })
     }
 
+    /// Set I/O intercept by modifying IOPM bitmap.
+    pub fn set_io_intercept_of_range(&mut self, port_base: u32, count: u32, intercept: bool) {
+        self.iopm
+            .set_intercept_of_range(port_base, count, intercept)
+    }
+
     pub fn regs(&self) -> &GeneralRegisters {
         &self.guest_regs
     }

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use ax_errno::AxResult;
-use axaddrspace::GuestPhysAddr;
+use axaddrspace::{GuestPhysAddr, HostVirtAddr};
 
 use axvm::VMMemoryRegion;
 use axvm::config::AxVMCrateConfig;
@@ -23,6 +23,9 @@ use byte_unit::Byte;
 use crate::hal::CacheOp;
 use crate::vmm::VMRef;
 use crate::vmm::config::{config, get_vm_dtb_arc};
+
+#[cfg(target_arch = "x86_64")]
+use alloc::sync::Arc;
 
 mod linux;
 #[cfg(target_arch = "x86_64")]
@@ -95,6 +98,10 @@ impl ImageLoader {
             self.bios_load_gpa = config.image_config.bios_load_gpa;
             self.pflash0_load_gpa = config.image_config.pflash0_load_gpa;
             self.pflash1_load_gpa = config.image_config.pflash1_load_gpa;
+            info!(
+                "[ImageLoader] pflash0_load_gpa: {:?}, pflash1_load_gpa: {:?}",
+                self.pflash0_load_gpa, self.pflash1_load_gpa
+            );
         });
 
         match self.config.kernel.boot_mode {
@@ -265,17 +272,45 @@ impl ImageLoader {
         info!("Loading VM[{}] images in UEFI mode", self.config.base.id);
 
         // Load OVMF_CODE (pflash0) — read-only firmware code
+        // Pflash files are aligned to the END of the pflash region, matching QEMU's
+        // pflash model. If the file is smaller than the region, the file is loaded at
+        // an offset so that the last byte of the file aligns with the last byte of the
+        // region. This ensures the x86 reset vector (at the end of OVMF_CODE) maps to
+        // GPA 0xFFFFFFF0.
         if let (Some(pflash0_path), Some(pflash0_gpa)) =
             (&self.config.kernel.pflash0, self.pflash0_load_gpa)
         {
-            info!(
-                "Loading pflash0 (OVMF_CODE) from {} into GPA @{:#x}",
-                pflash0_path.path,
-                pflash0_gpa.as_usize()
-            );
             #[cfg(feature = "fs")]
             {
-                fs::load_vm_image(&pflash0_path.path, pflash0_gpa, self.vm.clone())?;
+                let (_, file_size) = fs::open_image_file(&pflash0_path.path)?;
+                let region_size = pflash0_path.size;
+                let load_offset = region_size.saturating_sub(file_size);
+                let load_gpa = GuestPhysAddr::from(pflash0_gpa.as_usize() + load_offset);
+                info!(
+                    "[pflash0] Loading {} (file {} bytes, region {:#x}) at offset {:#x}, GPA {:#x}",
+                    pflash0_path.path,
+                    file_size,
+                    region_size,
+                    load_offset,
+                    load_gpa.as_usize()
+                );
+                let _pflash0_hva =
+                    fs::load_vm_image(&pflash0_path.path, load_gpa, self.vm.clone())?;
+
+                // Verify reset vector at 0xFFFFFFF0 (last 16 bytes of pflash0 region)
+                let rv_gpa = GuestPhysAddr::from(0xFFFFFFF0usize);
+                let rv_data = self
+                    .vm
+                    .get_image_load_region(rv_gpa, 16)
+                    .unwrap_or_default();
+                if !rv_data.is_empty() {
+                    let bytes = &rv_data[0][..16.min(rv_data[0].len())];
+                    info!(
+                        "[UEFI] GPA 0xFFFFFFF0 HVA: {:#x}",
+                        rv_data[0].as_ptr() as usize
+                    );
+                    info!("[UEFI] GPA 0xFFFFFFF0 data: {:02x?}", bytes);
+                }
             }
             #[cfg(not(feature = "fs"))]
             {
@@ -296,14 +331,21 @@ impl ImageLoader {
         if let (Some(pflash1_path), Some(pflash1_gpa)) =
             (&self.config.kernel.pflash1, self.pflash1_load_gpa)
         {
-            info!(
-                "Loading pflash1 (OVMF_VARS) from {} into GPA @{:#x}",
-                pflash1_path.path,
-                pflash1_gpa.as_usize()
-            );
             #[cfg(feature = "fs")]
             {
-                fs::load_vm_image(&pflash1_path.path, pflash1_gpa, self.vm.clone())?;
+                let (_, file_size) = fs::open_image_file(&pflash1_path.path)?;
+                let region_size = pflash1_path.size;
+                let load_offset = region_size.saturating_sub(file_size);
+                let load_gpa = GuestPhysAddr::from(pflash1_gpa.as_usize() + load_offset);
+                info!(
+                    "[pflash1] Loading {} (file {} bytes, region {:#x}) at offset {:#x}, GPA {:#x}",
+                    pflash1_path.path,
+                    file_size,
+                    region_size,
+                    load_offset,
+                    load_gpa.as_usize()
+                );
+                let _ = fs::load_vm_image(&pflash1_path.path, load_gpa, self.vm.clone())?;
             }
             #[cfg(not(feature = "fs"))]
             {
@@ -333,7 +375,7 @@ impl ImageLoader {
                 }
                 #[cfg(feature = "fs")]
                 Some("fs") => {
-                    fs::load_vm_image(
+                    let _ = fs::load_vm_image(
                         &self.config.kernel.kernel_path,
                         self.kernel_load_gpa,
                         self.vm.clone(),
@@ -355,8 +397,108 @@ impl ImageLoader {
             }
         }
 
-        // TODO (Phase 2): Create fw_cfg device and inject boot info
-        // TODO (Phase 2): Generate ACPI tables and write to guest memory
+        // Create fw_cfg device and inject boot info
+        #[cfg(target_arch = "x86_64")]
+        self.setup_fw_cfg_and_acpi()?;
+
+        Ok(())
+    }
+
+    /// Set up fw_cfg device and ACPI tables for UEFI boot (x86_64 only).
+    ///
+    /// This method:
+    /// 1. Creates a fw_cfg device with boot information (RAM size, CPU count)
+    /// 2. Generates minimal ACPI tables (RSDP, XSDT, FADT, MADT, MCFG)
+    /// 3. Writes ACPI tables into guest memory
+    /// 4. Registers ACPI tables as fw_cfg file items
+    /// 5. Registers the fw_cfg device as a port I/O device
+    #[cfg(target_arch = "x86_64")]
+    fn setup_fw_cfg_and_acpi(&self) -> AxResult {
+        use acpi_tables::{AcpiConfig, AcpiTableBuilder};
+        use fw_cfg::FwCfgDevice;
+
+        // Calculate RAM size from memory_regions
+        let ram_size: usize = self
+            .config
+            .kernel
+            .memory_regions
+            .iter()
+            .filter(|r| r.gpa == 0) // Only count RAM regions starting at 0
+            .map(|r| r.size)
+            .sum();
+        let cpu_num = self.config.base.cpu_num;
+
+        info!(
+            "Setting up fw_cfg and ACPI tables: ram_size={:#x}, cpu_num={}",
+            ram_size, cpu_num
+        );
+
+        // Generate ACPI tables
+        let acpi_config = AcpiConfig {
+            cpu_num,
+            ram_size,
+            lapic_addr: 0xFEE0_0000,
+            ioapic_addr: 0xFEC0_0000,
+            ioapic_id: 0,
+            ioapic_gsi_base: 0,
+            ecam_base_addr: 0xB000_0000,
+            ecam_segment: 0,
+            ecam_bus_start: 0,
+            ecam_bus_end: 0xFF,
+            rsdp_gpa: 0x000F_0000,
+        };
+        let acpi_tables = AcpiTableBuilder::new(acpi_config).build();
+
+        // Write ACPI tables into guest memory
+        // RSDP at 0xF0000
+        let rsdp_gpa = GuestPhysAddr::from(0xF0000usize);
+        let mut rsdp_regions = self
+            .vm
+            .get_image_load_region(rsdp_gpa, acpi_tables.rsdp.len())?;
+        let mut offset = 0;
+        for region in &mut rsdp_regions {
+            let copy_len = region.len().min(acpi_tables.rsdp.len() - offset);
+            region[..copy_len].copy_from_slice(&acpi_tables.rsdp[offset..offset + copy_len]);
+            offset += copy_len;
+        }
+        info!(
+            "Wrote RSDP ({} bytes) to GPA {:#x}",
+            acpi_tables.rsdp.len(),
+            rsdp_gpa.as_usize()
+        );
+
+        // Other tables follow RSDP
+        let tables_gpa = GuestPhysAddr::from(0xF0000usize + acpi_tables.rsdp.len());
+        let mut table_regions = self
+            .vm
+            .get_image_load_region(tables_gpa, acpi_tables.tables.len())?;
+        offset = 0;
+        for region in &mut table_regions {
+            let copy_len = region.len().min(acpi_tables.tables.len() - offset);
+            region[..copy_len].copy_from_slice(&acpi_tables.tables[offset..offset + copy_len]);
+            offset += copy_len;
+        }
+        info!(
+            "Wrote ACPI tables ({} bytes) to GPA {:#x}",
+            acpi_tables.tables.len(),
+            tables_gpa.as_usize()
+        );
+
+        // Create fw_cfg device
+        let fw_cfg = FwCfgDevice::new(ram_size, cpu_num);
+
+        // Register ACPI tables as fw_cfg file items
+        fw_cfg.add_file("etc/acpi/tables", &acpi_tables.tables);
+        fw_cfg.add_file("etc/acpi/rsdp", &acpi_tables.rsdp);
+
+        // Register kernel command line if provided
+        if let Some(cmdline) = &self.config.kernel.cmdline {
+            fw_cfg.add_file("etc/boot-cmdline", cmdline.as_bytes());
+        }
+
+        // Register fw_cfg as a port I/O device
+        self.vm.get_devices().lock().add_port_dev(Arc::new(fw_cfg));
+        info!("Registered fw_cfg device at I/O ports 0x510-0x511");
 
         Ok(())
     }
@@ -379,7 +521,8 @@ impl ImageLoader {
             ramdisk_size,
             load_gpa.as_usize()
         );
-        fs::load_vm_image(ramdisk_path, load_gpa, self.vm.clone())
+        let _ = fs::load_vm_image(ramdisk_path, load_gpa, self.vm.clone())?;
+        Ok(())
     }
 }
 
@@ -473,7 +616,7 @@ pub mod fs {
     pub(crate) fn load_vm_images_from_filesystem(loader: &ImageLoader) -> AxResult {
         info!("Loading VM images from filesystem");
         // Load kernel image.
-        load_vm_image(
+        let _ = load_vm_image(
             &loader.config.kernel.kernel_path,
             loader.kernel_load_gpa,
             loader.vm.clone(),
@@ -492,7 +635,7 @@ pub mod fs {
                     loader.load_x86_multiboot_info(&bios_image, bios_load_addr)?;
                 }
                 #[cfg(not(target_arch = "x86_64"))]
-                load_vm_image(bios_path, bios_load_addr, loader.vm.clone())?;
+                let _ = load_vm_image(bios_path, bios_load_addr, loader.vm.clone())?;
             } else {
                 return ax_err!(NotFound, "BIOS load addr is missed");
             }
@@ -540,20 +683,45 @@ pub mod fs {
         image_path: &str,
         image_load_gpa: GuestPhysAddr,
         vm: VMRef,
-    ) -> AxResult {
+    ) -> AxResult<Option<HostVirtAddr>> {
         use std::io::{BufReader, Read};
         let (image_file, image_size) = open_image_file(image_path)?;
+        info!(
+            "[load_vm_image] Loading {} ({} bytes) to GPA {:#x}",
+            image_path, image_size, image_load_gpa
+        );
 
-        let image_load_regions = vm.get_image_load_region(image_load_gpa, image_size)?;
+        let mut image_load_regions = vm.get_image_load_region(image_load_gpa, image_size)?;
+        info!(
+            "[load_vm_image] Got {} region(s) for GPA {:#x}",
+            image_load_regions.len(),
+            image_load_gpa
+        );
+        for (i, region) in image_load_regions.iter().enumerate() {
+            info!(
+                "[load_vm_image] Region {}: HVA {:#x}, size {} bytes",
+                i,
+                region.as_ptr() as usize,
+                region.len()
+            );
+        }
+
         let mut file = BufReader::new(image_file);
 
-        for buffer in image_load_regions {
+        for (i, buffer) in image_load_regions.iter_mut().enumerate() {
             file.read_exact(buffer).map_err(|err| {
                 ax_err_type!(
                     Io,
                     format!("Failed in reading from file {}, err {:?}", image_path, err)
                 )
             })?;
+
+            info!(
+                "[load_vm_image] Read {} bytes into region {}, first 16 bytes: {:02x?}",
+                buffer.len(),
+                i,
+                &buffer[..16.min(buffer.len())]
+            );
 
             crate::hal::arch::cache::dcache_range(
                 CacheOp::Clean,
@@ -562,7 +730,12 @@ pub mod fs {
             );
         }
 
-        Ok(())
+        let first_hva = if !image_load_regions.is_empty() {
+            Some(HostVirtAddr::from(image_load_regions[0].as_ptr() as usize))
+        } else {
+            None
+        };
+        Ok(first_hva)
     }
 
     #[cfg(target_arch = "x86_64")]

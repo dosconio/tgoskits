@@ -19,6 +19,7 @@ pub fn inject_interrupt(irq_id: usize) {
     let vplic = get_vm_by_id(current_vm_id())
         .unwrap()
         .get_devices()
+        .lock()
         .find_mmio_dev(GuestPhysAddr::from_usize(PLIC_PADDR))
         .unwrap();
 

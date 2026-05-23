@@ -1,14 +1,14 @@
 Using build config: os/axvisor/configs/board/qemu-x86_64.toml
 AX_TARGET=x86_64-unknown-none
-AX_IP=10.0.2.15
-AX_CONFIG_PATH=/home/phina/Documents/tgoskits/tmp/axbuild/axconfig/axvisor/x86_64-unknown-none/.axconfig.toml
-AXVISOR_VM_CONFIGS=/home/phina/Documents/tgoskits/os/axvisor/configs/vms/uefi-x86_64-qemu.toml
 AX_GW=10.0.2.2
-AX_LOG=info
-AX_PLATFORM=x86-qemu-q35
 AX_ARCH=x86_64
+AX_PLATFORM=x86-qemu-q35
+AX_IP=10.0.2.15
+AXVISOR_VM_CONFIGS=/home/phina/Documents/tgoskits/os/axvisor/configs/vms/uefi-x86_64-qemu.toml
+AX_LOG=info
+AX_CONFIG_PATH=/home/phina/Documents/tgoskits/tmp/axbuild/axconfig/axvisor/x86_64-unknown-none/.axconfig.toml
 cargo build -p axvisor --target x86_64-unknown-none -Z unstable-options --target-dir /home/phina/Documents/tgoskits/target --features ax-std/myplat,ept-level-4,fs,vmx,log/release_max_level_info --config target.x86_64-unknown-none.rustflags=["-Clink-arg=-Tlinker.x","-Clink-arg=-no-pie","-Clink-arg=-znostart-stop-gc"] --bin axvisor --release --message-format json-render-diagnostics
-qemu-system-x86_64 -nographic -cpu host -machine q35 -smp 1 -accel kvm -device virtio-blk-pci,drive=disk0 -drive id=disk0,if=none,format=raw,file=/home/phina/Documents/tgoskits/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img -m 128M -kernel /home/phina/Documents/tgoskits/target/x86_64-unknown-none/release/axvisor
+qemu-system-x86_64 -nographic -cpu host -machine q35 -smp 1 -enable-kvm -device virtio-blk-pci,drive=disk0 -drive id=disk0,if=none,format=raw,file=/home/phina/Documents/tgoskits/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img -m 128M -kernel /home/phina/Documents/tgoskits/target/x86_64-unknown-none/release/axvisor
 c[?7l[2J[0mSeaBIOS (version rel-1.16.3-0-ga6ed6b701f0a-prebuilt.qemu.org)
 
 
@@ -35,59 +35,59 @@ log_level = info
 backtrace = false
 smp = 1
 
-[37m[  0.008209 ax_runtime:171] [32mLogging is enabled.[m
-[m[37m[  0.009043 ax_runtime:172] [32mPrimary CPU 0 started, arg = 0x9500.[m
-[m[37m[  0.010064 ax_runtime:174] [32mFound physcial memory regions:[m
-[m[37m[  0.011438 ax_runtime:176] [32m  [PA:0x0, PA:0x200000) reserved (READ | WRITE | EXECUTE | RESERVED)[m
-[m[37m[  0.012769 ax_runtime:176] [32m  [PA:0x200000, PA:0x341000) .text (READ | EXECUTE | RESERVED)[m
-[m[37m[  0.014095 ax_runtime:176] [32m  [PA:0x341000, PA:0x364000) .rodata (READ | RESERVED)[m
-[m[37m[  0.015301 ax_runtime:176] [32m  [PA:0x364000, PA:0x377000) .data .tdata .tbss .percpu (READ | WRITE | RESERVED)[m
-[m[37m[  0.017131 ax_runtime:176] [32m  [PA:0x377000, PA:0x3b7000) boot stack (READ | WRITE | RESERVED)[m
-[m[37m[  0.018445 ax_runtime:176] [32m  [PA:0x3b7000, PA:0x3dd000) .bss (READ | WRITE | RESERVED)[m
-[m[37m[  0.019671 ax_runtime:176] [32m  [PA:0x3dd000, PA:0x7fdc000) free memory (READ | WRITE | FREE)[m
-[m[37m[  0.020894 ax_runtime:176] [32m  [PA:0xb0000000, PA:0xc0000000) mmio (READ | WRITE | DEVICE | RESERVED)[m
-[m[37m[  0.022411 ax_runtime:176] [32m  [PA:0xfe000000, PA:0xfec00000) mmio (READ | WRITE | DEVICE | RESERVED)[m
-[m[37m[  0.023704 ax_runtime:176] [32m  [PA:0xfec00000, PA:0xfec01000) mmio (READ | WRITE | DEVICE | RESERVED)[m
-[m[37m[  0.025172 ax_runtime:176] [32m  [PA:0xfed00000, PA:0xfed01000) mmio (READ | WRITE | DEVICE | RESERVED)[m
-[m[37m[  0.026806 ax_runtime:176] [32m  [PA:0xfee00000, PA:0xfee01000) mmio (READ | WRITE | DEVICE | RESERVED)[m
-[m[37m[  0.028162 ax_runtime:176] [32m  [PA:0x7000000000, PA:0x7000004000) mmio (READ | WRITE | DEVICE | RESERVED)[m
-[m[37m[  0.029306 ax_runtime:176] [32m  [PA:0x380000000000, PA:0x380000004000) mmio (READ | WRITE | DEVICE | RESERVED)[m
-[m[37m[  0.030978 ax_runtime:303] [32mInitialize global memory allocator...[m
-[m[37m[  0.031861 ax_runtime:304] [32m  use TLSF allocator.[m
-[m[37m[  0.032799 ax_runtime:211] [32mkernel aspace: [VA:0xffff800000000000, VA:0xfffffffffffff000)[m
-[m[37m[  0.034103 ax_mm:91] [32mInitialize virtual memory management...[m
-[m[37m[  0.036513 ax_runtime:223] [32mInitialize platform devices...[m
-[m[37m[  0.037514 axplat_x86_qemu_q35::apic:81] [32mInitialize Local APIC...[m
-[m[37m[  0.038521 axplat_x86_qemu_q35::apic:96] [32mUsing x2APIC.[m
-[m[37m[  0.039628 axplat_x86_qemu_q35::apic:111] [32mInitialize IO APIC...[m
-[m[37m[  0.040700 ax_task::api:125] [32mInitialize scheduling...[m
-[m[37m[  0.041747 ax_task::api:130] [32m  use FIFO scheduler.[m
-[m[37m[  0.042671 ax_driver:177] [32mInitialize device drivers...[m
-[m[37m[  0.044034 ax_driver:178] [32m  device model: static[m
-[m[37m[  0.097486 virtio_drivers::device::blk:63] [32mfound a block device of size 1048576KB[m
-[m[37m[  0.098864 ax_driver::bus::pci:111] [32mregistered a new Block device at 00:03.0: "virtio-blk"[m
-[m[37m[  0.637740 ax_fs:42] [32mInitialize filesystems...[m
-[m[37m[  0.638487 ax_fs:45] [32m  use block device 0: "virtio-blk"[m
-[m[37m[  0.639469 ax_fs::partition:95] [32mScanning for GPT partitions...[m
-[m[37m[  0.640586 ax_fs::partition:112] [33mFailed to parse GPT: AxErrorKind::InvalidData[m
-[m[37m[  0.641920 ax_fs::partition:113] [32mTrying MBR...[m
-[m[37m[  0.642994 ax_fs::partition:118] [33mNo partition table found, treating whole disk as single partition[m
-[m[37m[  0.645282 ax_fs:72] [32mFound 1 partitions, initializing with dynamic filesystem detection[m
-[m[37m[  0.646654 ax_fs::root:398] [32mInitializing root filesystem with 1 partitions[m
-[m[37m[  0.647735 ax_fs::partition:420] [32mCreating ext4 filesystem for partition 'disk'[m
-[m[37m[  0.648996 ax_fs::fs::ext4fs:80] [32mGot Partition size:1073742336, position:0[m
-[m[37m[  0.653849 rsext4::ext4::mount:270] [32m/lost+found exists (path resolution)[m
-[m[37m[  0.656656 rsext4::ext4::mount:381] [32mExt4 filesystem mounted[m
-[m[37m[  0.657556 rsext4::ext4::mount:382] [32m  - block size: 4096 bytes[m
-[m[37m[  0.658625 rsext4::ext4::mount:383] [32m  - total blocks: 262144[m
-[m[37m[  0.659546 rsext4::ext4::mount:384] [32m  - free blocks: 178092[m
-[m[37m[  0.660444 rsext4::ext4::mount:385] [32m  - total inodes: 65536[m
-[m[37m[  0.661386 rsext4::ext4::mount:386] [32m  - free inodes: 61339[m
-[m[37m[  0.662257 rsext4::ext4::sync:13] [32mSyncing filesystem...[m
-[m[37m[  0.666686 rsext4::ext4::mount:455] [32mExt4 filesystem mounted[m
-[m[37m[  0.667796 ax_fs::root:300] [32mUsing partition 'disk' (Ext4) as root filesystem[m
-[m[37m[  0.670901 ax_runtime:269] [32mInitialize interrupt handlers...[m
-[m[37m[  0.672015 ax_runtime:281] [32mPrimary CPU 0 init OK.[m
+[37m[  0.007747 ax_runtime:171] [32mLogging is enabled.[m
+[m[37m[  0.008395 ax_runtime:172] [32mPrimary CPU 0 started, arg = 0x9500.[m
+[m[37m[  0.009446 ax_runtime:174] [32mFound physcial memory regions:[m
+[m[37m[  0.010542 ax_runtime:176] [32m  [PA:0x0, PA:0x200000) reserved (READ | WRITE | EXECUTE | RESERVED)[m
+[m[37m[  0.011932 ax_runtime:176] [32m  [PA:0x200000, PA:0x347000) .text (READ | EXECUTE | RESERVED)[m
+[m[37m[  0.012988 ax_runtime:176] [32m  [PA:0x347000, PA:0x36a000) .rodata (READ | RESERVED)[m
+[m[37m[  0.014178 ax_runtime:176] [32m  [PA:0x36a000, PA:0x37d000) .data .tdata .tbss .percpu (READ | WRITE | RESERVED)[m
+[m[37m[  0.015863 ax_runtime:176] [32m  [PA:0x37d000, PA:0x3bd000) boot stack (READ | WRITE | RESERVED)[m
+[m[37m[  0.017367 ax_runtime:176] [32m  [PA:0x3bd000, PA:0x3e3000) .bss (READ | WRITE | RESERVED)[m
+[m[37m[  0.018766 ax_runtime:176] [32m  [PA:0x3e3000, PA:0x7fdc000) free memory (READ | WRITE | FREE)[m
+[m[37m[  0.019842 ax_runtime:176] [32m  [PA:0xb0000000, PA:0xc0000000) mmio (READ | WRITE | DEVICE | RESERVED)[m
+[m[37m[  0.020981 ax_runtime:176] [32m  [PA:0xfe000000, PA:0xfec00000) mmio (READ | WRITE | DEVICE | RESERVED)[m
+[m[37m[  0.022209 ax_runtime:176] [32m  [PA:0xfec00000, PA:0xfec01000) mmio (READ | WRITE | DEVICE | RESERVED)[m
+[m[37m[  0.023429 ax_runtime:176] [32m  [PA:0xfed00000, PA:0xfed01000) mmio (READ | WRITE | DEVICE | RESERVED)[m
+[m[37m[  0.024658 ax_runtime:176] [32m  [PA:0xfee00000, PA:0xfee01000) mmio (READ | WRITE | DEVICE | RESERVED)[m
+[m[37m[  0.025929 ax_runtime:176] [32m  [PA:0x7000000000, PA:0x7000004000) mmio (READ | WRITE | DEVICE | RESERVED)[m
+[m[37m[  0.027136 ax_runtime:176] [32m  [PA:0x380000000000, PA:0x380000004000) mmio (READ | WRITE | DEVICE | RESERVED)[m
+[m[37m[  0.028460 ax_runtime:303] [32mInitialize global memory allocator...[m
+[m[37m[  0.029216 ax_runtime:304] [32m  use TLSF allocator.[m
+[m[37m[  0.029987 ax_runtime:211] [32mkernel aspace: [VA:0xffff800000000000, VA:0xfffffffffffff000)[m
+[m[37m[  0.031044 ax_mm:91] [32mInitialize virtual memory management...[m
+[m[37m[  0.033436 ax_runtime:223] [32mInitialize platform devices...[m
+[m[37m[  0.034349 axplat_x86_qemu_q35::apic:81] [32mInitialize Local APIC...[m
+[m[37m[  0.035168 axplat_x86_qemu_q35::apic:96] [32mUsing x2APIC.[m
+[m[37m[  0.036209 axplat_x86_qemu_q35::apic:111] [32mInitialize IO APIC...[m
+[m[37m[  0.037030 ax_task::api:125] [32mInitialize scheduling...[m
+[m[37m[  0.037811 ax_task::api:130] [32m  use FIFO scheduler.[m
+[m[37m[  0.038616 ax_driver:177] [32mInitialize device drivers...[m
+[m[37m[  0.039286 ax_driver:178] [32m  device model: static[m
+[m[37m[  0.090543 virtio_drivers::device::blk:63] [32mfound a block device of size 1048576KB[m
+[m[37m[  0.092027 ax_driver::bus::pci:111] [32mregistered a new Block device at 00:03.0: "virtio-blk"[m
+[m[37m[  0.628781 ax_fs:42] [32mInitialize filesystems...[m
+[m[37m[  0.629542 ax_fs:45] [32m  use block device 0: "virtio-blk"[m
+[m[37m[  0.630348 ax_fs::partition:95] [32mScanning for GPT partitions...[m
+[m[37m[  0.631441 ax_fs::partition:112] [33mFailed to parse GPT: AxErrorKind::InvalidData[m
+[m[37m[  0.632672 ax_fs::partition:113] [32mTrying MBR...[m
+[m[37m[  0.633456 ax_fs::partition:118] [33mNo partition table found, treating whole disk as single partition[m
+[m[37m[  0.635321 ax_fs:72] [32mFound 1 partitions, initializing with dynamic filesystem detection[m
+[m[37m[  0.636554 ax_fs::root:398] [32mInitializing root filesystem with 1 partitions[m
+[m[37m[  0.637596 ax_fs::partition:420] [32mCreating ext4 filesystem for partition 'disk'[m
+[m[37m[  0.638849 ax_fs::fs::ext4fs:80] [32mGot Partition size:1073742336, position:0[m
+[m[37m[  0.642573 rsext4::ext4::mount:270] [32m/lost+found exists (path resolution)[m
+[m[37m[  0.645152 rsext4::ext4::mount:381] [32mExt4 filesystem mounted[m
+[m[37m[  0.646114 rsext4::ext4::mount:382] [32m  - block size: 4096 bytes[m
+[m[37m[  0.647026 rsext4::ext4::mount:383] [32m  - total blocks: 262144[m
+[m[37m[  0.648020 rsext4::ext4::mount:384] [32m  - free blocks: 178092[m
+[m[37m[  0.648890 rsext4::ext4::mount:385] [32m  - total inodes: 65536[m
+[m[37m[  0.649793 rsext4::ext4::mount:386] [32m  - free inodes: 61339[m
+[m[37m[  0.650667 rsext4::ext4::sync:13] [32mSyncing filesystem...[m
+[m[37m[  0.654789 rsext4::ext4::mount:455] [32mExt4 filesystem mounted[m
+[m[37m[  0.655705 ax_fs::root:300] [32mUsing partition 'disk' (Ext4) as root filesystem[m
+[m[37m[  0.658464 ax_runtime:269] [32mInitialize interrupt handlers...[m
+[m[37m[  0.659425 ax_runtime:281] [32mPrimary CPU 0 init OK.[m
 [m
 
     _         __     ___
@@ -99,82 +99,60 @@ smp = 1
 
 by AxVisor Team
 
-[37m[  0.675422 0:2 axvisor:61] [32mStarting virtualization...[m
-[m[37m[  0.676461 0:2 axvisor:62] [32mHardware support: true[m
-[m[37m[  0.677321 0:2 axvisor::hal:87] [32mEnabling hardware virtualization support on all cores...[m
-[m[37m[  0.678809 0:2 axvisor::hal:122] [32mWaiting for all cores to enable hardware virtualization...[m
-[m[37m[  0.680026 0:4 axvisor::hal:95] [32mCore 0 is initializing hardware virtualization support...[m
-[m[37m[  0.681281 0:4 axvisor::hal:102] [32mEnabling hardware virtualization support on core 0[m
-[m[37m[  0.682507 0:4 axvisor::vmm::timer:123] [32mIniting HV Timer...[m
-[m[37m[  0.683560 0:4 x86_vcpu::vmx::percpu:135] [32m[AxVM] succeeded to turn on VMX.[m
-[m[37m[  0.685402 0:4 axvisor::hal:116] [32mHardware virtualization support enabled on core 0[m
-[m[37m[  0.687793 0:2 axvisor::hal:132] [32mAll cores have enabled hardware virtualization support.[m
-[m[37m[  0.690312 0:2 axvisor::vmm:58] [32mInitializing VMM...[m
-[m[37m[  0.693543 0:2 axvisor::vmm::config::config:62] [32mNOT find dir: /guest/vm_default in filesystem[m
-[m[37m[  0.696038 0:2 axvisor::vmm::config:170] [32mUsing static VM configs.[m
-[m[37m[  0.698099 0:2 axvisor::vmm::images::fs:377] [33m[AxErrorKind::NotFound] Failed to open , err AxErrorKind::NotFound, please check your disk.img[m
-[m[37m[  0.701782 0:2 axvisor::vmm::config:230] [32mCreating VM[1] "uefi-vm"[m
-[m[37m[  0.703791 0:2 axvm::vm:177] [32mVM created: id=1[m
-[m[37m[  0.718301 0:2 axvisor::vmm::config:248] [32mVM[1] created success, loading images...[m
-[m[37m[  0.720499 0:2 axvisor::vmm::images:82] [32mLoading VM[1] images into memory region: gpa=GPA:0x0, hva=VA:0xffff800001800000, size=16 MiB[m
-[m[37m[  0.723984 0:2 axvisor::vmm::images:194] [32mLoading VM[1] images in UEFI mode[m
-[m[37m[  0.725837 0:2 axvisor::vmm::images:200] [32mLoading pflash0 (OVMF_CODE) from /guest/ovmf/OVMF_CODE.fd into GPA @0x10000000[m
-[m[37m[  1.105878 0:2 axvisor::vmm::images:228] [32mLoading pflash1 (OVMF_VARS) from /guest/ovmf/OVMF_VARS.fd into GPA @0x10200000[m
-[m[37m[  1.132964 0:2 axvm::vm:195] [32mdtb_load_gpa: None[m
-[m[37m[  1.134437 0:2 x86_vcpu::vmx::vcpu:140] [32m[HV] created VmxVcpu(vmcs: PA:0x367d000)[m
-[m[37m[  1.136926 0:2 axvm::vm:386] [32mVM setup: id=1[m
-[m[37m[  1.138686 0:2 axvisor::vmm:63] [32mSetting up vcpus...[m
-[m[37m[  1.140142 0:2 axvisor::vmm::vcpus:356] [32mInitializing VM[1]'s 1 vcpus[m
-[m[37m[  1.142054 0:2 axvisor::vmm::vcpus:405] [32mSpawning task for VM[1] VCpu[0][m
-[m[37m[  1.144056 0:2 axvisor::vmm::vcpus:420] [32mVCpu task Task(5, "VM[1]-VCpu[0]") created cpumask: [0, ][m
-[m[37m[  1.146599 0:2 axvisor::vmm:71] [32mVMM starting, booting VMs...[m
-[m[37m[  1.148013 0:2 axvm::vm:469] [32mBooting VM[1][m
-[m[37m[  1.149298 0:2 axvisor::vmm:77] [32mVM[1] boot success[m
-[m[37m[  1.150858 0:2 axvisor::vmm:88] [32ma VM exited, current running VM count: 1[m
-[m[37m[  1.152958 0:5 axvisor::vmm::vcpus:443] [32mVM[1] boot delay: 0s[m
-[m[37m[  1.154927 0:5 axvisor::vmm::vcpus:446] [32mVM[1] VCpu[0] waiting for running[m
-[m[37m[  1.156964 0:5 axvisor::vmm::vcpus:449] [32mVM[1] VCpu[0] running...[m
-[m[37m[  1.160950 0:5 x86_vcpu::vmx::vcpu:1313] [33mVMX unsupported VM-Exit: VmxExitInfo {
-    entry_failure: false,
-    exit_reason: EXCEPTION_NMI,
-    exit_instruction_length: 0x2,
-    guest_rip: 0xfff4,
-}[m
-[m[37m[  1.166173 0:5 x86_vcpu::vmx::vcpu:1314] [33mVCpu VmxVcpu {
-    guest_regs: GeneralRegisters {
-        rax: 0x0,
-        rcx: 0x0,
-        rdx: 0x0,
-        rbx: 0x0,
-        _unused_rsp: 0x0,
-        rbp: 0x0,
-        rsi: 0x0,
-        rdi: 0x0,
-        r8: 0x0,
-        r9: 0x0,
-        r10: 0x0,
-        r11: 0x0,
-        r12: 0x0,
-        r13: 0x0,
-        r14: 0x0,
-        r15: 0x0,
-    },
-    rip: 0xfff4,
-    rsp: 0xfff4,
-    rflags: 0x10002,
-    cr0: 0x30,
-    cr3: 0x0,
-    cr4: 0x2000,
-    cs: 0x0,
-    fs_base: 0x0,
-    gs_base: 0x0,
-    tss: 0x0,
-}[m
-[mpanicked at os/arceos/modu
-=== FAIL PATTERN MATCHED: (?i)\bpanic(?:ked)?\b
-les/axtask/src/wait_queue.rs:77:9:
-sleeping or rescheduling is not allowed in atomic context: irq_enabled=false, preempt_count=0
-<backtrace disabled>
-
-[37m[  1.183671 0:5 axplat_x86_qemu_q35::power:44] [32mShutting down...[m
-[mSystem will reboot, press any key to continue ...
+[37m[  0.662793 0:2 axvisor:61] [32mStarting virtualization...[m
+[m[37m[  0.663485 0:2 axvisor:62] [32mHardware support: true[m
+[m[37m[  0.664290 0:2 axvisor::hal:87] [32mEnabling hardware virtualization support on all cores...[m
+[m[37m[  0.665816 0:2 axvisor::hal:122] [32mWaiting for all cores to enable hardware virtualization...[m
+[m[37m[  0.667184 0:4 axvisor::hal:95] [32mCore 0 is initializing hardware virtualization support...[m
+[m[37m[  0.668416 0:4 axvisor::hal:102] [32mEnabling hardware virtualization support on core 0[m
+[m[37m[  0.669610 0:4 axvisor::vmm::timer:123] [32mIniting HV Timer...[m
+[m[37m[  0.670591 0:4 x86_vcpu::vmx::percpu:135] [32m[AxVM] succeeded to turn on VMX.[m
+[m[37m[  0.672456 0:4 axvisor::hal:116] [32mHardware virtualization support enabled on core 0[m
+[m[37m[  0.674502 0:2 axvisor::hal:132] [32mAll cores have enabled hardware virtualization support.[m
+[m[37m[  0.676960 0:2 axvisor::vmm:58] [32mInitializing VMM...[m
+[m[37m[  0.680467 0:2 axvisor::vmm::config::config:62] [32mNOT find dir: /guest/vm_default in filesystem[m
+[m[37m[  0.682640 0:2 axvisor::vmm::config:170] [32mUsing static VM configs.[m
+[m[37m[  0.684754 0:2 axvisor::vmm::images::fs:520] [33m[AxErrorKind::NotFound] Failed to open , err AxErrorKind::NotFound, please check your disk.img[m
+[m[37m[  0.687886 0:2 axvisor::vmm::config:230] [32mCreating VM[1] "uefi-vm"[m
+[m[37m[  0.689314 0:2 axvm::vm:180] [32mVM created: id=1[m
+[m[37m[  0.798640 0:2 axvisor::vmm::config:248] [32mVM[1] created success, loading images...[m
+[m[37m[  0.800370 0:2 axvisor::vmm::images:85] [32mLoading VM[1] images into memory region: gpa=GPA:0x0, hva=VA:0xffff800002800000, size=32 MiB[m
+[m[37m[  0.803388 0:2 axvisor::vmm::images:99] [32m[ImageLoader] pflash0_load_gpa: Some(GPA:0xffe00000), pflash1_load_gpa: Some(GPA:0xffc00000)[m
+[m[37m[  0.806196 0:2 axvisor::vmm::images:201] [32mLoading VM[1] images in UEFI mode[m
+[m[37m[  0.809699 0:2 axvisor::vmm::images:218] [32m[pflash0] Loading /guest/ovmf/OVMF_CODE.fd (file 1966080 bytes, region 0x200000) at offset 0x20000, GPA 0xffe20000[m
+[m[37m[  0.813115 0:2 axvisor::vmm::images::fs:592] [32m[load_vm_image] Loading /guest/ovmf/OVMF_CODE.fd (1966080 bytes) to GPA GPA:0xffe20000[m
+[m[37m[  0.816208 0:2 axvisor::vmm::images::fs:598] [32m[load_vm_image] Got 1 region(s) for GPA GPA:0xffe20000[m
+[m[37m[  0.818288 0:2 axvisor::vmm::images::fs:604] [32m[load_vm_image] Region 0: HVA 0xffff800004a20000, size 1966080 bytes[m
+[m[37m[  1.155918 0:2 axvisor::vmm::images::fs:622] [32m[load_vm_image] Read 1966080 bytes into region 0, first 16 bytes: [00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00][m
+[m[37m[  1.159968 0:2 axvisor::vmm::images:237] [32m[UEFI] GPA 0xFFFFFFF0 HVA: 0xffff800004bffff0[m
+[m[37m[  1.162200 0:2 axvisor::vmm::images:241] [32m[UEFI] GPA 0xFFFFFFF0 data: [0f, 20, c0, a8, 01, 74, 05, e9, 28, ff, ff, ff, e9, 09, ff, 90][m
+[m[37m[  1.166764 0:2 axvisor::vmm::images:269] [32m[pflash1] Loading /guest/ovmf/OVMF_VARS.fd (file 131072 bytes, region 0x200000) at offset 0x1e0000, GPA 0xffde0000[m
+[m[37m[  1.170904 0:2 axvisor::vmm::images::fs:592] [32m[load_vm_image] Loading /guest/ovmf/OVMF_VARS.fd (131072 bytes) to GPA GPA:0xffde0000[m
+[m[37m[  1.173973 0:2 axvisor::vmm::images::fs:598] [32m[load_vm_image] Got 1 region(s) for GPA GPA:0xffde0000[m
+[m[37m[  1.178017 0:2 axvisor::vmm::images::fs:604] [32m[load_vm_image] Region 0: HVA 0xffff800004fe0000, size 131072 bytes[m
+[m[37m[  1.229861 0:2 axvisor::vmm::images::fs:622] [32m[load_vm_image] Read 131072 bytes into region 0, first 16 bytes: [00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00][m
+[m[37m[  1.233592 0:2 axvisor::vmm::images:360] [32mSetting up fw_cfg and ACPI tables: ram_size=0x2000000, cpu_num=1[m
+[m[37m[  1.236256 0:2 axvisor::vmm::images:393] [32mWrote RSDP (64 bytes) to GPA 0xf0000[m
+[m[37m[  1.238410 0:2 axvisor::vmm::images:410] [32mWrote ACPI tables (438 bytes) to GPA 0xf0040[m
+[m[37m[  1.240837 0:2 axvisor::vmm::images:430] [32mRegistered fw_cfg device at I/O ports 0x510-0x511[m
+[m[37m[  1.243103 0:2 axvm::vm:198] [32mdtb_load_gpa: None[m
+[m[37m[  1.244641 0:2 x86_vcpu::vmx::vcpu:140] [32m[HV] created VmxVcpu(vmcs: PA:0x6684000)[m
+[m[37m[  1.246691 0:2 axdevice::device:313] [32mfw_cfg device will be initialized during UEFI image loading[m
+[m[37m[  1.249424 0:2 x86_vcpu::vmx::vcpu:549] [32m[VMX setup] boot_mode=Uefi, setting CS for UEFI[m
+[m[37m[  1.251603 0:2 x86_vcpu::vmx::vcpu:553] [32m[VMX setup] Set CS_SELECTOR=0xF000, CS_BASE=0xFFFF0000[m
+[m[37m[  1.253829 0:2 x86_vcpu::vmx::vcpu:572] [32m[VMX setup] RIP=0xfff0, entry=0xfffffff0[m
+[m[37m[  1.256087 0:2 axvm::vm:408] [32mVM setup: id=1[m
+[m[37m[  1.257490 0:2 axvisor::vmm:63] [32mSetting up vcpus...[m
+[m[37m[  1.258955 0:2 axvisor::vmm::vcpus:356] [32mInitializing VM[1]'s 1 vcpus[m
+[m[37m[  1.260721 0:2 axvisor::vmm::vcpus:405] [32mSpawning task for VM[1] VCpu[0][m
+[m[37m[  1.262555 0:2 axvisor::vmm::vcpus:420] [32mVCpu task Task(5, "VM[1]-VCpu[0]") created cpumask: [0, ][m
+[m[37m[  1.264940 0:2 axvisor::vmm:71] [32mVMM starting, booting VMs...[m
+[m[37m[  1.266641 0:2 axvm::vm:501] [32mBooting VM[1][m
+[m[37m[  1.267944 0:2 axvisor::vmm:77] [32mVM[1] boot success[m
+[m[37m[  1.269347 0:2 axvisor::vmm:88] [32ma VM exited, current running VM count: 1[m
+[m[37m[  1.271400 0:5 axvisor::vmm::vcpus:443] [32mVM[1] boot delay: 0s[m
+[m[37m[  1.273077 0:5 axvisor::vmm::vcpus:446] [32mVM[1] VCpu[0] waiting for running[m
+[m[37m[  1.274916 0:5 axvisor::vmm::vcpus:449] [32mVM[1] VCpu[0] running...[m
+[m[37m[  1.280350 0:5 x86_vlapic::timer:252] [33m`stop_timer` called when timer is not started, bad operation tolerated[m
+[m[37m[  3.436518 0:5 x86_vcpu::vmx::vcpu:1401] [33minject_interrupt called with vector 0, ignoring[m
+[m

@@ -91,6 +91,13 @@ pub struct AxVmDevices {
     ivc_channel: Option<Mutex<RangeAllocator<usize>>>,
 }
 
+// SAFETY: AxVmDevices is always accessed through a Mutex, which provides
+// synchronization. All device implementations are designed for use in a
+// multi-threaded hypervisor context, and Arc references ensure shared
+// ownership is safe.
+unsafe impl Send for AxVmDevices {}
+unsafe impl Sync for AxVmDevices {}
+
 #[inline]
 fn log_device_io(
     addr_type: &'static str,
@@ -298,6 +305,13 @@ impl AxVmDevices {
                         warn!("IVCChannel already initialized, ignoring additional config");
                     }
                 }
+                EmulatedDeviceType::FwCfg => {
+                    // fw_cfg is created dynamically in ImageLoader during UEFI boot,
+                    // because it needs runtime parameters (ram_size, cpu_num, ACPI tables).
+                    // This branch is reached only if fw_cfg is declared in TOML config,
+                    // which serves as a hint that the VM needs fw_cfg.
+                    info!("fw_cfg device will be initialized during UEFI image loading");
+                }
                 _ => {
                     warn!(
                         "Emulated device {}'s type {:?} is not supported yet",
@@ -486,5 +500,24 @@ impl AxVmDevices {
             return emu_dev.handle_write(port, width, val);
         }
         panic_device_not_found("port", port, false, width);
+    }
+
+    /// Merge devices from another `AxVmDevices` into this one.
+    ///
+    /// Devices from `other` are added to this instance. If this instance
+    /// already has an IVC channel, the one from `other` is discarded.
+    pub fn merge(&mut self, other: AxVmDevices) {
+        for dev in other.emu_mmio_devices.iter() {
+            self.add_mmio_dev(dev.clone());
+        }
+        for dev in other.emu_sys_reg_devices.iter() {
+            self.add_sys_reg_dev(dev.clone());
+        }
+        for dev in other.emu_port_devices.iter() {
+            self.add_port_dev(dev.clone());
+        }
+        if self.ivc_channel.is_none() {
+            self.ivc_channel = other.ivc_channel;
+        }
     }
 }

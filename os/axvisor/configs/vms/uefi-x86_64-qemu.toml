@@ -31,21 +31,24 @@ boot_mode = "uefi"
 # Memory regions with format (`base_paddr`, `size`, `flags`, `map_type`).
 # For `map_type`, 0 means `MAP_ALLOC`, 1 means `MAP_IDENTICAL`, 2 means `MAP_RESERVED`.
 # Memory layout:
-# 0x0000_0000 - 0x00FF_FFFF: Low RAM (16 MiB) for OVMF scratch space
-# 0x1000_0000 - 0x101F_FFFF: pflash0 (OVMF_CODE) - 2 MiB (actual OVMF size)
-# 0x1020_0000 - 0x103F_FFFF: pflash1 (OVMF_VARS) - 2 MiB
+# 0x0000_0000 - 0x01FF_FFFF: Low RAM (32 MiB) for OVMF (needs at least 24 MiB)
+# 0x000F_0000 - 0x000F_FFFF: ACPI table area (RSDP + tables)
+# 0xFFE0_0000 - 0xFFFF_FFFF: pflash0 (OVMF_CODE) - 2 MiB (includes reset vector at 0xFFFFFFF0)
+# 0xFFC0_0000 - 0xFFDF_FFFF: pflash1 (OVMF_VARS) - 2 MiB
 memory_regions = [
-  [0x0000_0000, 0x100_0000, 0x7, 0],   # Low RAM 16 MiB R|W|X
-  [0x1000_0000, 0x20_0000, 0x5, 0],    # pflash0 (OVMF_CODE) 2 MiB R|X
-  [0x1020_0000, 0x20_0000, 0x3, 0],    # pflash1 (OVMF_VARS) 2 MiB R|W
+  [0x0000_0000, 0x200_0000, 0x7, 0],   # Low RAM 32 MiB R|W|X (includes ACPI area at 0xF0000)
+  [0xFFE0_0000, 0x20_0000, 0x5, 0],    # pflash0 (OVMF_CODE) 2 MiB R|X (reset vector at 0xFFFFFFF0)
+  [0xFFC0_0000, 0x20_0000, 0x3, 0],    # pflash1 (OVMF_VARS) 2 MiB R|W
 ]
 
 # OVMF_CODE (pflash0) - Read-only firmware code
+# Must be mapped at 0xFFE00000 so that the reset vector at 0xFFFFFFF0 falls within
+# this region: 0xFFE00000 + 0x1FFFF0 = 0xFFFFFFF0 (last 16 bytes of 2 MiB flash).
 # OVMF images are typically 2 MiB (OVMF_CODE.fd) or 4 MiB (OVMF_CODE_4M.fd)
-pflash0 = { path = "/guest/ovmf/OVMF_CODE.fd", base_gpa = 0x10000000, size = 0x200000, read_only = true }
+pflash0 = { path = "/guest/ovmf/OVMF_CODE.fd", base_gpa = 0xFFE00000, size = 0x200000, read_only = true }
 
 # OVMF_VARS (pflash1) - Read-write UEFI variable store
-pflash1 = { path = "/guest/ovmf/OVMF_VARS.fd", base_gpa = 0x10200000, size = 0x200000, read_only = false }
+pflash1 = { path = "/guest/ovmf/OVMF_VARS.fd", base_gpa = 0xFFC00000, size = 0x200000, read_only = false }
 
 #
 # Device specifications
@@ -53,11 +56,11 @@ pflash1 = { path = "/guest/ovmf/OVMF_VARS.fd", base_gpa = 0x10200000, size = 0x2
 [devices]
 interrupt_mode = "passthrough"
 
-# TODO: Stage 2 will add fw_cfg device here
-# TODO: Stage 2 will add ACPI table generation
-# TODO: Stage 3 will add PCI/virtio devices
-
-emu_devices = []
+# fw_cfg device - provides boot info to OVMF (RAM size, CPU count, ACPI tables)
+# Note: fw_cfg is created dynamically by ImageLoader, this entry serves as a hint
+emu_devices = [
+  { name = "fw-cfg", base_gpa = 0, length = 2, irq_id = 0, emu_type = 0x10, cfg_list = [] },
+]
 
 passthrough_devices = [
   ["IO APIC", 0xfec0_0000, 0xfec0_0000, 0x1000, 0x1],

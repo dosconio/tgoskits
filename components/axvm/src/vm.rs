@@ -50,7 +50,6 @@ pub type AxVMRef = Arc<AxVM>;
 struct AxVMInnerConst {
     phys_cpu_ls: PhysCpuList,
     vcpu_list: Box<[AxVCpuRef]>,
-    devices: AxVmDevices,
 }
 
 unsafe impl Send for AxVMInnerConst {}
@@ -150,6 +149,7 @@ pub struct AxVM {
     id: usize,
     inner_const: Once<AxVMInnerConst>,
     inner_mut: Mutex<AxVMInnerMut>,
+    devices: Mutex<AxVmDevices>,
 }
 
 impl AxVM {
@@ -172,6 +172,9 @@ impl AxVM {
                 memory_regions: Vec::new(),
                 vm_status: VMStatus::Loading,
             }),
+            devices: Mutex::new(axdevice::AxVmDevices::new(AxVmDeviceConfig {
+                emu_configs: Vec::new(),
+            })),
         });
 
         info!("VM created: id={}", result.id());
@@ -342,8 +345,11 @@ impl AxVM {
         self.inner_const.call_once(|| AxVMInnerConst {
             phys_cpu_ls: inner_mut.config.phys_cpu_ls.clone(),
             vcpu_list: vcpu_list.into_boxed_slice(),
-            devices,
         });
+
+        // Merge configured devices into self.devices (preserving any devices
+        // that were added earlier, e.g. fw_cfg during UEFI image loading).
+        self.devices.lock().merge(devices);
 
         // Setup VCpus.
         for vcpu in self.vcpu_list() {
@@ -382,6 +388,22 @@ impl AxVM {
                 inner_mut.address_space.page_table_root(),
                 setup_config,
             )?;
+
+            // Set I/O bitmap intercept for port devices on x86_64.
+            // This must be done after vcpu.setup() which initializes the I/O bitmap.
+            #[cfg(target_arch = "x86_64")]
+            {
+                let devices = self.devices.lock();
+                for port_dev in devices.iter_port_dev() {
+                    let range = port_dev.address_range();
+                    let port_count = (range.end.0 - range.start.0 + 1) as u32;
+                    vcpu.get_arch_vcpu().set_io_intercept_of_range(
+                        range.start.0 as u32,
+                        port_count,
+                        true,
+                    );
+                }
+            }
         }
         info!("VM setup: id={}", self.id());
         Ok(())
@@ -456,6 +478,16 @@ impl AxVM {
             .address_space
             .translated_byte_buffer(image_load_gpa, image_size)
             .expect("Failed to translate kernel image load address");
+        debug!(
+            "[get_image_load_region] GPA {:#x} -> {} regions, first HVA {:#x}",
+            image_load_gpa,
+            image_load_hva.len(),
+            if !image_load_hva.is_empty() {
+                image_load_hva[0].as_ptr() as usize
+            } else {
+                0
+            }
+        );
         Ok(image_load_hva)
     }
 
@@ -513,8 +545,8 @@ impl AxVM {
     // TODO: implement re-init.
 
     /// Returns this VM's emulated devices.
-    pub fn get_devices(&self) -> &AxVmDevices {
-        &self.inner_const().devices
+    pub fn get_devices(&self) -> &Mutex<AxVmDevices> {
+        &self.devices
     }
 
     /// Run a vCPU according to the given vcpu_id.
@@ -542,17 +574,18 @@ impl AxVM {
                     reg_width: _,
                     signed_ext: _,
                 } => {
-                    let val = self.get_devices().handle_mmio_read(*addr, *width)?;
+                    let val = self.get_devices().lock().handle_mmio_read(*addr, *width)?;
                     vcpu.set_gpr(*reg, val);
                     true
                 }
                 AxVCpuExitReason::MmioWrite { addr, width, data } => {
                     self.get_devices()
+                        .lock()
                         .handle_mmio_write(*addr, *width, *data as usize)?;
                     true
                 }
                 AxVCpuExitReason::IoRead { port, width } => {
-                    let val = self.get_devices().handle_port_read(*port, *width)?;
+                    let val = self.get_devices().lock().handle_port_read(*port, *width)?;
                     #[cfg(not(target_arch = "riscv64"))]
                     vcpu.set_gpr(0, val); // The target is always eax/ax/al, todo: handle access_width correctly
 
@@ -563,11 +596,132 @@ impl AxVM {
                 }
                 AxVCpuExitReason::IoWrite { port, width, data } => {
                     self.get_devices()
+                        .lock()
                         .handle_port_write(*port, *width, *data as usize)?;
                     true
                 }
+                AxVCpuExitReason::IoStringIn {
+                    port,
+                    width,
+                    count,
+                    guest_addr,
+                    dir_down,
+                } => {
+                    let width_bytes = match width {
+                        AccessWidth::Byte => 1usize,
+                        AccessWidth::Word => 2,
+                        AccessWidth::Dword => 4,
+                        AccessWidth::Qword => 8,
+                    };
+                    let total_bytes = *count as usize * width_bytes;
+                    // Translate the entire buffer range once
+                    let base_gpa = GuestPhysAddr::from(*guest_addr as usize);
+                    if let Ok(slice) = self.get_image_load_region(base_gpa, total_bytes)
+                        && !slice.is_empty()
+                    {
+                        let base_ptr = slice[0].as_ptr() as *mut u8;
+                        let step = if *dir_down {
+                            -(width_bytes as isize)
+                        } else {
+                            width_bytes as isize
+                        };
+                        let mut offset: isize = 0;
+                        for _ in 0..*count {
+                            let val = self.get_devices().lock().handle_port_read(*port, *width)?;
+                            let dst = unsafe { base_ptr.offset(offset) };
+                            match width {
+                                AccessWidth::Byte => unsafe { dst.write_volatile(val as u8) },
+                                AccessWidth::Word => unsafe {
+                                    (dst as *mut u16).write_volatile(val as u16)
+                                },
+                                AccessWidth::Dword => unsafe {
+                                    (dst as *mut u32).write_volatile(val as u32)
+                                },
+                                AccessWidth::Qword => unsafe {
+                                    (dst as *mut u64).write_volatile(val as u64)
+                                },
+                            }
+                            offset += step;
+                        }
+                        // Update RDI and RCX: all count processed
+                        let new_addr = *guest_addr as i64
+                            + if *dir_down {
+                                -(*count as i64 * width_bytes as i64)
+                            } else {
+                                *count as i64 * width_bytes as i64
+                            };
+                        vcpu.set_gpr(7, new_addr as usize); // RDI
+                        vcpu.set_gpr(1, 0); // RCX = 0 (all done)
+                    } else {
+                        // Failed to translate, skip but still update registers
+                        vcpu.set_gpr(7, *guest_addr as usize);
+                        vcpu.set_gpr(1, *count as usize);
+                    }
+                    true
+                }
+                AxVCpuExitReason::IoStringOut {
+                    port,
+                    width,
+                    count,
+                    guest_addr,
+                    dir_down,
+                } => {
+                    let width_bytes = match width {
+                        AccessWidth::Byte => 1usize,
+                        AccessWidth::Word => 2,
+                        AccessWidth::Dword => 4,
+                        AccessWidth::Qword => 8,
+                    };
+                    let total_bytes = *count as usize * width_bytes;
+                    // Translate the entire buffer range once
+                    let base_gpa = GuestPhysAddr::from(*guest_addr as usize);
+                    if let Ok(slice) = self.get_image_load_region(base_gpa, total_bytes)
+                        && !slice.is_empty()
+                    {
+                        let base_ptr = slice[0].as_ptr();
+                        let step = if *dir_down {
+                            -(width_bytes as isize)
+                        } else {
+                            width_bytes as isize
+                        };
+                        let mut offset: isize = 0;
+                        for _ in 0..*count {
+                            let data = match width {
+                                AccessWidth::Byte => unsafe {
+                                    base_ptr.offset(offset).read_volatile() as usize
+                                },
+                                AccessWidth::Word => unsafe {
+                                    (base_ptr.offset(offset) as *const u16).read_volatile() as usize
+                                },
+                                AccessWidth::Dword => unsafe {
+                                    (base_ptr.offset(offset) as *const u32).read_volatile() as usize
+                                },
+                                AccessWidth::Qword => unsafe {
+                                    (base_ptr.offset(offset) as *const u64).read_volatile() as usize
+                                },
+                            };
+                            self.get_devices()
+                                .lock()
+                                .handle_port_write(*port, *width, data)?;
+                            offset += step;
+                        }
+                        // Update RSI and RCX: all count processed
+                        let new_addr = *guest_addr as i64
+                            + if *dir_down {
+                                -(*count as i64 * width_bytes as i64)
+                            } else {
+                                *count as i64 * width_bytes as i64
+                            };
+                        vcpu.set_gpr(6, new_addr as usize); // RSI
+                        vcpu.set_gpr(1, 0); // RCX = 0 (all done)
+                    } else {
+                        vcpu.set_gpr(6, *guest_addr as usize);
+                        vcpu.set_gpr(1, *count as usize);
+                    }
+                    true
+                }
                 AxVCpuExitReason::SysRegRead { addr, reg } => {
-                    let val = self.get_devices().handle_sys_reg_read(
+                    let val = self.get_devices().lock().handle_sys_reg_read(
                         *addr,
                         // Generally speaking, the width of system register is fixed and needless to be specified.
                         // AccessWidth::Qword here is just a placeholder, may be changed in the future.
@@ -577,18 +731,27 @@ impl AxVM {
                     true
                 }
                 AxVCpuExitReason::SysRegWrite { addr, value } => {
-                    self.get_devices().handle_sys_reg_write(
+                    self.get_devices().lock().handle_sys_reg_write(
                         *addr,
                         AccessWidth::Qword,
                         *value as usize,
                     )?;
                     true
                 }
-                AxVCpuExitReason::NestedPageFault { addr, access_flags } => self
-                    .inner_mut
-                    .lock()
-                    .address_space
-                    .handle_page_fault(*addr, *access_flags),
+                AxVCpuExitReason::NestedPageFault { addr, access_flags } => {
+                    let handled = self
+                        .inner_mut
+                        .lock()
+                        .address_space
+                        .handle_page_fault(*addr, *access_flags);
+                    if !handled {
+                        warn!(
+                            "Unhandled EPT violation: GPA={:#x}, access={:?}",
+                            addr, access_flags
+                        );
+                    }
+                    handled
+                }
                 _ => false,
             };
             if !handled {
@@ -741,7 +904,7 @@ impl AxVM {
     pub fn alloc_ivc_channel(&self, expected_size: usize) -> AxResult<(GuestPhysAddr, usize)> {
         // Ensure the expected size is aligned to 4K.
         let size = align_up_4k(expected_size);
-        let gpa = self.inner_const().devices.alloc_ivc_channel(size)?;
+        let gpa = self.devices.lock().alloc_ivc_channel(size)?;
         Ok((gpa, size))
     }
 
@@ -752,7 +915,7 @@ impl AxVM {
     /// ## Returns
     /// * `AxResult<()>` - An empty result indicating success or failure.
     pub fn release_ivc_channel(&self, gpa: GuestPhysAddr, size: usize) -> AxResult {
-        self.inner_const().devices.release_ivc_channel(gpa, size)?;
+        self.devices.lock().release_ivc_channel(gpa, size)?;
         Ok(())
     }
 
@@ -810,23 +973,32 @@ impl AxVM {
             layout.size() > 0,
             "Cannot allocate zero-sized memory region"
         );
+
+        let hva = unsafe { alloc::alloc::alloc_zeroed(layout) };
+        if hva.is_null() {
+            return Err(AxError::NoMemory);
+        }
+        let s = unsafe { core::slice::from_raw_parts_mut(hva, layout.size()) };
+        let hva = HostVirtAddr::from_mut_ptr_of(hva);
+
+        let hpa = axvisor_api::memory::virt_to_phys(hva);
+
+        let gpa = gpa.unwrap_or_else(|| hpa.as_usize().into());
+
         let mut g = self.inner_mut.lock();
         g.address_space.map_linear(
-            gpa.unwrap(),
-            gpa.unwrap().as_usize().into(),
+            gpa,
+            hpa,
             layout.size(),
             MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE | MappingFlags::USER,
         )?;
-        let hva = gpa.unwrap().as_usize().into();
-        let tem_hva = gpa.unwrap().as_usize() as *mut u8;
-        let s = unsafe { core::slice::from_raw_parts_mut(tem_hva, layout.size()) };
-        let gpa = gpa.unwrap();
         g.memory_regions.push(VMMemoryRegion {
             gpa,
             hva,
             layout,
-            needs_dealloc: false, // This is a reserved region, not allocated
+            needs_dealloc: true,
         });
+
         Ok(s)
     }
 
@@ -920,23 +1092,21 @@ impl AxVM {
         // - Hardware interrupt registrations
         // - DMA mappings
         // - Background threads or timers
-        if let Some(inner_const) = self.inner_const.get() {
-            debug!(
-                "VM[{}] devices cleanup: {} MMIO devices, {} SysReg devices",
-                self.id(),
-                inner_const.devices.iter_mmio_dev().count(),
-                inner_const.devices.iter_sys_reg_dev().count()
-            );
+        debug!(
+            "VM[{}] devices cleanup: {} MMIO devices, {} SysReg devices",
+            self.id(),
+            self.devices.lock().iter_mmio_dev().count(),
+            self.devices.lock().iter_sys_reg_dev().count()
+        );
 
-            // TODO: Add device-specific cleanup if needed
-            // For example:
-            // - Stop device background tasks
-            // - Unregister interrupts
-            // - Release device-specific resources
+        // TODO: Add device-specific cleanup if needed
+        // For example:
+        // - Stop device background tasks
+        // - Unregister interrupts
+        // - Release device-specific resources
 
-            // Note: Device Arc references will be dropped automatically when
-            // inner_const is dropped at the end of AxVM's drop
-        }
+        // Note: Device Arc references will be dropped automatically when
+        // AxVM is dropped
 
         info!("VM[{}] resources cleanup completed", self.id());
     }

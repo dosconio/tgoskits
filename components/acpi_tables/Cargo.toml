@@ -1,0 +1,10 @@
+[package]
+name = "acpi_tables"
+version = "0.1.0"
+edition.workspace = true
+authors = ["Axvisor Team"]
+description = "ACPI table generation for UEFI guest VMs"
+license = "Apache-2.0"
+
+[dependencies]
+log = "0.4"

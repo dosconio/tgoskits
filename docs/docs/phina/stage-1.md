@@ -565,3 +565,11 @@ cargo test --package axvmconfig
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+## 文档中的配置错误
+文档中的示例配置使用了 错误的 GPA 地址 ：
+
+```
+# 文档中的错误示例
+pflash0 = { path = "/guest/ovmf/OVMF_CODE.fd", base_gpa = 0x10000000, ... }
+```
+这是错误的！x86 reset vector 在 0xFFFFFFF0 ，pflash 必须映射到高地址才能覆盖这个地址。

@@ -554,8 +554,12 @@ impl VmxVcpu {
         // In UEFI mode, the reset vector is at 0xFFFFFFF0 which is near the top
         // of the 4GB address space. CS base must be set to 0xFFFF0000 so that
         // the linear address (CS_base + IP) = 0xFFFF0000 + 0xFFF0 = 0xFFFFFFF0.
+        // This matches the x86 hardware reset state: CS=0xF000, IP=0xFFF0.
+        info!("[VMX setup] boot_mode={:?}, setting CS for UEFI", boot_mode);
         if boot_mode == X86BootMode::Uefi {
             VmcsGuestNW::CS_BASE.write(0xFFFF0000)?;
+            VmcsGuest16::CS_SELECTOR.write(0xF000)?;
+            info!("[VMX setup] Set CS_SELECTOR=0xF000, CS_BASE=0xFFFF0000");
         }
 
         VmcsGuestNW::GDTR_BASE.write(0)?;
@@ -566,7 +570,20 @@ impl VmxVcpu {
         VmcsGuestNW::CR3.write(0)?;
         VmcsGuestNW::DR7.write(0x400)?;
         VmcsGuestNW::RSP.write(0)?;
-        VmcsGuestNW::RIP.write(entry.as_usize())?;
+        // In UEFI mode, RIP should be 0xFFF0 (the offset within the CS segment),
+        // not the full linear address 0xFFFFFFF0. The linear address is computed
+        // by the processor as CS.base + RIP = 0xFFFF0000 + 0xFFF0 = 0xFFFFFFF0.
+        let rip_val = if boot_mode == X86BootMode::Uefi {
+            0xFFF0usize
+        } else {
+            entry.as_usize()
+        };
+        info!(
+            "[VMX setup] RIP={:#x}, entry={:#x}",
+            rip_val,
+            entry.as_usize()
+        );
+        VmcsGuestNW::RIP.write(rip_val)?;
         VmcsGuestNW::RFLAGS.write(0x2)?;
         VmcsGuestNW::PENDING_DBG_EXCEPTIONS.write(0)?;
         VmcsGuestNW::IA32_SYSENTER_ESP.write(0)?;
@@ -1267,36 +1284,57 @@ impl AxArchVCpu for VmxVcpu {
 
                         let port = io_info.port;
 
-                        if io_info.is_repeat || io_info.is_string {
-                            warn!("VMX unsupported IO-Exit: {io_info:#x?} of {exit_info:#x?}");
-                            warn!("VCpu {self:#x?}");
-                            AxVCpuExitReason::Halt
-                        } else {
-                            let width = match AccessWidth::try_from(io_info.access_size as usize) {
-                                Ok(width) => width,
-                                Err(_) => {
-                                    warn!("VMX invalid IO-Exit: {io_info:#x?} of {exit_info:#x?}");
-                                    warn!("VCpu {self:#x?}");
-                                    return Ok(AxVCpuExitReason::Halt);
-                                }
+                        let width = match AccessWidth::try_from(io_info.access_size as usize) {
+                            Ok(width) => width,
+                            Err(_) => {
+                                warn!("VMX invalid IO-Exit: {io_info:#x?} of {exit_info:#x?}");
+                                return Ok(AxVCpuExitReason::Halt);
+                            }
+                        };
+
+                        if io_info.is_string {
+                            // String I/O: ins/outs with optional rep prefix
+                            let count = if io_info.is_repeat {
+                                self.regs().rcx
+                            } else {
+                                1
                             };
+                            let dir_down = VmcsGuestNW::RFLAGS.read().unwrap_or(0) & (1 << 10) != 0; // DF flag
 
                             if io_info.is_in {
-                                AxVCpuExitReason::IoRead {
+                                // rep insb/w/d: read from port, write to [RDI]
+                                AxVCpuExitReason::IoStringIn {
                                     port: Port(port),
                                     width,
+                                    count,
+                                    guest_addr: self.regs().rdi,
+                                    dir_down,
                                 }
-                            } else if port == QEMU_EXIT_PORT
-                                && width == AccessWidth::Word
-                                && self.regs().rax == QEMU_EXIT_MAGIC
-                            {
-                                AxVCpuExitReason::SystemDown
                             } else {
-                                AxVCpuExitReason::IoWrite {
+                                // rep outsb/w/d: read from [RSI], write to port
+                                AxVCpuExitReason::IoStringOut {
                                     port: Port(port),
                                     width,
-                                    data: self.regs().rax.get_bits(width.bits_range()),
+                                    count,
+                                    guest_addr: self.regs().rsi,
+                                    dir_down,
                                 }
+                            }
+                        } else if io_info.is_in {
+                            AxVCpuExitReason::IoRead {
+                                port: Port(port),
+                                width,
+                            }
+                        } else if port == QEMU_EXIT_PORT
+                            && width == AccessWidth::Word
+                            && self.regs().rax == QEMU_EXIT_MAGIC
+                        {
+                            AxVCpuExitReason::SystemDown
+                        } else {
+                            AxVCpuExitReason::IoWrite {
+                                port: Port(port),
+                                width,
+                                data: self.regs().rax.get_bits(width.bits_range()),
                             }
                         }
                     }
@@ -1314,6 +1352,19 @@ impl AxArchVCpu for VmxVcpu {
                             reg: 0,
                         }
                     }
+                    VmxExitReason::EPT_VIOLATION => {
+                        let info = self.nested_page_fault_info()?;
+                        info!(
+                            "EPT_VIOLATION: GPA={:#x}, access={:?}, RIP={:#x}",
+                            info.fault_guest_paddr,
+                            info.access_flags,
+                            self.rip()
+                        );
+                        AxVCpuExitReason::NestedPageFault {
+                            addr: info.fault_guest_paddr,
+                            access_flags: info.access_flags,
+                        }
+                    }
                     VmxExitReason::MSR_WRITE => {
                         let value = (self.regs().rax & 0xffff_ffff)
                             | ((self.regs().rdx & 0xffff_ffff) << 32);
@@ -1323,6 +1374,18 @@ impl AxArchVCpu for VmxVcpu {
                         }
                     }
                     _ => {
+                        if exit_info.exit_reason == VmxExitReason::EXCEPTION_NMI
+                            && let Ok(int_info) = self.interrupt_exit_info()
+                        {
+                            warn!(
+                                "VMX EXCEPTION_NMI: vector={}, int_type={:?}, err_code={:?}, \
+                                 valid={}",
+                                int_info.vector,
+                                int_info.int_type,
+                                int_info.err_code,
+                                int_info.valid
+                            );
+                        }
                         warn!("VMX unsupported VM-Exit: {exit_info:#x?}");
                         warn!("VCpu {self:#x?}");
                         AxVCpuExitReason::Halt
@@ -1347,11 +1410,9 @@ impl AxArchVCpu for VmxVcpu {
     }
 
     fn inject_interrupt(&mut self, vector: usize) -> AxResult {
-        if vector != 0 {
-            // warn!("interrupt queued in inject_interrupt: vector {:#x}", vector);
-        } else {
-            warn!("interrupt queued in inject_interrupt: vector 0");
-            panic!()
+        if vector == 0 {
+            warn!("inject_interrupt called with vector 0, ignoring");
+            return Ok(());
         }
         self.queue_event(vector as u8, None);
         Ok(())

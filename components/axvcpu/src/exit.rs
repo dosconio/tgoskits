@@ -144,6 +144,42 @@ pub enum AxVCpuExitReason {
         data: u64,
     },
 
+    /// The guest performed a string port I/O read (e.g., `rep insb`).
+    ///
+    /// **Architecture**: x86-specific. The hypervisor should read `count` values
+    /// from the port and write them into guest memory starting at `guest_addr`.
+    /// After handling, the hypervisor must update the vCPU's RDI and RCX registers.
+    IoStringIn {
+        /// I/O port number being read from
+        port: Port,
+        /// Width of each I/O access (8, 16, or 32 bits)
+        width: AccessWidth,
+        /// Number of iterations (from RCX before the instruction)
+        count: u64,
+        /// Guest virtual address of the destination buffer (from RDI)
+        guest_addr: u64,
+        /// Whether the direction flag (DF) is set (RDI decrements instead of incrementing)
+        dir_down: bool,
+    },
+
+    /// The guest performed a string port I/O write (e.g., `rep outsb`).
+    ///
+    /// **Architecture**: x86-specific. The hypervisor should read `count` values
+    /// from guest memory starting at `guest_addr` and write them to the port.
+    /// After handling, the hypervisor must update the vCPU's RSI and RCX registers.
+    IoStringOut {
+        /// I/O port number being written to
+        port: Port,
+        /// Width of each I/O access (8, 16, or 32 bits)
+        width: AccessWidth,
+        /// Number of iterations (from RCX before the instruction)
+        count: u64,
+        /// Guest virtual address of the source buffer (from RSI)
+        guest_addr: u64,
+        /// Whether the direction flag (DF) is set (RSI decrements instead of incrementing)
+        dir_down: bool,
+    },
+
     /// An external interrupt was delivered to the VCpu.
     ///
     /// This represents hardware interrupts from external devices that need
