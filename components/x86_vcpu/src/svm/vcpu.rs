@@ -891,6 +891,10 @@ impl AxArchVCpu for SvmVcpu {
         )
     }
 
+    fn handle_timer_expired(&mut self) -> AxResult {
+        Ok(())
+    }
+
     fn set_return_value(&mut self, val: usize) {
         self.regs_mut().rax = val as u64;
     }

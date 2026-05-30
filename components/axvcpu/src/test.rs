@@ -135,6 +135,13 @@ mod tests {
             Ok(())
         }
 
+        fn handle_timer_expired(&mut self) -> AxResult {
+            self.call_log
+                .borrow_mut()
+                .push("handle_timer_expired".to_string());
+            Ok(())
+        }
+
         fn set_return_value(&mut self, val: usize) {
             self.call_log
                 .borrow_mut()

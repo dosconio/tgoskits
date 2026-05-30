@@ -301,6 +301,11 @@ impl<A: AxArchVCpu> AxVCpu<A> {
         self.get_arch_vcpu().inject_interrupt(vector)
     }
 
+    /// Handle a virtual timer expiration event for this VCpu.
+    pub fn handle_timer_expired(&self) -> AxResult {
+        self.get_arch_vcpu().handle_timer_expired()
+    }
+
     /// Sets the return value of the VCpu.
     pub fn set_return_value(&self, val: usize) {
         self.get_arch_vcpu().set_return_value(val);

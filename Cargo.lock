@@ -1944,6 +1944,8 @@ dependencies = [
  "hashbrown 0.14.5",
  "lazy_static",
  "log",
+ "pci_host",
+ "pm_timer",
  "prettyplease",
  "quote",
  "rdif-intc",
@@ -1954,6 +1956,7 @@ dependencies = [
  "syn 2.0.117",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
+ "virtio_blk_pci",
 ]
 
 [[package]]
@@ -5681,6 +5684,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pci_host"
+version = "0.1.0"
+dependencies = [
+ "ax-errno",
+ "axaddrspace",
+ "axdevice_base",
+ "log",
+ "spin 0.10.0",
+]
+
+[[package]]
 name = "pci_types"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5864,6 +5878,7 @@ dependencies = [
 ]
 
 [[package]]
+<<<<<<< HEAD
 name = "png"
 version = "0.17.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5874,6 +5889,15 @@ dependencies = [
  "fdeflate",
  "flate2",
  "miniz_oxide",
+=======
+name = "pm_timer"
+version = "0.1.0"
+dependencies = [
+ "ax-errno",
+ "axaddrspace",
+ "axdevice_base",
+ "log",
+>>>>>>> acc3e27ae (stage3)
 ]
 
 [[package]]
@@ -9060,6 +9084,18 @@ dependencies = [
  "safe-mmio",
  "thiserror 2.0.18",
  "zerocopy",
+]
+
+[[package]]
+name = "virtio_blk_pci"
+version = "0.1.0"
+dependencies = [
+ "ax-errno",
+ "axaddrspace",
+ "axdevice_base",
+ "log",
+ "pci_host",
+ "spin 0.10.0",
 ]
 
 [[package]]

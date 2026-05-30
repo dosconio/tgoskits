@@ -60,6 +60,7 @@ pub struct IOBitmap {
 }
 
 impl IOBitmap {
+    #[allow(unused)]
     pub fn passthrough_all() -> AxResult<Self> {
         Ok(Self {
             io_bitmap_a_frame: PhysFrame::alloc_zero()?,

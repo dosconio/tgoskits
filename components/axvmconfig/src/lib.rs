@@ -141,6 +141,10 @@ pub enum EmulatedDeviceType {
     // 0x10 - 0x1F: Platform devices.
     /// QEMU fw_cfg (Firmware Configuration) device for passing boot info to UEFI firmware.
     FwCfg               = 0x10,
+    /// PCI Host Bridge for PCI configuration space access (0xCF8/0xCFC).
+    PciHostBridge       = 0x11,
+    /// ACPI Power Management Timer (PMTimer) for timekeeping.
+    PmTimer             = 0x12,
 
     // Arch-specific interrupt controller devices.
     // 0x20 - 0x22: GPPT (GIC Partial Passthrough) devices.
@@ -191,6 +195,8 @@ impl Display for EmulatedDeviceType {
             // EmulatedDeviceType::GICR => write!(f, "interrupt controller gicr"),
             EmulatedDeviceType::IVCChannel => write!(f, "ivc channel"),
             EmulatedDeviceType::FwCfg => write!(f, "fw_cfg"),
+            EmulatedDeviceType::PciHostBridge => write!(f, "pci host bridge"),
+            EmulatedDeviceType::PmTimer => write!(f, "pm timer"),
             EmulatedDeviceType::Dummy => write!(f, "meta device"),
             EmulatedDeviceType::VirtioBlk => write!(f, "virtio block"),
             EmulatedDeviceType::VirtioNet => write!(f, "virtio net"),
@@ -224,6 +230,8 @@ impl EmulatedDeviceType {
             0x2 => EmulatedDeviceType::Console,
             0xA => EmulatedDeviceType::IVCChannel,
             0x10 => EmulatedDeviceType::FwCfg,
+            0x11 => EmulatedDeviceType::PciHostBridge,
+            0x12 => EmulatedDeviceType::PmTimer,
             0x20 => EmulatedDeviceType::GPPTRedistributor,
             0x21 => EmulatedDeviceType::GPPTDistributor,
             0x22 => EmulatedDeviceType::GPPTITS,

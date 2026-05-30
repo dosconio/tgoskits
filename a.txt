@@ -1,12 +1,12 @@
 Using build config: os/axvisor/configs/board/qemu-x86_64.toml
-AX_TARGET=x86_64-unknown-none
+AXVISOR_VM_CONFIGS=/home/phina/Documents/tgoskits/os/axvisor/configs/vms/uefi-x86_64-qemu.toml
+AX_CONFIG_PATH=/home/phina/Documents/tgoskits/tmp/axbuild/axconfig/axvisor/x86_64-unknown-none/.axconfig.toml
+AX_IP=10.0.2.15
+AX_LOG=info
 AX_GW=10.0.2.2
 AX_ARCH=x86_64
 AX_PLATFORM=x86-qemu-q35
-AX_IP=10.0.2.15
-AXVISOR_VM_CONFIGS=/home/phina/Documents/tgoskits/os/axvisor/configs/vms/uefi-x86_64-qemu.toml
-AX_LOG=info
-AX_CONFIG_PATH=/home/phina/Documents/tgoskits/tmp/axbuild/axconfig/axvisor/x86_64-unknown-none/.axconfig.toml
+AX_TARGET=x86_64-unknown-none
 cargo build -p axvisor --target x86_64-unknown-none -Z unstable-options --target-dir /home/phina/Documents/tgoskits/target --features ax-std/myplat,ept-level-4,fs,vmx,log/release_max_level_info --config target.x86_64-unknown-none.rustflags=["-Clink-arg=-Tlinker.x","-Clink-arg=-no-pie","-Clink-arg=-znostart-stop-gc"] --bin axvisor --release --message-format json-render-diagnostics
 qemu-system-x86_64 -nographic -cpu host -machine q35 -smp 1 -enable-kvm -device virtio-blk-pci,drive=disk0 -drive id=disk0,if=none,format=raw,file=/home/phina/Documents/tgoskits/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img -m 128M -kernel /home/phina/Documents/tgoskits/target/x86_64-unknown-none/release/axvisor
 c[?7l[2J[0mSeaBIOS (version rel-1.16.3-0-ga6ed6b701f0a-prebuilt.qemu.org)
@@ -35,59 +35,59 @@ log_level = info
 backtrace = false
 smp = 1
 
-[37m[  0.007747 ax_runtime:171] [32mLogging is enabled.[m
-[m[37m[  0.008395 ax_runtime:172] [32mPrimary CPU 0 started, arg = 0x9500.[m
-[m[37m[  0.009446 ax_runtime:174] [32mFound physcial memory regions:[m
-[m[37m[  0.010542 ax_runtime:176] [32m  [PA:0x0, PA:0x200000) reserved (READ | WRITE | EXECUTE | RESERVED)[m
-[m[37m[  0.011932 ax_runtime:176] [32m  [PA:0x200000, PA:0x347000) .text (READ | EXECUTE | RESERVED)[m
-[m[37m[  0.012988 ax_runtime:176] [32m  [PA:0x347000, PA:0x36a000) .rodata (READ | RESERVED)[m
-[m[37m[  0.014178 ax_runtime:176] [32m  [PA:0x36a000, PA:0x37d000) .data .tdata .tbss .percpu (READ | WRITE | RESERVED)[m
-[m[37m[  0.015863 ax_runtime:176] [32m  [PA:0x37d000, PA:0x3bd000) boot stack (READ | WRITE | RESERVED)[m
-[m[37m[  0.017367 ax_runtime:176] [32m  [PA:0x3bd000, PA:0x3e3000) .bss (READ | WRITE | RESERVED)[m
-[m[37m[  0.018766 ax_runtime:176] [32m  [PA:0x3e3000, PA:0x7fdc000) free memory (READ | WRITE | FREE)[m
-[m[37m[  0.019842 ax_runtime:176] [32m  [PA:0xb0000000, PA:0xc0000000) mmio (READ | WRITE | DEVICE | RESERVED)[m
-[m[37m[  0.020981 ax_runtime:176] [32m  [PA:0xfe000000, PA:0xfec00000) mmio (READ | WRITE | DEVICE | RESERVED)[m
-[m[37m[  0.022209 ax_runtime:176] [32m  [PA:0xfec00000, PA:0xfec01000) mmio (READ | WRITE | DEVICE | RESERVED)[m
-[m[37m[  0.023429 ax_runtime:176] [32m  [PA:0xfed00000, PA:0xfed01000) mmio (READ | WRITE | DEVICE | RESERVED)[m
-[m[37m[  0.024658 ax_runtime:176] [32m  [PA:0xfee00000, PA:0xfee01000) mmio (READ | WRITE | DEVICE | RESERVED)[m
-[m[37m[  0.025929 ax_runtime:176] [32m  [PA:0x7000000000, PA:0x7000004000) mmio (READ | WRITE | DEVICE | RESERVED)[m
-[m[37m[  0.027136 ax_runtime:176] [32m  [PA:0x380000000000, PA:0x380000004000) mmio (READ | WRITE | DEVICE | RESERVED)[m
-[m[37m[  0.028460 ax_runtime:303] [32mInitialize global memory allocator...[m
-[m[37m[  0.029216 ax_runtime:304] [32m  use TLSF allocator.[m
-[m[37m[  0.029987 ax_runtime:211] [32mkernel aspace: [VA:0xffff800000000000, VA:0xfffffffffffff000)[m
-[m[37m[  0.031044 ax_mm:91] [32mInitialize virtual memory management...[m
-[m[37m[  0.033436 ax_runtime:223] [32mInitialize platform devices...[m
-[m[37m[  0.034349 axplat_x86_qemu_q35::apic:81] [32mInitialize Local APIC...[m
-[m[37m[  0.035168 axplat_x86_qemu_q35::apic:96] [32mUsing x2APIC.[m
-[m[37m[  0.036209 axplat_x86_qemu_q35::apic:111] [32mInitialize IO APIC...[m
-[m[37m[  0.037030 ax_task::api:125] [32mInitialize scheduling...[m
-[m[37m[  0.037811 ax_task::api:130] [32m  use FIFO scheduler.[m
-[m[37m[  0.038616 ax_driver:177] [32mInitialize device drivers...[m
-[m[37m[  0.039286 ax_driver:178] [32m  device model: static[m
-[m[37m[  0.090543 virtio_drivers::device::blk:63] [32mfound a block device of size 1048576KB[m
-[m[37m[  0.092027 ax_driver::bus::pci:111] [32mregistered a new Block device at 00:03.0: "virtio-blk"[m
-[m[37m[  0.628781 ax_fs:42] [32mInitialize filesystems...[m
-[m[37m[  0.629542 ax_fs:45] [32m  use block device 0: "virtio-blk"[m
-[m[37m[  0.630348 ax_fs::partition:95] [32mScanning for GPT partitions...[m
-[m[37m[  0.631441 ax_fs::partition:112] [33mFailed to parse GPT: AxErrorKind::InvalidData[m
-[m[37m[  0.632672 ax_fs::partition:113] [32mTrying MBR...[m
-[m[37m[  0.633456 ax_fs::partition:118] [33mNo partition table found, treating whole disk as single partition[m
-[m[37m[  0.635321 ax_fs:72] [32mFound 1 partitions, initializing with dynamic filesystem detection[m
-[m[37m[  0.636554 ax_fs::root:398] [32mInitializing root filesystem with 1 partitions[m
-[m[37m[  0.637596 ax_fs::partition:420] [32mCreating ext4 filesystem for partition 'disk'[m
-[m[37m[  0.638849 ax_fs::fs::ext4fs:80] [32mGot Partition size:1073742336, position:0[m
-[m[37m[  0.642573 rsext4::ext4::mount:270] [32m/lost+found exists (path resolution)[m
-[m[37m[  0.645152 rsext4::ext4::mount:381] [32mExt4 filesystem mounted[m
-[m[37m[  0.646114 rsext4::ext4::mount:382] [32m  - block size: 4096 bytes[m
-[m[37m[  0.647026 rsext4::ext4::mount:383] [32m  - total blocks: 262144[m
-[m[37m[  0.648020 rsext4::ext4::mount:384] [32m  - free blocks: 178092[m
-[m[37m[  0.648890 rsext4::ext4::mount:385] [32m  - total inodes: 65536[m
-[m[37m[  0.649793 rsext4::ext4::mount:386] [32m  - free inodes: 61339[m
-[m[37m[  0.650667 rsext4::ext4::sync:13] [32mSyncing filesystem...[m
-[m[37m[  0.654789 rsext4::ext4::mount:455] [32mExt4 filesystem mounted[m
-[m[37m[  0.655705 ax_fs::root:300] [32mUsing partition 'disk' (Ext4) as root filesystem[m
-[m[37m[  0.658464 ax_runtime:269] [32mInitialize interrupt handlers...[m
-[m[37m[  0.659425 ax_runtime:281] [32mPrimary CPU 0 init OK.[m
+[37m[  0.007333 ax_runtime:171] [32mLogging is enabled.[m
+[m[37m[  0.008048 ax_runtime:172] [32mPrimary CPU 0 started, arg = 0x9500.[m
+[m[37m[  0.008848 ax_runtime:174] [32mFound physcial memory regions:[m
+[m[37m[  0.009783 ax_runtime:176] [32m  [PA:0x0, PA:0x200000) reserved (READ | WRITE | EXECUTE | RESERVED)[m
+[m[37m[  0.011073 ax_runtime:176] [32m  [PA:0x200000, PA:0x34e000) .text (READ | EXECUTE | RESERVED)[m
+[m[37m[  0.012315 ax_runtime:176] [32m  [PA:0x34e000, PA:0x372000) .rodata (READ | RESERVED)[m
+[m[37m[  0.013401 ax_runtime:176] [32m  [PA:0x372000, PA:0x385000) .data .tdata .tbss .percpu (READ | WRITE | RESERVED)[m
+[m[37m[  0.014698 ax_runtime:176] [32m  [PA:0x385000, PA:0x3c5000) boot stack (READ | WRITE | RESERVED)[m
+[m[37m[  0.015831 ax_runtime:176] [32m  [PA:0x3c5000, PA:0x3eb000) .bss (READ | WRITE | RESERVED)[m
+[m[37m[  0.016940 ax_runtime:176] [32m  [PA:0x3eb000, PA:0x7fdc000) free memory (READ | WRITE | FREE)[m
+[m[37m[  0.017992 ax_runtime:176] [32m  [PA:0xb0000000, PA:0xc0000000) mmio (READ | WRITE | DEVICE | RESERVED)[m
+[m[37m[  0.019316 ax_runtime:176] [32m  [PA:0xfe000000, PA:0xfec00000) mmio (READ | WRITE | DEVICE | RESERVED)[m
+[m[37m[  0.021343 ax_runtime:176] [32m  [PA:0xfec00000, PA:0xfec01000) mmio (READ | WRITE | DEVICE | RESERVED)[m
+[m[37m[  0.024171 ax_runtime:176] [32m  [PA:0xfed00000, PA:0xfed01000) mmio (READ | WRITE | DEVICE | RESERVED)[m
+[m[37m[  0.025932 ax_runtime:176] [32m  [PA:0xfee00000, PA:0xfee01000) mmio (READ | WRITE | DEVICE | RESERVED)[m
+[m[37m[  0.027440 ax_runtime:176] [32m  [PA:0x7000000000, PA:0x7000004000) mmio (READ | WRITE | DEVICE | RESERVED)[m
+[m[37m[  0.028925 ax_runtime:176] [32m  [PA:0x380000000000, PA:0x380000004000) mmio (READ | WRITE | DEVICE | RESERVED)[m
+[m[37m[  0.031269 ax_runtime:303] [32mInitialize global memory allocator...[m
+[m[37m[  0.032306 ax_runtime:304] [32m  use TLSF allocator.[m
+[m[37m[  0.033250 ax_runtime:211] [32mkernel aspace: [VA:0xffff800000000000, VA:0xfffffffffffff000)[m
+[m[37m[  0.034553 ax_mm:91] [32mInitialize virtual memory management...[m
+[m[37m[  0.036749 ax_runtime:223] [32mInitialize platform devices...[m
+[m[37m[  0.037651 axplat_x86_qemu_q35::apic:81] [32mInitialize Local APIC...[m
+[m[37m[  0.038811 axplat_x86_qemu_q35::apic:96] [32mUsing x2APIC.[m
+[m[37m[  0.039918 axplat_x86_qemu_q35::apic:111] [32mInitialize IO APIC...[m
+[m[37m[  0.040963 ax_task::api:125] [32mInitialize scheduling...[m
+[m[37m[  0.041904 ax_task::api:130] [32m  use FIFO scheduler.[m
+[m[37m[  0.043152 ax_driver:177] [32mInitialize device drivers...[m
+[m[37m[  0.043928 ax_driver:178] [32m  device model: static[m
+[m[37m[  0.093736 virtio_drivers::device::blk:63] [32mfound a block device of size 1048576KB[m
+[m[37m[  0.095123 ax_driver::bus::pci:111] [32mregistered a new Block device at 00:03.0: "virtio-blk"[m
+[m[37m[  0.635204 ax_fs:42] [32mInitialize filesystems...[m
+[m[37m[  0.636015 ax_fs:45] [32m  use block device 0: "virtio-blk"[m
+[m[37m[  0.636958 ax_fs::partition:95] [32mScanning for GPT partitions...[m
+[m[37m[  0.638148 ax_fs::partition:112] [33mFailed to parse GPT: AxErrorKind::InvalidData[m
+[m[37m[  0.639308 ax_fs::partition:113] [32mTrying MBR...[m
+[m[37m[  0.640071 ax_fs::partition:118] [33mNo partition table found, treating whole disk as single partition[m
+[m[37m[  0.642082 ax_fs:72] [32mFound 1 partitions, initializing with dynamic filesystem detection[m
+[m[37m[  0.643923 ax_fs::root:398] [32mInitializing root filesystem with 1 partitions[m
+[m[37m[  0.645069 ax_fs::partition:420] [32mCreating ext4 filesystem for partition 'disk'[m
+[m[37m[  0.646254 ax_fs::fs::ext4fs:80] [32mGot Partition size:1073742336, position:0[m
+[m[37m[  0.650000 rsext4::ext4::mount:270] [32m/lost+found exists (path resolution)[m
+[m[37m[  0.652219 rsext4::ext4::mount:381] [32mExt4 filesystem mounted[m
+[m[37m[  0.653163 rsext4::ext4::mount:382] [32m  - block size: 4096 bytes[m
+[m[37m[  0.654018 rsext4::ext4::mount:383] [32m  - total blocks: 262144[m
+[m[37m[  0.654998 rsext4::ext4::mount:384] [32m  - free blocks: 177579[m
+[m[37m[  0.655959 rsext4::ext4::mount:385] [32m  - total inodes: 65536[m
+[m[37m[  0.656910 rsext4::ext4::mount:386] [32m  - free inodes: 61336[m
+[m[37m[  0.657891 rsext4::ext4::sync:13] [32mSyncing filesystem...[m
+[m[37m[  0.660991 rsext4::ext4::mount:455] [32mExt4 filesystem mounted[m
+[m[37m[  0.662002 ax_fs::root:300] [32mUsing partition 'disk' (Ext4) as root filesystem[m
+[m[37m[  0.664914 ax_runtime:269] [32mInitialize interrupt handlers...[m
+[m[37m[  0.666354 ax_runtime:281] [32mPrimary CPU 0 init OK.[m
 [m
 
     _         __     ___
@@ -99,60 +99,329 @@ smp = 1
 
 by AxVisor Team
 
-[37m[  0.662793 0:2 axvisor:61] [32mStarting virtualization...[m
-[m[37m[  0.663485 0:2 axvisor:62] [32mHardware support: true[m
-[m[37m[  0.664290 0:2 axvisor::hal:87] [32mEnabling hardware virtualization support on all cores...[m
-[m[37m[  0.665816 0:2 axvisor::hal:122] [32mWaiting for all cores to enable hardware virtualization...[m
-[m[37m[  0.667184 0:4 axvisor::hal:95] [32mCore 0 is initializing hardware virtualization support...[m
-[m[37m[  0.668416 0:4 axvisor::hal:102] [32mEnabling hardware virtualization support on core 0[m
-[m[37m[  0.669610 0:4 axvisor::vmm::timer:123] [32mIniting HV Timer...[m
-[m[37m[  0.670591 0:4 x86_vcpu::vmx::percpu:135] [32m[AxVM] succeeded to turn on VMX.[m
-[m[37m[  0.672456 0:4 axvisor::hal:116] [32mHardware virtualization support enabled on core 0[m
-[m[37m[  0.674502 0:2 axvisor::hal:132] [32mAll cores have enabled hardware virtualization support.[m
-[m[37m[  0.676960 0:2 axvisor::vmm:58] [32mInitializing VMM...[m
-[m[37m[  0.680467 0:2 axvisor::vmm::config::config:62] [32mNOT find dir: /guest/vm_default in filesystem[m
-[m[37m[  0.682640 0:2 axvisor::vmm::config:170] [32mUsing static VM configs.[m
-[m[37m[  0.684754 0:2 axvisor::vmm::images::fs:520] [33m[AxErrorKind::NotFound] Failed to open , err AxErrorKind::NotFound, please check your disk.img[m
-[m[37m[  0.687886 0:2 axvisor::vmm::config:230] [32mCreating VM[1] "uefi-vm"[m
-[m[37m[  0.689314 0:2 axvm::vm:180] [32mVM created: id=1[m
-[m[37m[  0.798640 0:2 axvisor::vmm::config:248] [32mVM[1] created success, loading images...[m
-[m[37m[  0.800370 0:2 axvisor::vmm::images:85] [32mLoading VM[1] images into memory region: gpa=GPA:0x0, hva=VA:0xffff800002800000, size=32 MiB[m
-[m[37m[  0.803388 0:2 axvisor::vmm::images:99] [32m[ImageLoader] pflash0_load_gpa: Some(GPA:0xffe00000), pflash1_load_gpa: Some(GPA:0xffc00000)[m
-[m[37m[  0.806196 0:2 axvisor::vmm::images:201] [32mLoading VM[1] images in UEFI mode[m
-[m[37m[  0.809699 0:2 axvisor::vmm::images:218] [32m[pflash0] Loading /guest/ovmf/OVMF_CODE.fd (file 1966080 bytes, region 0x200000) at offset 0x20000, GPA 0xffe20000[m
-[m[37m[  0.813115 0:2 axvisor::vmm::images::fs:592] [32m[load_vm_image] Loading /guest/ovmf/OVMF_CODE.fd (1966080 bytes) to GPA GPA:0xffe20000[m
-[m[37m[  0.816208 0:2 axvisor::vmm::images::fs:598] [32m[load_vm_image] Got 1 region(s) for GPA GPA:0xffe20000[m
-[m[37m[  0.818288 0:2 axvisor::vmm::images::fs:604] [32m[load_vm_image] Region 0: HVA 0xffff800004a20000, size 1966080 bytes[m
-[m[37m[  1.155918 0:2 axvisor::vmm::images::fs:622] [32m[load_vm_image] Read 1966080 bytes into region 0, first 16 bytes: [00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00][m
-[m[37m[  1.159968 0:2 axvisor::vmm::images:237] [32m[UEFI] GPA 0xFFFFFFF0 HVA: 0xffff800004bffff0[m
-[m[37m[  1.162200 0:2 axvisor::vmm::images:241] [32m[UEFI] GPA 0xFFFFFFF0 data: [0f, 20, c0, a8, 01, 74, 05, e9, 28, ff, ff, ff, e9, 09, ff, 90][m
-[m[37m[  1.166764 0:2 axvisor::vmm::images:269] [32m[pflash1] Loading /guest/ovmf/OVMF_VARS.fd (file 131072 bytes, region 0x200000) at offset 0x1e0000, GPA 0xffde0000[m
-[m[37m[  1.170904 0:2 axvisor::vmm::images::fs:592] [32m[load_vm_image] Loading /guest/ovmf/OVMF_VARS.fd (131072 bytes) to GPA GPA:0xffde0000[m
-[m[37m[  1.173973 0:2 axvisor::vmm::images::fs:598] [32m[load_vm_image] Got 1 region(s) for GPA GPA:0xffde0000[m
-[m[37m[  1.178017 0:2 axvisor::vmm::images::fs:604] [32m[load_vm_image] Region 0: HVA 0xffff800004fe0000, size 131072 bytes[m
-[m[37m[  1.229861 0:2 axvisor::vmm::images::fs:622] [32m[load_vm_image] Read 131072 bytes into region 0, first 16 bytes: [00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00][m
-[m[37m[  1.233592 0:2 axvisor::vmm::images:360] [32mSetting up fw_cfg and ACPI tables: ram_size=0x2000000, cpu_num=1[m
-[m[37m[  1.236256 0:2 axvisor::vmm::images:393] [32mWrote RSDP (64 bytes) to GPA 0xf0000[m
-[m[37m[  1.238410 0:2 axvisor::vmm::images:410] [32mWrote ACPI tables (438 bytes) to GPA 0xf0040[m
-[m[37m[  1.240837 0:2 axvisor::vmm::images:430] [32mRegistered fw_cfg device at I/O ports 0x510-0x511[m
-[m[37m[  1.243103 0:2 axvm::vm:198] [32mdtb_load_gpa: None[m
-[m[37m[  1.244641 0:2 x86_vcpu::vmx::vcpu:140] [32m[HV] created VmxVcpu(vmcs: PA:0x6684000)[m
-[m[37m[  1.246691 0:2 axdevice::device:313] [32mfw_cfg device will be initialized during UEFI image loading[m
-[m[37m[  1.249424 0:2 x86_vcpu::vmx::vcpu:549] [32m[VMX setup] boot_mode=Uefi, setting CS for UEFI[m
-[m[37m[  1.251603 0:2 x86_vcpu::vmx::vcpu:553] [32m[VMX setup] Set CS_SELECTOR=0xF000, CS_BASE=0xFFFF0000[m
-[m[37m[  1.253829 0:2 x86_vcpu::vmx::vcpu:572] [32m[VMX setup] RIP=0xfff0, entry=0xfffffff0[m
-[m[37m[  1.256087 0:2 axvm::vm:408] [32mVM setup: id=1[m
-[m[37m[  1.257490 0:2 axvisor::vmm:63] [32mSetting up vcpus...[m
-[m[37m[  1.258955 0:2 axvisor::vmm::vcpus:356] [32mInitializing VM[1]'s 1 vcpus[m
-[m[37m[  1.260721 0:2 axvisor::vmm::vcpus:405] [32mSpawning task for VM[1] VCpu[0][m
-[m[37m[  1.262555 0:2 axvisor::vmm::vcpus:420] [32mVCpu task Task(5, "VM[1]-VCpu[0]") created cpumask: [0, ][m
-[m[37m[  1.264940 0:2 axvisor::vmm:71] [32mVMM starting, booting VMs...[m
-[m[37m[  1.266641 0:2 axvm::vm:501] [32mBooting VM[1][m
-[m[37m[  1.267944 0:2 axvisor::vmm:77] [32mVM[1] boot success[m
-[m[37m[  1.269347 0:2 axvisor::vmm:88] [32ma VM exited, current running VM count: 1[m
-[m[37m[  1.271400 0:5 axvisor::vmm::vcpus:443] [32mVM[1] boot delay: 0s[m
-[m[37m[  1.273077 0:5 axvisor::vmm::vcpus:446] [32mVM[1] VCpu[0] waiting for running[m
-[m[37m[  1.274916 0:5 axvisor::vmm::vcpus:449] [32mVM[1] VCpu[0] running...[m
-[m[37m[  1.280350 0:5 x86_vlapic::timer:252] [33m`stop_timer` called when timer is not started, bad operation tolerated[m
-[m[37m[  3.436518 0:5 x86_vcpu::vmx::vcpu:1401] [33minject_interrupt called with vector 0, ignoring[m
+[37m[  0.670038 0:2 axvisor:61] [32mStarting virtualization...[m
+[m[37m[  0.670887 0:2 axvisor:62] [32mHardware support: true[m
+[m[37m[  0.671671 0:2 axvisor::hal:87] [32mEnabling hardware virtualization support on all cores...[m
+[m[37m[  0.673280 0:2 axvisor::hal:122] [32mWaiting for all cores to enable hardware virtualization...[m
+[m[37m[  0.674665 0:4 axvisor::hal:95] [32mCore 0 is initializing hardware virtualization support...[m
+[m[37m[  0.676023 0:4 axvisor::hal:102] [32mEnabling hardware virtualization support on core 0[m
+[m[37m[  0.677277 0:4 axvisor::vmm::timer:123] [32mIniting HV Timer...[m
+[m[37m[  0.678328 0:4 x86_vcpu::vmx::percpu:135] [32m[AxVM] succeeded to turn on VMX.[m
+[m[37m[  0.680355 0:4 axvisor::hal:116] [32mHardware virtualization support enabled on core 0[m
+[m[37m[  0.682534 0:2 axvisor::hal:132] [32mAll cores have enabled hardware virtualization support.[m
+[m[37m[  0.684911 0:2 axvisor::vmm:58] [32mInitializing VMM...[m
+[m[37m[  0.687815 0:2 axvisor::vmm::config::config:62] [32mNOT find dir: /guest/vm_default in filesystem[m
+[m[37m[  0.690428 0:2 axvisor::vmm::config:170] [32mUsing static VM configs.[m
+[m[37m[  0.692405 0:2 axvisor::vmm::images::fs:619] [33m[AxErrorKind::NotFound] Failed to open , err AxErrorKind::NotFound, please check your disk.img[m
+[m[37m[  0.695644 0:2 axvisor::vmm::config:230] [32mCreating VM[1] "uefi-vm"[m
+[m[37m[  0.697346 0:2 axvm::vm:180] [32mVM created: id=1[m
+[m[37m[  0.715391 0:2 axvisor::vmm::config:248] [32mVM[1] created success, loading images...[m
+[m[37m[  0.717227 0:2 axvisor::vmm::images:140] [32mLoading VM[1] images into memory region: gpa=GPA:0x0, hva=VA:0xffff800002800000, size=32 MiB[m
+[m[37m[  0.720093 0:2 axvisor::vmm::images:154] [32m[ImageLoader] pflash0_load_gpa: Some(GPA:0xffe00000), pflash1_load_gpa: Some(GPA:0xffc00000)[m
+[m[37m[  0.722945 0:2 axvisor::vmm::images:256] [32mLoading VM[1] images in UEFI mode[m
+[m[37m[  0.729824 0:2 axvisor::vmm::images:273] [32m[pflash0] Loading /guest/ovmf/OVMF_CODE.fd (file 1966080 bytes, region 0x200000) at offset 0x20000, GPA 0xffe20000[m
+[m[37m[  0.733125 0:2 axvisor::vmm::images::fs:691] [32m[load_vm_image] Loading /guest/ovmf/OVMF_CODE.fd (1966080 bytes) to GPA GPA:0xffe20000[m
+[m[37m[  0.735794 0:2 axvisor::vmm::images::fs:697] [32m[load_vm_image] Got 1 region(s) for GPA GPA:0xffe20000[m
+[m[37m[  0.738019 0:2 axvisor::vmm::images::fs:703] [32m[load_vm_image] Region 0: HVA 0xffff800004a20000, size 1966080 bytes[m
+[m[37m[  1.053436 0:2 axvisor::vmm::images::fs:721] [32m[load_vm_image] Read 1966080 bytes into region 0, first 16 bytes: [00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00][m
+[m[37m[  1.057365 0:2 axvisor::vmm::images:292] [32m[UEFI] GPA 0xFFFFFFF0 HVA: 0xffff800004bffff0[m
+[m[37m[  1.059528 0:2 axvisor::vmm::images:296] [32m[UEFI] GPA 0xFFFFFFF0 data: [0f, 20, c0, a8, 01, 74, 05, e9, 28, ff, ff, ff, e9, 09, ff, 90][m
+[m[37m[  1.063248 0:2 axvisor::vmm::images:324] [32m[pflash1] Loading /guest/ovmf/OVMF_VARS.fd (file 131072 bytes, region 0x200000) at offset 0x1e0000, GPA 0xffde0000[m
+[m[37m[  1.066877 0:2 axvisor::vmm::images::fs:691] [32m[load_vm_image] Loading /guest/ovmf/OVMF_VARS.fd (131072 bytes) to GPA GPA:0xffde0000[m
+[m[37m[  1.070064 0:2 axvisor::vmm::images::fs:697] [32m[load_vm_image] Got 1 region(s) for GPA GPA:0xffde0000[m
+[m[37m[  1.072494 0:2 axvisor::vmm::images::fs:703] [32m[load_vm_image] Region 0: HVA 0xffff800004fe0000, size 131072 bytes[m
+[m[37m[  1.094122 0:2 axvisor::vmm::images::fs:721] [32m[load_vm_image] Read 131072 bytes into region 0, first 16 bytes: [00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00][m
+[m[37m[  1.098055 0:2 axvisor::vmm::images:415] [32mSetting up fw_cfg and ACPI tables: ram_size=0x2000000, cpu_num=1[m
+[m[37m[  1.100633 0:2 axvisor::vmm::images:448] [32mWrote RSDP (64 bytes) to GPA 0xf0000[m
+[m[37m[  1.102690 0:2 axvisor::vmm::images:465] [32mWrote ACPI tables (438 bytes) to GPA 0xf0040[m
+[m[37m[  1.104967 0:2 axvisor::vmm::images:485] [32mRegistered fw_cfg device at I/O ports 0x510-0x511[m
+[m[37m[  1.107210 0:2 axvisor::vmm::images:495] [32mCreated virtio-blk-pci device: BDF=(0,1,0), disk_size=0x4000000[m
+[m[37m[  1.109728 0:2 axvisor::vmm::images:502] [32mAdded virtio-blk-pci to PCI host bridge device list[m
+[m[37m[  1.112128 0:2 axvisor::vmm::images:509] [32mRegistered PCI Host Bridge at I/O ports 0xCF8-0xCFF[m
+[m[37m[  1.114562 0:2 axvisor::vmm::images:514] [32mRegistered virtio-blk-pci as port I/O device (dynamic BAR)[m
+[m[37m[  1.117013 0:2 axvisor::vmm::images:523] [32mRegistered PM device at I/O ports 0x600-0x60B[m
+[m[37m[  1.119205 0:2 axvisor::vmm::images:529] [32mRegistered Guest Serial at I/O ports 0x3F8-0x3FE[m
+[m[37m[  1.121365 0:2 axvm::vm:198] [32mdtb_load_gpa: None[m
+[m[37m[  1.122835 0:2 x86_vcpu::vmx::vcpu:147] [32m[HV] created VmxVcpu(vmcs: PA:0x668c000)[m
+[m[37m[  1.124920 0:2 axdevice::device:313] [32mfw_cfg device will be initialized during UEFI image loading[m
+[m[37m[  1.127645 0:2 x86_vcpu::vmx::vcpu:620] [32m[VMX setup] boot_mode=Uefi, setting CS for UEFI[m
+[m[37m[  1.130295 0:2 x86_vcpu::vmx::vcpu:624] [32m[VMX setup] Set CS_SELECTOR=0xF000, CS_BASE=0xFFFF0000[m
+[m[37m[  1.132581 0:2 x86_vcpu::vmx::vcpu:643] [32m[VMX setup] RIP=0xfff0, entry=0xfffffff0[m
+[m[37m[  1.134847 0:2 axvm::vm:397] [32mVM setup: id=1[m
+[m[37m[  1.136174 0:2 axvisor::vmm:63] [32mSetting up vcpus...[m
+[m[37m[  1.137555 0:2 axvisor::vmm::vcpus:356] [32mInitializing VM[1]'s 1 vcpus[m
+[m[37m[  1.139418 0:2 axvisor::vmm::vcpus:405] [32mSpawning task for VM[1] VCpu[0][m
+[m[37m[  1.141257 0:2 axvisor::vmm::vcpus:420] [32mVCpu task Task(5, "VM[1]-VCpu[0]") created cpumask: [0, ][m
+[m[37m[  1.143958 0:2 axvisor::vmm:71] [32mVMM starting, booting VMs...[m
+[m[37m[  1.145524 0:2 axvm::vm:490] [32mBooting VM[1][m
+[m[37m[  1.146907 0:2 axvisor::vmm:77] [32mVM[1] boot success[m
+[m[37m[  1.148316 0:2 axvisor::vmm:88] [32ma VM exited, current running VM count: 1[m
+[m[37m[  1.150497 0:5 axvisor::vmm::vcpus:443] [32mVM[1] boot delay: 0s[m
+[m[37m[  1.152151 0:5 axvisor::vmm::vcpus:446] [32mVM[1] VCpu[0] waiting for running[m
+[m[37m[  1.154076 0:5 axvisor::vmm::vcpus:449] [32mVM[1] VCpu[0] running...[m
+[m[37m[  1.156640 0:5 x86_vcpu::vmx::vcpu:286] [32m[VMX-DEBUG] Non-IO exit #0: reason=CR_ACCESS, RIP=0xfeb4[m
+[m[37m[  1.159314 0:5 x86_vcpu::vmx::vcpu:286] [32m[VMX-DEBUG] Non-IO exit #1: reason=CR_ACCESS, RIP=0xfffffec4[m
+[m[37m[  1.162469 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #0: leaf=0x80000000, sub=0xfffd3d76, RIP=0xfffff9d1, IF=0[m
+[m[37m[  1.165615 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #0: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.169610 0:5 axdevice::device:490] [32m[PORT-DEBUG] read port=0xcf8 width=Dword val=0x0 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.172118 0:5 axvm::vm:592] [32m[DIAG] IO read #1: port=0xcf8, width=Dword, val=0x0[m
+[m[37m[  1.174690 0:5 axvm::vm:605] [32m[DIAG] IO write #2: port=0xcf8, width=Dword, data=0x80000000[m
+[m[37m[  1.176764 0:5 axdevice::device:505] [32m[PORT-DEBUG] write port=0xcf8 width=Dword val=0x80000000 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.180294 0:5 axdevice::device:490] [32m[PORT-DEBUG] read port=0xcfe width=Word val=0x29c0 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.182624 0:5 axvm::vm:592] [32m[DIAG] IO read #1: port=0xcfe, width=Word, val=0x29c0[m
+[m[37m[  1.185343 0:5 axvm::vm:605] [32m[DIAG] IO write #1: port=0xcf8, width=Dword, data=0x0[m
+[m[37m[  1.187234 0:5 axdevice::device:505] [32m[PORT-DEBUG] write port=0xcf8 width=Dword val=0x0 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.189947 0:5 axdevice::device:490] [32m[PORT-DEBUG] read port=0xcf8 width=Dword val=0x0 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.192473 0:5 axvm::vm:592] [32m[DIAG] IO read #2: port=0xcf8, width=Dword, val=0x0[m
+[m[37m[  1.194923 0:5 axvm::vm:605] [32m[DIAG] IO write #1: port=0xcf8, width=Dword, data=0x8000f844[m
+[m[37m[  1.197198 0:5 axdevice::device:505] [32m[PORT-DEBUG] write port=0xcf8 width=Dword val=0x8000f844 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.200338 0:5 axdevice::device:490] [32m[PORT-DEBUG] read port=0xcfc width=Byte val=0x1 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.202903 0:5 axvm::vm:592] [32m[DIAG] IO read #2: port=0xcfc, width=Byte, val=0x1[m
+[m[37m[  1.205646 0:5 axvm::vm:605] [32m[DIAG] IO write #1: port=0xcf8, width=Dword, data=0x0[m
+[m[37m[  1.207888 0:5 axdevice::device:505] [32m[PORT-DEBUG] write port=0xcf8 width=Dword val=0x0 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.210738 0:5 axdevice::device:490] [32m[PORT-DEBUG] read port=0xcf8 width=Dword val=0x0 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.213248 0:5 axvm::vm:592] [32m[DIAG] IO read #2: port=0xcf8, width=Dword, val=0x0[m
+[m[37m[  1.216050 0:5 axvm::vm:605] [32m[DIAG] IO write #1: port=0xcf8, width=Dword, data=0x8000f840[m
+[m[37m[  1.218049 0:5 axdevice::device:505] [32m[PORT-DEBUG] write port=0xcf8 width=Dword val=0x8000f840 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.221072 0:5 axdevice::device:490] [32m[PORT-DEBUG] read port=0xcfc width=Dword val=0x600 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.224101 0:5 axvm::vm:592] [32m[DIAG] IO read #2: port=0xcfc, width=Dword, val=0x600[m
+[m[37m[  1.226810 0:5 axvm::vm:605] [32m[DIAG] IO write #1: port=0xcfc, width=Dword, data=0x600[m
+[m[37m[  1.228760 0:5 axdevice::device:505] [32m[PORT-DEBUG] write port=0xcfc width=Dword val=0x600 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.232010 0:5 axvm::vm:605] [32m[DIAG] IO write #2: port=0xcf8, width=Dword, data=0x0[m
+[m[37m[  1.234119 0:5 axdevice::device:505] [32m[PORT-DEBUG] write port=0xcf8 width=Dword val=0x0 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.237267 0:5 axdevice::device:490] [32m[PORT-DEBUG] read port=0xcf8 width=Dword val=0x0 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.239919 0:5 axvm::vm:592] [32m[DIAG] IO read #1: port=0xcf8, width=Dword, val=0x0[m
+[m[37m[  1.242082 0:5 axvm::vm:605] [32m[DIAG] IO write #2: port=0xcf8, width=Dword, data=0x8000f844[m
+[m[37m[  1.244339 0:5 axdevice::device:505] [32m[PORT-DEBUG] write port=0xcf8 width=Dword val=0x8000f844 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.247663 0:5 axdevice::device:490] [32m[PORT-DEBUG] read port=0xcfc width=Byte val=0x1 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.250083 0:5 axvm::vm:592] [32m[DIAG] IO read #1: port=0xcfc, width=Byte, val=0x1[m
+[m[37m[  1.252418 0:5 axvm::vm:605] [32m[DIAG] IO write #2: port=0xcfc, width=Byte, data=0x81[m
+[m[37m[  1.254507 0:5 axdevice::device:505] [32m[PORT-DEBUG] write port=0xcfc width=Byte val=0x81 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.257933 0:5 axvm::vm:605] [32m[DIAG] IO write #1: port=0xcf8, width=Dword, data=0x0[m
+[m[37m[  1.260022 0:5 axdevice::device:505] [32m[PORT-DEBUG] write port=0xcf8 width=Dword val=0x0 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.262893 0:5 axvm::vm:605] [32m[DIAG] IO write #2: port=0x21, width=Byte, data=0xff[m
+[m[37m[  1.265590 0:5 axvm::vm:605] [32m[DIAG] IO write #1: port=0xa1, width=Byte, data=0xff[m
+[m[37m[  1.268110 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #1: leaf=0x1, sub=0x1, RIP=0xfffd18f9, IF=0[m
+[m[37m[  1.270426 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #1: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.273685 0:5 x86_vcpu::vmx::vcpu:286] [32m[VMX-DEBUG] Non-IO exit #2: reason=MSR_READ, RIP=0xfffcc50c, MSR=0x1b[m
+[m[37m[  1.276351 0:5 x86_vcpu::vmx::vcpu:1064] [32m[APIC-BASE] read: returning 0xfee00c00[m
+[m[37m[  1.279040 0:5 x86_vcpu::vmx::vcpu:286] [32m[VMX-DEBUG] Non-IO exit #3: reason=MSR_READ, RIP=0xfffcc50c, MSR=0x80f[m
+[m[37m[  1.281443 0:5 x86_vcpu::vmx::vcpu:1094] [32m[APIC-MSR] read: msr=0x80f, value=0x0[m
+[m[37m[  1.283443 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #2: leaf=0x1, sub=0x1, RIP=0xfffd18f9, IF=0[m
+[m[37m[  1.285818 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #2: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.288878 0:5 x86_vcpu::vmx::vcpu:286] [32m[VMX-DEBUG] Non-IO exit #4: reason=MSR_READ, RIP=0xfffcc50c, MSR=0x1b[m
+[m[37m[  1.291435 0:5 x86_vcpu::vmx::vcpu:1064] [32m[APIC-BASE] read: returning 0xfee00c00[m
+[m[37m[  1.293605 0:5 x86_vcpu::vmx::vcpu:286] [32m[VMX-DEBUG] Non-IO exit #5: reason=MSR_WRITE, RIP=0xfffcc51f, MSR=0x80f[m
+[m[37m[  1.296321 0:5 x86_vcpu::vmx::vcpu:1079] [32m[APIC-MSR] write: msr=0x80f, value=0x100[m
+[m[37m[  1.299049 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #3: leaf=0x1, sub=0x1, RIP=0xfffd18f9, IF=0[m
+[m[37m[  1.301674 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #3: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.305330 0:5 x86_vcpu::vmx::vcpu:286] [32m[VMX-DEBUG] Non-IO exit #6: reason=MSR_READ, RIP=0xfffcc50c, MSR=0x1b[m
+[m[37m[  1.308024 0:5 x86_vcpu::vmx::vcpu:1064] [32m[APIC-BASE] read: returning 0xfee00c00[m
+[m[37m[  1.310395 0:5 x86_vcpu::vmx::vcpu:286] [32m[VMX-DEBUG] Non-IO exit #7: reason=MSR_WRITE, RIP=0xfffcc51f, MSR=0x838[m
+[m[37m[  1.313085 0:5 x86_vcpu::vmx::vcpu:1079] [32m[APIC-MSR] write: msr=0x838, value=0xffffffff[m
+[m[37m[  1.315327 0:5 x86_vlapic::vlapic:719] [32m[VLAPIC] write ICR_TIMER: initial_count=0xffffffff[m
+[m[37m[  1.317518 0:5 x86_vlapic::timer:306] [33m`stop_timer` called when timer is not started, bad operation tolerated[m
+[m[37m[  1.320767 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #4: leaf=0x1, sub=0x1, RIP=0xfffd18f9, IF=0[m
+[m[37m[  1.323229 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #4: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.326830 0:5 x86_vcpu::vmx::vcpu:286] [32m[VMX-DEBUG] Non-IO exit #8: reason=MSR_READ, RIP=0xfffcc50c, MSR=0x1b[m
+[m[37m[  1.329534 0:5 x86_vcpu::vmx::vcpu:1064] [32m[APIC-BASE] read: returning 0xfee00c00[m
+[m[37m[  1.331724 0:5 x86_vcpu::vmx::vcpu:286] [32m[VMX-DEBUG] Non-IO exit #9: reason=MSR_READ, RIP=0xfffcc50c, MSR=0x832[m
+[m[37m[  1.334337 0:5 x86_vlapic::vlapic:816] [32m[VLAPIC] read LvtTimer: lvt_last=0x00010000, regs=0x00000000, timer_lvt=0x00010000[m
+[m[37m[  1.337157 0:5 x86_vcpu::vmx::vcpu:1094] [32m[APIC-MSR] read: msr=0x832, value=0x10000[m
+[m[37m[  1.339631 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #5: leaf=0x1, sub=0x1, RIP=0xfffd18f9, IF=0[m
+[m[37m[  1.342041 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #5: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.345230 0:5 x86_vcpu::vmx::vcpu:286] [32m[VMX-DEBUG] Non-IO exit #10: reason=MSR_READ, RIP=0xfffcc50c, MSR=0x1b[m
+[m[37m[  1.347804 0:5 x86_vcpu::vmx::vcpu:1064] [32m[APIC-BASE] read: returning 0xfee00c00[m
+[m[37m[  1.350053 0:5 x86_vcpu::vmx::vcpu:286] [32m[VMX-DEBUG] Non-IO exit #11: reason=MSR_WRITE, RIP=0xfffcc51f, MSR=0x832[m
+[m[37m[  1.352817 0:5 x86_vcpu::vmx::vcpu:1079] [32m[APIC-MSR] write: msr=0x832, value=0x20005[m
+[m[37m[  1.354828 0:5 x86_vlapic::vlapic:925] [32m[VLAPIC] handle_write LvtTimer: data=0x00020005, current LVT_TIMER=0x00000000[m
+[m[37m[  1.357581 0:5 x86_vlapic::vlapic:927] [32m[VLAPIC] handle_write LvtTimer: after set, LVT_TIMER=0x00020005[m
+[m[37m[  1.360166 0:5 x86_vlapic::vlapic:594] [32m[VLAPIC] write_lvt(LvtTimer): raw_val=0x00020005, apic_disabled=false[m
+[m[37m[  1.362819 0:5 x86_vlapic::vlapic:606] [32m[VLAPIC] write LVT_TIMER: val=0x00020005, apic_disabled=false, guest_mask=false, timer_mask=true[m
+[m[37m[  1.365959 0:5 x86_vlapic::timer:275] [32mvlapic @ (vm 1, vcpu 0) starts timer @ tick 5463836554, deadline tick 14053771144, vector 5, masked=false, periodic=true[m
+[m[37m[  1.370458 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #6: leaf=0x1, sub=0x1, RIP=0xfffd18f9, IF=0[m
+[m[37m[  1.373036 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #6: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.376375 0:5 x86_vcpu::vmx::vcpu:286] [32m[VMX-DEBUG] Non-IO exit #12: reason=MSR_READ, RIP=0xfffcc50c, MSR=0x1b[m
+[m[37m[  1.379103 0:5 x86_vcpu::vmx::vcpu:1064] [32m[APIC-BASE] read: returning 0xfee00c00[m
+[m[37m[  1.381797 0:5 x86_vcpu::vmx::vcpu:286] [32m[VMX-DEBUG] Non-IO exit #13: reason=MSR_READ, RIP=0xfffcc50c, MSR=0x832[m
+[m[37m[  1.384419 0:5 x86_vlapic::vlapic:816] [32m[VLAPIC] read LvtTimer: lvt_last=0x00020005, regs=0x00020005, timer_lvt=0x00020005[m
+[m[37m[  1.387221 0:5 x86_vcpu::vmx::vcpu:1094] [32m[APIC-MSR] read: msr=0x832, value=0x20005[m
+[m[37m[  1.390035 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #7: leaf=0x1, sub=0x1, RIP=0xfffd18f9, IF=0[m
+[m[37m[  1.392440 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #7: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.395754 0:5 x86_vcpu::vmx::vcpu:286] [32m[VMX-DEBUG] Non-IO exit #14: reason=MSR_READ, RIP=0xfffcc50c, MSR=0x1b[m
+[m[37m[  1.398472 0:5 x86_vcpu::vmx::vcpu:1064] [32m[APIC-BASE] read: returning 0xfee00c00[m
+[m[37m[  1.400984 0:5 x86_vcpu::vmx::vcpu:286] [32m[VMX-DEBUG] Non-IO exit #15: reason=MSR_WRITE, RIP=0xfffcc51f, MSR=0x832[m
+[m[37m[  1.403977 0:5 x86_vcpu::vmx::vcpu:1079] [32m[APIC-MSR] write: msr=0x832, value=0x30005[m
+[m[37m[  1.406182 0:5 x86_vlapic::vlapic:925] [32m[VLAPIC] handle_write LvtTimer: data=0x00030005, current LVT_TIMER=0x00020005[m
+[m[37m[  1.408960 0:5 x86_vlapic::vlapic:927] [32m[VLAPIC] handle_write LvtTimer: after set, LVT_TIMER=0x00030005[m
+[m[37m[  1.411549 0:5 x86_vlapic::vlapic:594] [32m[VLAPIC] write_lvt(LvtTimer): raw_val=0x00030005, apic_disabled=false[m
+[m[37m[  1.414143 0:5 x86_vlapic::vlapic:606] [32m[VLAPIC] write LVT_TIMER: val=0x00030005, apic_disabled=false, guest_mask=true, timer_mask=false[m
+[m[37m[  1.417994 0:5 axvm::vm:605] [32m[DIAG] IO write #1: port=0x70, width=Byte, data=0xf[m
+[m[37m[  1.420801 0:5 axvm::vm:592] [32m[DIAG] IO read #1: port=0x71, width=Byte, val=0x0[m
+[m[37m[  1.491291 0:5 axdevice::device:490] [32m[PORT-DEBUG] read port=0xcf8 width=Dword val=0x0 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.493931 0:5 axvm::vm:592] [32m[DIAG] IO read #1: port=0xcf8, width=Dword, val=0x0[m
+[m[37m[  1.496169 0:5 axvm::vm:605] [32m[DIAG] IO write #2: port=0xcf8, width=Dword, data=0x80000000[m
+[m[37m[  1.498488 0:5 axdevice::device:505] [32m[PORT-DEBUG] write port=0xcf8 width=Dword val=0x80000000 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.501934 0:5 axdevice::device:490] [32m[PORT-DEBUG] read port=0xcfe width=Word val=0x29c0 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.504656 0:5 axvm::vm:592] [32m[DIAG] IO read #1: port=0xcfe, width=Word, val=0x29c0[m
+[m[37m[  1.507069 0:5 axvm::vm:605] [32m[DIAG] IO write #2: port=0xcf8, width=Dword, data=0x0[m
+[m[37m[  1.509157 0:5 axdevice::device:505] [32m[PORT-DEBUG] write port=0xcf8 width=Dword val=0x0 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.512058 0:5 axdevice::device:490] [32m[PORT-DEBUG] read port=0xcf8 width=Dword val=0x0 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.514795 0:5 axvm::vm:592] [32m[DIAG] IO read #1: port=0xcf8, width=Dword, val=0x0[m
+[m[37m[  1.516995 0:5 axvm::vm:605] [32m[DIAG] IO write #2: port=0xcf8, width=Dword, data=0x8000f844[m
+[m[37m[  1.519246 0:5 axdevice::device:505] [32m[PORT-DEBUG] write port=0xcf8 width=Dword val=0x8000f844 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.522750 0:5 axdevice::device:490] [32m[PORT-DEBUG] read port=0xcfc width=Byte val=0x81 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.525938 0:5 axvm::vm:592] [32m[DIAG] IO read #1: port=0xcfc, width=Byte, val=0x81[m
+[m[37m[  1.528626 0:5 axvm::vm:605] [32m[DIAG] IO write #1: port=0xcf8, width=Dword, data=0x0[m
+[m[37m[  1.530790 0:5 axdevice::device:505] [32m[PORT-DEBUG] write port=0xcf8 width=Dword val=0x0 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.533745 0:5 axdevice::device:490] [32m[PORT-DEBUG] read port=0xcf8 width=Dword val=0x0 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.536522 0:5 axvm::vm:592] [32m[DIAG] IO read #2: port=0xcf8, width=Dword, val=0x0[m
+[m[37m[  1.539188 0:5 axvm::vm:605] [32m[DIAG] IO write #1: port=0xcf8, width=Dword, data=0x8000f840[m
+[m[37m[  1.541494 0:5 axdevice::device:505] [32m[PORT-DEBUG] write port=0xcf8 width=Dword val=0x8000f840 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.544457 0:5 axdevice::device:490] [32m[PORT-DEBUG] read port=0xcfc width=Dword val=0x600 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.547221 0:5 axvm::vm:592] [32m[DIAG] IO read #2: port=0xcfc, width=Dword, val=0x600[m
+[m[37m[  1.549840 0:5 axvm::vm:605] [32m[DIAG] IO write #1: port=0xcf8, width=Dword, data=0x0[m
+[m[37m[  1.551850 0:5 axdevice::device:505] [32m[PORT-DEBUG] write port=0xcf8 width=Dword val=0x0 dev_range=0xcf8..=0xcff[m
+[m[37m[  1.554605 0:5 axvm::vm:605] [32m[DIAG] IO write #2: port=0x510, width=Word, data=0x0[m
+[m[37m[  1.556891 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #8: leaf=0x1, sub=0x4, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.558941 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #8: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.562380 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #9: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.564874 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #9: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.568747 0:5 axvm::vm:605] [32m[DIAG] IO write #1: port=0x510, width=Word, data=0x1[m
+[m[37m[  1.570978 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #10: leaf=0x1, sub=0x4, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.573257 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #10: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.576143 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #11: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.578503 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #11: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.582240 0:5 axvm::vm:605] [32m[DIAG] IO write #1: port=0x510, width=Word, data=0x19[m
+[m[37m[  1.584467 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #12: leaf=0x1, sub=0x4, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.586610 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #12: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.589795 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #13: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.592388 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #13: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.595919 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #14: leaf=0x1, sub=0x4, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.598422 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #14: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.601821 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #15: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.604291 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #15: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.608605 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #16: leaf=0x1, sub=0x2, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.611109 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #16: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.614159 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #17: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.616663 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #17: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.620734 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #18: leaf=0x1, sub=0x2, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.622974 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #18: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.625964 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #19: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.628594 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #19: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.632854 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #20: leaf=0x1, sub=0x38, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.635282 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #20: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.638877 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #21: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.641489 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #21: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.645341 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #22: leaf=0x1, sub=0x4, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.647608 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #22: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.651388 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #23: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.654098 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #23: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.657874 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #24: leaf=0x1, sub=0x2, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.660165 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #24: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.663794 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #25: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.666407 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #25: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.670615 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #26: leaf=0x1, sub=0x2, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.673375 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #26: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.676422 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #27: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.679139 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #27: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.683284 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #28: leaf=0x1, sub=0x38, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.685672 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #28: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.689519 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #29: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.692150 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #29: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.695900 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #30: leaf=0x1, sub=0x4, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.698345 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #30: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.701962 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #31: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.704631 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #31: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.708758 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #32: leaf=0x1, sub=0x2, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.711156 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #32: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.714317 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #33: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.716937 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #33: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.720927 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #34: leaf=0x1, sub=0x2, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.723120 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #34: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.726317 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #35: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.728962 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #35: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.733454 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #36: leaf=0x1, sub=0x38, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.735841 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #36: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.739174 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #37: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.741797 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #37: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.745420 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #38: leaf=0x1, sub=0x4, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.747806 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #38: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.751272 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #39: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.753991 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #39: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.757851 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #40: leaf=0x1, sub=0x2, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.760262 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #40: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.763838 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #41: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.766456 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #41: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.770487 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #42: leaf=0x1, sub=0x2, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.772881 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #42: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.776046 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #43: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.778672 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #43: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.782742 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #44: leaf=0x1, sub=0x38, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.785201 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #44: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.788704 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #45: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.791388 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #45: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.795161 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #46: leaf=0x1, sub=0x4, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.797594 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #46: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.801278 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #47: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.803934 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #47: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.807665 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #48: leaf=0x1, sub=0x2, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.810097 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #48: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  1.813621 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #49: leaf=0x80000000, sub=0xfefa3203, RIP=0x82dbc5, IF=0[m
+[m[37m[  1.816327 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #49: leaf=0x80000000 => EAX=0x80000008, EBX=0x756e6547, ECX=0x6c65746e, EDX=0x49656e69[m
+[m[37m[  1.835033 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #100: leaf=0x1, sub=0x38, RIP=0x82dbb8, IF=0[m
+[m[37m[  1.837519 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #100: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  2.116406 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #1000: leaf=0x1, sub=0x2, RIP=0x82dbb8, IF=0[m
+[m[37m[  2.118782 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #1000: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  3.517185 0:5 x86_vlapic::timer:288] [32mvlapic @ (vm 1, vcpu 0) timer callback fired, vector 5[m
+[m[37m[  3.519146 0:5 x86_vcpu::vmx::vcpu:1810] [32m[VLAPIC] timer expired: vector=0x5, masked=true, periodic=true[m
+[m[37m[  3.521023 0:5 x86_vlapic::timer:275] [32mvlapic @ (vm 1, vcpu 0) starts timer @ tick 14084091897, deadline tick 22674026487, vector 5, masked=true, periodic=true[m
+[m[37m[  4.997823 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #10000: leaf=0x1, sub=0x2, RIP=0x82dbb8, IF=0[m
+[m[37m[  5.000140 0:5 x86_vcpu::vmx::vcpu:1471] [32m[CPUID-OUT] #10000: leaf=0x1 => EAX=0xc0662, EBX=0x800, ECX=0xfefa3203, EDX=0xf8bfb7f[m
+[m[37m[  5.677290 0:5 x86_vlapic::timer:288] [32mvlapic @ (vm 1, vcpu 0) timer callback fired, vector 5[m
+[m[37m[  5.679553 0:5 x86_vcpu::vmx::vcpu:1810] [32m[VLAPIC] timer expired: vector=0x5, masked=true, periodic=true[m
+[m[37m[  5.682086 0:5 x86_vlapic::timer:275] [32mvlapic @ (vm 1, vcpu 0) starts timer @ tick 22728345144, deadline tick 31318279734, vector 5, masked=true, periodic=true[m
+[m[37m[  7.837132 0:5 x86_vlapic::timer:288] [32mvlapic @ (vm 1, vcpu 0) timer callback fired, vector 5[m
+[m[37m[  7.839451 0:5 x86_vcpu::vmx::vcpu:1810] [32m[VLAPIC] timer expired: vector=0x5, masked=true, periodic=true[m
+[m[37m[  7.841887 0:5 x86_vlapic::timer:275] [32mvlapic @ (vm 1, vcpu 0) starts timer @ tick 31367550874, deadline tick 39957485464, vector 5, masked=true, periodic=true[m
+[m[37m[  9.997251 0:5 x86_vlapic::timer:288] [32mvlapic @ (vm 1, vcpu 0) timer callback fired, vector 5[m
+[m[37m[  9.999596 0:5 x86_vcpu::vmx::vcpu:1810] [32m[VLAPIC] timer expired: vector=0x5, masked=true, periodic=true[m
+[m[37m[ 10.002099 0:5 x86_vlapic::timer:275] [32mvlapic @ (vm 1, vcpu 0) starts timer @ tick 40008398421, deadline tick 48598333011, vector 5, masked=true, periodic=true[m
+[m[37m[ 12.157292 0:5 x86_vlapic::timer:288] [32mvlapic @ (vm 1, vcpu 0) timer callback fired, vector 5[m
+[m[37m[ 12.159681 0:5 x86_vcpu::vmx::vcpu:1810] [32m[VLAPIC] timer expired: vector=0x5, masked=true, periodic=true[m
+[m[37m[ 12.162383 0:5 x86_vlapic::timer:275] [32mvlapic @ (vm 1, vcpu 0) starts timer @ tick 48649531394, deadline tick 57239465984, vector 5, masked=true, periodic=true[m
+[m[37m[ 14.317205 0:5 x86_vlapic::timer:288] [32mvlapic @ (vm 1, vcpu 0) timer callback fired, vector 5[m
+[m[37m[ 14.319317 0:5 x86_vcpu::vmx::vcpu:1810] [32m[VLAPIC] timer expired: vector=0x5, masked=true, periodic=true[m
+[m[37m[ 14.321878 0:5 x86_vlapic::timer:275] [32mvlapic @ (vm 1, vcpu 0) starts timer @ tick 57287511754, deadline tick 65877446344, vector 5, masked=true, periodic=true[m
+[m[37m[ 16.477266 0:5 x86_vlapic::timer:288] [32mvlapic @ (vm 1, vcpu 0) timer callback fired, vector 5[m
+[m[37m[ 16.479810 0:5 x86_vcpu::vmx::vcpu:1810] [32m[VLAPIC] timer expired: vector=0x5, masked=true, periodic=true[m
+[m[37m[ 16.482076 0:5 x86_vlapic::timer:275] [32mvlapic @ (vm 1, vcpu 0) starts timer @ tick 65928304864, deadline tick 74518239454, vector 5, masked=true, periodic=true[m
+[m[37m[ 18.637158 0:5 x86_vlapic::timer:288] [32mvlapic @ (vm 1, vcpu 0) timer callback fired, vector 5[m
+[m[37m[ 18.639505 0:5 x86_vcpu::vmx::vcpu:1810] [32m[VLAPIC] timer expired: vector=0x5, masked=true, periodic=true[m
+[m[37m[ 18.642154 0:5 x86_vlapic::timer:275] [32mvlapic @ (vm 1, vcpu 0) starts timer @ tick 74568616554, deadline tick 83158551144, vector 5, masked=true, periodic=true[m
+[m[37m[ 20.798028 0:5 x86_vlapic::timer:288] [32mvlapic @ (vm 1, vcpu 0) timer callback fired, vector 5[m
+[m[37m[ 20.800612 0:5 x86_vcpu::vmx::vcpu:1810] [32m[VLAPIC] timer expired: vector=0x5, masked=true, periodic=true[m
+[m[37m[ 20.803358 0:5 x86_vlapic::timer:275] [32mvlapic @ (vm 1, vcpu 0) starts timer @ tick 83213433301, deadline tick 91803367891, vector 5, masked=true, periodic=true[m
+[m[37m[ 22.957301 0:5 x86_vlapic::timer:288] [32mvlapic @ (vm 1, vcpu 0) timer callback fired, vector 5[m
+[m[37m[ 22.959529 0:5 x86_vcpu::vmx::vcpu:1810] [32m[VLAPIC] timer expired: vector=0x5, masked=true, periodic=true[m
+[m[37m[ 22.961603 0:5 x86_vlapic::timer:275] [32mvlapic @ (vm 1, vcpu 0) starts timer @ tick 91846414987, deadline tick 100436349577, vector 5, masked=true, periodic=true[m
+[m[37m[ 25.117266 0:5 x86_vlapic::timer:288] [32mvlapic @ (vm 1, vcpu 0) timer callback fired, vector 5[m
+[m[37m[ 25.119573 0:5 x86_vcpu::vmx::vcpu:1810] [32m[VLAPIC] timer expired: vector=0x5, masked=true, periodic=true[m
+[m[37m[ 25.121544 0:5 x86_vlapic::timer:275] [32mvlapic @ (vm 1, vcpu 0) starts timer @ tick 100486179242, deadline tick 109076113832, vector 5, masked=true, periodic=true[m
+[m[37m[ 27.277236 0:5 x86_vlapic::timer:288] [32mvlapic @ (vm 1, vcpu 0) timer callback fired, vector 5[m
+[m[37m[ 27.279377 0:5 x86_vcpu::vmx::vcpu:1810] [32m[VLAPIC] timer expired: vector=0x5, masked=true, periodic=true[m
+[m[37m[ 27.281397 0:5 x86_vlapic::timer:275] [32mvlapic @ (vm 1, vcpu 0) starts timer @ tick 109125588561, deadline tick 117715523151, vector 5, masked=true, periodic=true[m
+[m[37m[ 29.437144 0:5 x86_vlapic::timer:288] [32mvlapic @ (vm 1, vcpu 0) timer callback fired, vector 5[m
+[m[37m[ 29.438833 0:5 x86_vcpu::vmx::vcpu:1810] [32m[VLAPIC] timer expired: vector=0x5, masked=true, periodic=true[m
+[m[37m[ 29.440626 0:5 x86_vlapic::timer:275] [32mvlapic @ (vm 1, vcpu 0) starts timer @ tick 117762504696, deadline tick 126352439286, vector 5, masked=true, periodic=true[m
+[m[37m[ 31.597241 0:5 x86_vlapic::timer:288] [32mvlapic @ (vm 1, vcpu 0) timer callback fired, vector 5[m
+[m[37m[ 31.599589 0:5 x86_vcpu::vmx::vcpu:1810] [32m[VLAPIC] timer expired: vector=0x5, masked=true, periodic=true[m
+[m[37m[ 31.602090 0:5 x86_vlapic::timer:275] [32mvlapic @ (vm 1, vcpu 0) starts timer @ tick 126408360353, deadline tick 134998294943, vector 5, masked=true, periodic=true[m
+[m[37m[ 33.757167 0:5 x86_vlapic::timer:288] [32mvlapic @ (vm 1, vcpu 0) timer callback fired, vector 5[m
+[m[37m[ 33.759477 0:5 x86_vcpu::vmx::vcpu:1810] [32m[VLAPIC] timer expired: vector=0x5, masked=true, periodic=true[m
+[m[37m[ 33.761824 0:5 x86_vlapic::timer:275] [32mvlapic @ (vm 1, vcpu 0) starts timer @ tick 135047299178, deadline tick 143637233768, vector 5, masked=true, periodic=true[m
+[m[37m[ 35.917296 0:5 x86_vlapic::timer:288] [32mvlapic @ (vm 1, vcpu 0) timer callback fired, vector 5[m
+[m[37m[ 35.919687 0:5 x86_vcpu::vmx::vcpu:1810] [32m[VLAPIC] timer expired: vector=0x5, masked=true, periodic=true[m
+[m[37m[ 35.922383 0:5 x86_vlapic::timer:275] [32mvlapic @ (vm 1, vcpu 0) starts timer @ tick 143689531378, deadline tick 152279465968, vector 5, masked=true, periodic=true[m
+[m[37m[ 36.212774 0:5 x86_vcpu::vmx::vcpu:266] [32m[CPUID-IN] #100000: leaf=0x1, sub=0x2, RIP=0x82dbb8, IF=0[m
 [m

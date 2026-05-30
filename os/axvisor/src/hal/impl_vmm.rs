@@ -34,8 +34,9 @@ impl VmmIf for VmmImpl {
         todo!("inject_interrupt_to_cpus")
     }
 
-    fn notify_vcpu_timer_expired(_vm_id: VMId, _vcpu_id: VCpuId) {
-        todo!("notify_vcpu_timer_expired")
-        // vmm::timer::notify_timer_expired(vm_id, vcpu_id);
+    fn notify_vcpu_timer_expired(vm_id: VMId, vcpu_id: VCpuId) {
+        let _ = vmm::with_vm_and_vcpu_on_pcpu(vm_id, vcpu_id, move |_, vcpu| {
+            vcpu.handle_timer_expired().unwrap();
+        });
     }
 }

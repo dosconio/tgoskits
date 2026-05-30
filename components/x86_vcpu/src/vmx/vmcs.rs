@@ -538,6 +538,16 @@ impl VmxInterruptInfo {
         }
     }
 
+    /// Convert from the interrupt vector, error code, and explicit interruption type.
+    pub fn from_with_type(vector: u8, err_code: Option<u32>, int_type: VmxInterruptionType) -> Self {
+        Self {
+            vector,
+            int_type,
+            err_code,
+            valid: true,
+        }
+    }
+
     /// Raw bits for writing to VMCS.
     pub fn bits(&self) -> u32 {
         let mut bits = self.vector as u32;
@@ -723,7 +733,6 @@ pub fn raw_interrupt_exit_info() -> AxResult<u32> {
 }
 
 pub fn interrupt_exit_info() -> AxResult<VmxInterruptInfo> {
-    // SDM Vol. 3C, Section 24.9.2
     let info = VmcsReadOnly32::VMEXIT_INTERRUPTION_INFO.read()?;
     Ok(VmxInterruptInfo {
         vector: info.get_bits(0..8) as u8,
@@ -737,14 +746,46 @@ pub fn interrupt_exit_info() -> AxResult<VmxInterruptInfo> {
     })
 }
 
+pub fn idt_vectoring_info() -> AxResult<Option<VmxInterruptInfo>> {
+    let info = VmcsReadOnly32::IDT_VECTORING_INFO.read()?;
+    if info.get_bit(31) {
+        Ok(Some(VmxInterruptInfo {
+            vector: info.get_bits(0..8) as u8,
+            int_type: VmxInterruptionType::try_from(info.get_bits(8..11) as u8).unwrap(),
+            err_code: if info.get_bit(11) {
+                Some(VmcsReadOnly32::IDT_VECTORING_ERR_CODE.read()?)
+            } else {
+                None
+            },
+            valid: true,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn inject_event(vector: u8, err_code: Option<u32>) -> AxResult {
-    // SDM Vol. 3C, Section 24.8.3
+    let int_type = VmxInterruptionType::from_vector(vector);
+    inject_event_with_type(vector, err_code, int_type)
+}
+
+/// Clear the VM-entry interruption-information field to prevent stale
+/// injection data from causing repeated VM-entry failures.
+pub fn clear_injection() -> AxResult {
+    VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD.write(0)
+}
+
+pub fn inject_event_with_type(
+    vector: u8,
+    err_code: Option<u32>,
+    int_type: VmxInterruptionType,
+) -> AxResult {
     let err_code = if VmxInterruptionType::vector_has_error_code(vector) {
         err_code.or_else(|| Some(VmcsReadOnly32::VMEXIT_INTERRUPTION_ERR_CODE.read().unwrap()))
     } else {
         None
     };
-    let int_info = VmxInterruptInfo::from(vector, err_code);
+    let int_info = VmxInterruptInfo::from_with_type(vector, err_code, int_type);
     if let Some(err_code) = int_info.err_code {
         VmcsControl32::VMENTRY_EXCEPTION_ERR_CODE.write(err_code)?;
     }

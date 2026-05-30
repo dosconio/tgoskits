@@ -485,21 +485,32 @@ impl AxVmDevices {
     /// Handle the port read by port number and data width, return the value of the guest want to read
     pub fn handle_port_read(&self, port: Port, width: AccessWidth) -> AxResult<usize> {
         if let Some(emu_dev) = self.find_port_dev(port) {
-            log_device_io("port", port.0, emu_dev.address_range(), true, width);
-
-            return emu_dev.handle_read(port, width);
+            let val = emu_dev.handle_read(port, width)?;
+            if port.0 >= 0xCF8 && port.0 <= 0xCFF {
+                info!("[PORT-DEBUG] read port={:#x} width={:?} val={:#x} dev_range={:#x}", port.0, width, val, emu_dev.address_range());
+            }
+            return Ok(val);
         }
-        panic_device_not_found("port", port, true, width);
+        trace!(
+            "port read: device not found for port {:#x} with width {:?}, returning 0",
+            port.0, width
+        );
+        Ok(0)
     }
 
     /// Handle the port write by port number, data width and the value need to write, call specific device to write the value
     pub fn handle_port_write(&self, port: Port, width: AccessWidth, val: usize) -> AxResult {
         if let Some(emu_dev) = self.find_port_dev(port) {
-            log_device_io("port", port.0, emu_dev.address_range(), false, width);
-
+            if port.0 >= 0xCF8 && port.0 <= 0xCFF {
+                info!("[PORT-DEBUG] write port={:#x} width={:?} val={:#x} dev_range={:#x}", port.0, width, val, emu_dev.address_range());
+            }
             return emu_dev.handle_write(port, width, val);
         }
-        panic_device_not_found("port", port, false, width);
+        trace!(
+            "port write: device not found for port {:#x} with width {:?}, val {:#x}, ignoring",
+            port.0, width, val
+        );
+        Ok(())
     }
 
     /// Merge devices from another `AxVmDevices` into this one.

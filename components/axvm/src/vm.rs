@@ -389,21 +389,10 @@ impl AxVM {
                 setup_config,
             )?;
 
-            // Set I/O bitmap intercept for port devices on x86_64.
-            // This must be done after vcpu.setup() which initializes the I/O bitmap.
-            #[cfg(target_arch = "x86_64")]
-            {
-                let devices = self.devices.lock();
-                for port_dev in devices.iter_port_dev() {
-                    let range = port_dev.address_range();
-                    let port_count = (range.end.0 - range.start.0 + 1) as u32;
-                    vcpu.get_arch_vcpu().set_io_intercept_of_range(
-                        range.start.0 as u32,
-                        port_count,
-                        true,
-                    );
-                }
-            }
+            // I/O bitmap is set to intercept_all() in VmxVcpu::new(), so all
+            // port I/O accesses cause VM exits. No per-device setup needed.
+            // This is required because virtio-blk-pci uses a dynamic I/O BAR
+            // address assigned by OVMF at runtime.
         }
         info!("VM setup: id={}", self.id());
         Ok(())
@@ -563,6 +552,10 @@ impl AxVM {
 
         vcpu.bind()?;
 
+        let mut diag_io_count: u64 = 0;
+        let mut diag_ept_count: u64 = 0;
+        let mut diag_mmio_count: u64 = 0;
+
         let exit_reason = loop {
             let exit_reason = vcpu.run()?;
             trace!("{exit_reason:#x?}");
@@ -574,20 +567,32 @@ impl AxVM {
                     reg_width: _,
                     signed_ext: _,
                 } => {
+                    diag_mmio_count += 1;
+                    if diag_mmio_count <= 20 || diag_mmio_count % 10000 == 0 {
+                        info!("[DIAG] MMIO read: addr={:#x}, width={:?}", addr, width);
+                    }
                     let val = self.get_devices().lock().handle_mmio_read(*addr, *width)?;
                     vcpu.set_gpr(*reg, val);
                     true
                 }
                 AxVCpuExitReason::MmioWrite { addr, width, data } => {
+                    diag_mmio_count += 1;
+                    if diag_mmio_count <= 20 || diag_mmio_count % 10000 == 0 {
+                        info!("[DIAG] MMIO write: addr={:#x}, width={:?}, data={:#x}", addr, width, data);
+                    }
                     self.get_devices()
                         .lock()
                         .handle_mmio_write(*addr, *width, *data as usize)?;
                     true
                 }
                 AxVCpuExitReason::IoRead { port, width } => {
+                    diag_io_count += 1;
                     let val = self.get_devices().lock().handle_port_read(*port, *width)?;
+                    if diag_io_count <= 200 || diag_io_count % 10000 == 0 {
+                        info!("[DIAG] IO read #{diag_io_count}: port={:#x}, width={:?}, val={:#x}", port.0, width, val);
+                    }
                     #[cfg(not(target_arch = "riscv64"))]
-                    vcpu.set_gpr(0, val); // The target is always eax/ax/al, todo: handle access_width correctly
+                    vcpu.set_gpr(0, val);
 
                     #[cfg(target_arch = "riscv64")]
                     vcpu.set_gpr(riscv_vcpu::GprIndex::A0 as usize, val);
@@ -595,6 +600,10 @@ impl AxVM {
                     true
                 }
                 AxVCpuExitReason::IoWrite { port, width, data } => {
+                    diag_io_count += 1;
+                    if diag_io_count <= 200 || diag_io_count % 10000 == 0 {
+                        info!("[DIAG] IO write #{diag_io_count}: port={:#x}, width={:?}, data={:#x}", port.0, width, data);
+                    }
                     self.get_devices()
                         .lock()
                         .handle_port_write(*port, *width, *data as usize)?;
@@ -739,14 +748,21 @@ impl AxVM {
                     true
                 }
                 AxVCpuExitReason::NestedPageFault { addr, access_flags } => {
+                    diag_ept_count += 1;
+                    if diag_ept_count <= 20 || diag_ept_count % 10000 == 0 {
+                        info!(
+                            "[DIAG] EPT violation #{diag_ept_count}: GPA={:#x}, access={:?}",
+                            addr, access_flags
+                        );
+                    }
                     let handled = self
                         .inner_mut
                         .lock()
                         .address_space
                         .handle_page_fault(*addr, *access_flags);
                     if !handled {
-                        warn!(
-                            "Unhandled EPT violation: GPA={:#x}, access={:?}",
+                        info!(
+                            "EPT violation UNHANDLED: GPA={:#x}, access={:?}",
                             addr, access_flags
                         );
                     }
@@ -754,7 +770,7 @@ impl AxVM {
                 }
                 _ => false,
             };
-            if !handled {
+            if !handled && !matches!(exit_reason, AxVCpuExitReason::Nothing) {
                 break exit_reason;
             }
         };

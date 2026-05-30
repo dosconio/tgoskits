@@ -88,6 +88,14 @@ pub trait AxArchVCpu: Sized {
     /// until the VCpu is running.
     fn inject_interrupt(&mut self, vector: usize) -> AxResult;
 
+    /// Handle a virtual timer expiration event for this VCpu.
+    ///
+    /// This method is called when the vLAPIC timer fires. It should:
+    /// - Read the current LVT timer state (vector, masked, periodic)
+    /// - Inject the timer interrupt if not masked
+    /// - Restart the timer if in periodic mode
+    fn handle_timer_expired(&mut self) -> AxResult;
+
     /// Sets the return value that will be delivered to the guest.
     fn set_return_value(&mut self, val: usize);
 }

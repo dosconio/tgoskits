@@ -92,6 +92,9 @@ fxmac_rs
 loongarch_vcpu
 nvme-driver
 pcie
+pci_host
+pm_timer
+virtio_blk_pci
 range-alloc-arceos
 axplat-riscv64-qemu-virt-hv
 ramdisk

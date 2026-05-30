@@ -27,6 +27,61 @@ use crate::vmm::config::{config, get_vm_dtb_arc};
 #[cfg(target_arch = "x86_64")]
 use alloc::sync::Arc;
 
+#[cfg(target_arch = "x86_64")]
+mod guest_serial {
+    use ax_errno::AxResult;
+    use axaddrspace::device::{AccessWidth, Port, PortRange};
+    use axdevice_base::{BaseDeviceOps, EmuDeviceType};
+    use log::info;
+
+    pub struct GuestSerial;
+
+    const COM1_BASE: u16 = 0x3F8;
+    const COM1_END: u16 = 0x3FE;
+
+    impl BaseDeviceOps<PortRange> for GuestSerial {
+        fn emu_type(&self) -> EmuDeviceType {
+            EmuDeviceType::Console
+        }
+
+        fn address_range(&self) -> PortRange {
+            PortRange::new(Port(COM1_BASE), Port(COM1_END))
+        }
+
+        fn handle_read(&self, addr: Port, _width: AccessWidth) -> AxResult<usize> {
+            let offset = addr.0 - COM1_BASE;
+            match offset {
+                0 => {
+                    // Receive Buffer Register - no data available
+                    Ok(0)
+                }
+                5 => {
+                    // Line Status Register - Transmitter Holding Register Empty
+                    Ok(0x60)
+                }
+                _ => Ok(0),
+            }
+        }
+
+        fn handle_write(&self, addr: Port, _width: AccessWidth, val: usize) -> AxResult {
+            let offset = addr.0 - COM1_BASE;
+            if offset == 0 {
+                let ch = val as u8;
+                if ch >= 0x20 && ch < 0x7F {
+                    info!("[GUEST] {}", ch as char);
+                } else if ch == b'\n' {
+                    info!("[GUEST] <newline>");
+                } else if ch == b'\r' {
+                    // ignore CR
+                } else {
+                    info!("[GUEST] \\x{:02x}", ch);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 mod linux;
 #[cfg(target_arch = "x86_64")]
 mod x86_boot;
@@ -499,6 +554,50 @@ impl ImageLoader {
         // Register fw_cfg as a port I/O device
         self.vm.get_devices().lock().add_port_dev(Arc::new(fw_cfg));
         info!("Registered fw_cfg device at I/O ports 0x510-0x511");
+
+        // Create and register PCI Host Bridge
+        use pci_host::PciHostBridge;
+        let pci_host = PciHostBridge::new();
+
+        // Create virtio-blk-pci device (Bus 0, Device 1, Function 0)
+        use virtio_blk_pci::VirtioBlkPci;
+        let blk_disk_size = 64 * 1024 * 1024; // 64 MiB disk
+        let virtio_blk = Arc::new(VirtioBlkPci::new(blk_disk_size, (0, 1, 0)));
+        info!(
+            "Created virtio-blk-pci device: BDF=(0,1,0), disk_size={:#x}",
+            blk_disk_size
+        );
+
+        // Add virtio-blk to PCI host bridge's device list
+        pci_host.add_device(virtio_blk.clone());
+        info!("Added virtio-blk-pci to PCI host bridge device list");
+
+        // Register PCI Host Bridge as a port I/O device
+        self.vm
+            .get_devices()
+            .lock()
+            .add_port_dev(Arc::new(pci_host));
+        info!("Registered PCI Host Bridge at I/O ports 0xCF8-0xCFF");
+
+        // Register virtio-blk-pci as a port I/O device
+        // (its I/O BAR address is dynamic, assigned by OVMF at runtime)
+        self.vm.get_devices().lock().add_port_dev(virtio_blk);
+        info!("Registered virtio-blk-pci as port I/O device (dynamic BAR)");
+
+        // Create and register PM Timer
+        use pm_timer::PmTimer;
+        let pm_timer = PmTimer::new_default();
+        self.vm
+            .get_devices()
+            .lock()
+            .add_port_dev(Arc::new(pm_timer));
+        info!("Registered PM device at I/O ports 0x600-0x60B");
+
+        // Create and register Guest Serial (COM1)
+        use guest_serial::GuestSerial;
+        let serial = GuestSerial;
+        self.vm.get_devices().lock().add_port_dev(Arc::new(serial));
+        info!("Registered Guest Serial at I/O ports 0x3F8-0x3FE");
 
         Ok(())
     }

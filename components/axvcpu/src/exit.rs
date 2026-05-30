@@ -214,6 +214,15 @@ pub enum AxVCpuExitReason {
     /// waiting for interrupts or other events to wake it up.
     Halt,
 
+    /// The guest executed an HLT instruction and is waiting for an interrupt.
+    ///
+    /// Unlike [`Halt`](Self::Halt), which indicates the vCPU should be
+    /// permanently suspended, this exit reason signals a temporary idle
+    /// state. The hypervisor should yield the vCPU task so the scheduler
+    /// can run other work, then resume the vCPU on the next scheduling
+    /// round (at which point a pending interrupt may have been queued).
+    Hlt,
+
     /// Request to bring up a secondary CPU core.
     ///
     /// This exit reason is used during the multi-core VM boot process when

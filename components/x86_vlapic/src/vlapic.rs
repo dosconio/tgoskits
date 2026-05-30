@@ -82,8 +82,13 @@ impl VirtualApicRegs {
     /// Create new virtual-APIC registers by allocating a 4-KByte page for the virtual-APIC page.
     pub fn new(vm_id: VMId, vcpu_id: VCpuId) -> Self {
         let apic_frame = PhysFrame::alloc_zero().expect("allocate virtual-APIC page failed");
+
+        unsafe {
+            let version_ptr = apic_frame.as_mut_ptr().cast::<u8>().add(0x30) as *mut u32;
+            *version_ptr = 0x0105_0014;
+        }
+
         Self {
-            // virtual-APIC ID is the same as the VCPU ID.
             vapic_id: vcpu_id as _,
             esr_pending: ErrorStatusRegisterLocal::new(0),
             esr_firing: 0,
@@ -134,6 +139,42 @@ impl VirtualApicRegs {
             .LVT_TIMER
             .read_as_enum(LVT_TIMER::TimerMode)
             .ok_or_else(|| ax_err_type!(InvalidData, "Failed to read timer mode from LVT_TIMER"))
+    }
+
+    pub fn set_tsc_deadline(&mut self, deadline: u64) {
+        self.virtual_timer.set_tsc_deadline(deadline);
+    }
+
+    pub fn get_tsc_deadline(&self) -> u64 {
+        self.virtual_timer.get_tsc_deadline()
+    }
+
+    pub fn timer_vector(&self) -> u8 {
+        self.virtual_timer.vector()
+    }
+
+    pub fn timer_is_masked(&self) -> bool {
+        self.virtual_timer.is_masked()
+    }
+
+    pub fn timer_read_lvt(&self) -> u32 {
+        self.virtual_timer.read_lvt()
+    }
+
+    pub fn timer_stop(&mut self) -> AxResult {
+        self.virtual_timer.stop_timer()
+    }
+
+    pub fn timer_where_am_i(&self) -> (VMId, VCpuId) {
+        self.virtual_timer.where_am_i()
+    }
+
+    pub fn timer_is_periodic(&self) -> bool {
+        self.virtual_timer.is_periodic()
+    }
+
+    pub fn timer_restart(&mut self) -> AxResult {
+        self.virtual_timer.restart_timer()
     }
 
     /// 30.1.4 EOI Virtualization
@@ -545,13 +586,14 @@ impl VirtualApicRegs {
     fn write_lvt(&mut self, offset: ApicRegOffset) -> AxResult {
         let mut val = self.extract_lvt_val(offset);
 
-        if self
+        let apic_disabled = !self
             .regs()
             .SVR
-            .is_set(SPURIOUS_INTERRUPT_VECTOR::APICSoftwareEnableDisable)
-        {
-            val |= APIC_LVT_M;
-        }
+            .is_set(SPURIOUS_INTERRUPT_VECTOR::APICSoftwareEnableDisable);
+
+        info!(
+            "[VLAPIC] write_lvt({offset}): raw_val={val:#010x}, apic_disabled={apic_disabled}"
+        );
 
         // Mask::Masked, Delivery Status:SendPending, Vector::SET(0xff)
         let mut mask = APIC_LVT_M | APIC_LVT_DS | APIC_LVT_VECTOR;
@@ -560,10 +602,19 @@ impl VirtualApicRegs {
             ApicRegOffset::LvtTimer => {
                 mask |= LVT_TIMER::TimerMode::SET.mask();
                 val &= mask;
-                self.regs().LVT_TIMER.set(val); // Duplicated, which one should be removed?
-                self.lvt_last.lvt_timer.set(val);
+
+                info!(
+                    "[VLAPIC] write LVT_TIMER: val={val:#010x}, apic_disabled={apic_disabled}, \
+                     guest_mask={}, timer_mask={}",
+                    val & APIC_LVT_M != 0,
+                    self.virtual_timer.is_masked()
+                );
 
                 self.virtual_timer.write_lvt(val)?;
+
+                let stored_val = if apic_disabled { val | APIC_LVT_M } else { val };
+                self.regs().LVT_TIMER.set(stored_val);
+                self.lvt_last.lvt_timer.set(stored_val);
             }
             ApicRegOffset::LvtErr => {
                 val &= mask;
@@ -664,7 +715,9 @@ impl VirtualApicRegs {
     }
 
     fn write_icrtmr(&mut self) -> AxResult {
-        self.virtual_timer.write_icr(self.regs().ICR_TIMER.get())
+        let icr = self.regs().ICR_TIMER.get();
+        info!("[VLAPIC] write ICR_TIMER: initial_count={icr:#010x}");
+        self.virtual_timer.write_icr(icr)
     }
 
     fn write_dcr(&mut self) -> AxResult {
@@ -757,7 +810,13 @@ impl VirtualApicRegs {
                 value = self.lvt_last.lvt_cmci.get() as _;
             }
             ApicRegOffset::LvtTimer => {
-                value = self.lvt_last.lvt_timer.get() as _;
+                let lvt_last_val = self.lvt_last.lvt_timer.get();
+                let regs_val = self.regs().LVT_TIMER.get();
+                let timer_lvt_val = self.virtual_timer.read_lvt();
+                info!(
+                    "[VLAPIC] read LvtTimer: lvt_last={lvt_last_val:#010x}, regs={regs_val:#010x}, timer_lvt={timer_lvt_val:#010x}"
+                );
+                value = lvt_last_val as _;
             }
             ApicRegOffset::LvtThermal => {
                 value = self.lvt_last.lvt_thermal.get() as _;
@@ -792,6 +851,7 @@ impl VirtualApicRegs {
             }
             ApicRegOffset::TimerCurCount => {
                 value = self.virtual_timer.read_ccr() as _;
+                info!("[VLAPIC] read TimerCurCount (CCR): {value:#010X}");
             }
             ApicRegOffset::TimerDivConf => {
                 value = self.regs().DCR_TIMER.get() as _;
@@ -862,7 +922,9 @@ impl VirtualApicRegs {
                 self.write_lvt(offset)?;
             }
             ApicRegOffset::LvtTimer => {
+                info!("[VLAPIC] handle_write LvtTimer: data={data32:#010x}, current LVT_TIMER={:#010x}", self.regs().LVT_TIMER.get());
                 self.regs().LVT_TIMER.set(data32);
+                info!("[VLAPIC] handle_write LvtTimer: after set, LVT_TIMER={:#010x}", self.regs().LVT_TIMER.get());
                 self.write_lvt(offset)?;
             }
             ApicRegOffset::LvtThermal => {

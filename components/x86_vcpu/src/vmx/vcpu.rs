@@ -40,13 +40,20 @@ use x86_vlapic::EmulatedLocalApic;
 
 use super::{
     VmxExitInfo, as_axerr,
-    definitions::VmxExitReason,
+    definitions::{VmxExitReason, VmxInterruptionType},
     structs::{IOBitmap, MsrBitmap, VmxRegion},
     vmcs::{
         self, ApicAccessExitType, VmcsControl32, VmcsControl64, VmcsControlNW, VmcsGuest16,
         VmcsGuest32, VmcsGuest64, VmcsGuestNW, VmcsHost16, VmcsHost32, VmcsHost64, VmcsHostNW,
+        VmcsReadOnly32,
     },
 };
+
+struct PendingEvent {
+    vector: u8,
+    err_code: Option<u32>,
+    int_type: VmxInterruptionType,
+}
 use crate::{
     boot_mode::{X86BootMode, X86VCpuSetupConfig},
     
@@ -110,7 +117,7 @@ pub struct VmxVcpu {
 
     // Interrupt-related fields
     /// Pending events to be injected to the guest.
-    pending_events: VecDeque<(u8, Option<u32>)>,
+    pending_events: VecDeque<PendingEvent>,
     /// Emulated Local APIC.
     vlapic: EmulatedLocalApic,
 
@@ -137,7 +144,7 @@ impl VmxVcpu {
             ept_root: None,
             // is_host: false,
             vmcs: VmxRegion::new(vmcs_revision_id, false)?,
-            io_bitmap: IOBitmap::passthrough_all()?,
+            io_bitmap: IOBitmap::intercept_all()?,
             msr_bitmap: MsrBitmap::passthrough_all()?,
             pending_events: VecDeque::with_capacity(8),
             vlapic: EmulatedLocalApic::new(vm_id, vcpu_id),
@@ -252,6 +259,47 @@ impl VmxVcpu {
         // Handle vm-exits
         let exit_info = self.exit_info().unwrap();
         // debug!("VM exit: {:#x?}", exit_info);
+
+        // Log non-I/O, non-external-interrupt exits for diagnostics
+        match exit_info.exit_reason {
+            VmxExitReason::IO_INSTRUCTION | VmxExitReason::EXTERNAL_INTERRUPT => {}
+            VmxExitReason::CPUID => {
+                static CPUID_COUNT: core::sync::atomic::AtomicU64 =
+                    core::sync::atomic::AtomicU64::new(0);
+                let count = CPUID_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if count < 50 || count == 100 || count == 1000 || count == 10000 || count == 100000 {
+                    let leaf = self.regs().rax as u32;
+                    let rflags = VmcsGuestNW::RFLAGS.read().unwrap_or(0);
+                    let if_flag = (rflags >> 9) & 1;
+                    let regs = self.regs();
+                    info!(
+                        "[CPUID-IN] #{count}: leaf={leaf:#x}, sub={:#x}, RIP={:#x}, IF={if_flag}",
+                        regs.rcx as u32, self.rip()
+                    );
+                }
+            }
+            reason => {
+                static EXIT_COUNT: core::sync::atomic::AtomicU64 =
+                    core::sync::atomic::AtomicU64::new(0);
+                let count = EXIT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if count < 20 || count == 100 || count == 1000 || count == 10000 {
+                    let extra = match reason {
+                        VmxExitReason::MSR_READ => {
+                            alloc::format!(", MSR={:#x}", self.regs().rcx as u32)
+                        }
+                        VmxExitReason::MSR_WRITE => {
+                            alloc::format!(", MSR={:#x}", self.regs().rcx as u32)
+                        }
+                        _ => alloc::string::String::new(),
+                    };
+                    info!(
+                        "[VMX-DEBUG] Non-IO exit #{count}: reason={reason:?}, RIP={:#x}{}",
+                        self.rip(),
+                        extra
+                    );
+                }
+            }
+        }
 
         match self.builtin_vmexit_handler(&exit_info) {
             Some(result) => match result {
@@ -394,7 +442,20 @@ impl VmxVcpu {
     /// Add a virtual interrupt or exception to the pending events list,
     /// and try to inject it before later VM entries.
     pub fn queue_event(&mut self, vector: u8, err_code: Option<u32>) {
-        self.pending_events.push_back((vector, err_code));
+        let int_type = VmxInterruptionType::from_vector(vector);
+        self.pending_events.push_back(PendingEvent {
+            vector,
+            err_code,
+            int_type,
+        });
+    }
+
+    pub fn queue_external_interrupt(&mut self, vector: u8) {
+        self.pending_events.push_back(PendingEvent {
+            vector,
+            err_code: None,
+            int_type: VmxInterruptionType::External,
+        });
     }
 
     /// If enable, a VM exit occurs at the beginning of any instruction if
@@ -448,8 +509,12 @@ impl VmxVcpu {
         // self.msr_bitmap.set_read_intercept(msr, true);
         // self.msr_bitmap.set_write_intercept(msr, true);
 
-        // This is strange, guest Linux's access to `IA32_UMWAIT_CONTROL` will cause an exception.
-        // But if we intercept it, it seems okay.
+        const IA32_APIC_BASE: u32 = 0x1B;
+        self.msr_bitmap
+            .set_read_intercept(IA32_APIC_BASE, true);
+        self.msr_bitmap
+            .set_write_intercept(IA32_APIC_BASE, true);
+
         const IA32_UMWAIT_CONTROL: u32 = 0xe1;
         self.msr_bitmap
             .set_write_intercept(IA32_UMWAIT_CONTROL, true);
@@ -461,6 +526,12 @@ impl VmxVcpu {
             self.msr_bitmap.set_read_intercept(msr, true);
             self.msr_bitmap.set_write_intercept(msr, true);
         }
+
+        // Intercept IA32_TSC_DEADLINE MSR (0x6E0) for TSC-Deadline timer mode
+        const IA32_TSC_DEADLINE: u32 = 0x6E0;
+        self.msr_bitmap.set_read_intercept(IA32_TSC_DEADLINE, true);
+        self.msr_bitmap.set_write_intercept(IA32_TSC_DEADLINE, true);
+
         Ok(())
     }
 
@@ -620,13 +691,16 @@ impl VmxVcpu {
         )?;
 
         // Intercept all I/O instructions, use MSR bitmaps, activate secondary controls,
-        // disable CR3 load/store interception.
+        // disable CR3 load/store interception, intercept HLT for UEFI wait loops.
         use PrimaryControls as CpuCtrl;
         vmcs::set_control(
             VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS,
             Msr::IA32_VMX_TRUE_PROCBASED_CTLS,
             Msr::IA32_VMX_PROCBASED_CTLS.read() as u32,
-            (CpuCtrl::USE_IO_BITMAPS | CpuCtrl::USE_MSR_BITMAPS | CpuCtrl::SECONDARY_CONTROLS)
+            (CpuCtrl::USE_IO_BITMAPS
+                | CpuCtrl::USE_MSR_BITMAPS
+                | CpuCtrl::SECONDARY_CONTROLS
+                | CpuCtrl::HLT_EXITING)
                 .bits(),
             (CpuCtrl::CR3_LOAD_EXITING
                 | CpuCtrl::CR3_STORE_EXITING
@@ -878,18 +952,18 @@ impl VmxVcpu {
 
     /// Try to inject a pending event before next VM entry.
     fn inject_pending_events(&mut self) -> AxResult {
+        vmcs::clear_injection()?;
         if let Some(event) = self.pending_events.front() {
-            // trace!(
-            //     "pending event vector {:#x} allow_int {}",
-            //     event.0,
-            //     self.allow_interrupt()
-            // );
-            if event.0 < 32 || self.allow_interrupt() {
-                // if it's an exception, or an interrupt that is not blocked, inject it directly.
-                vmcs::inject_event(event.0, event.1)?;
+            let is_nmi = event.int_type == VmxInterruptionType::NMI;
+            let can_inject = is_nmi || self.allow_interrupt();
+            if can_inject {
+                info!(
+                    "[INTR] Injecting interrupt vector={:#x} type={:?}",
+                    event.vector, event.int_type
+                );
+                vmcs::inject_event_with_type(event.vector, event.err_code, event.int_type)?;
                 self.pending_events.pop_front();
             } else {
-                // interrupts are blocked, enable interrupt-window exiting.
                 self.set_interrupt_window(true)?;
             }
         }
@@ -915,6 +989,14 @@ impl VmxVcpu {
             msr_rw @ (VmxExitReason::MSR_READ | VmxExitReason::MSR_WRITE)
                 if {
                     let msr = self.regs().rcx as u32;
+                    msr == 0x1B // IA32_APIC_BASE
+                } =>
+            {
+                Some(self.handle_apic_base_msr(msr_rw == VmxExitReason::MSR_WRITE))
+            }
+            msr_rw @ (VmxExitReason::MSR_READ | VmxExitReason::MSR_WRITE)
+                if {
+                    let msr = self.regs().rcx as u32;
                     (X2APIC_MSR_BASE..=X2APIC_MSR_END).contains(&msr)
                 } =>
             {
@@ -923,7 +1005,37 @@ impl VmxVcpu {
                     self.regs().rcx as u32,
                 ))
             }
+            msr_rw @ (VmxExitReason::MSR_READ | VmxExitReason::MSR_WRITE)
+                if {
+                    let msr = self.regs().rcx as u32;
+                    msr == 0x6E0 // IA32_TSC_DEADLINE
+                } =>
+            {
+                Some(self.handle_tsc_deadline_msr(msr_rw == VmxExitReason::MSR_WRITE))
+            }
             VmxExitReason::APIC_ACCESS => Some(self.handle_apic_access(exit_info)),
+            VmxExitReason::EPT_VIOLATION => {
+                if let Ok(info) = self.nested_page_fault_info() {
+                    let gpa = info.fault_guest_paddr.as_usize();
+                    let flags = info.access_flags;
+                    static EPT_VIOL_COUNT: core::sync::atomic::AtomicU64 =
+                        core::sync::atomic::AtomicU64::new(0);
+                    let vc = EPT_VIOL_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if vc < 20 || vc == 100 || vc == 1000 {
+                        info!(
+                            "[EPT-VIOL] #{vc}: GPA={gpa:#x}, RIP={:#x}, flags={:?}",
+                            self.rip(), flags
+                        );
+                    }
+                    if gpa >= 0xFEE0_0000 && gpa < 0xFEE0_1000 {
+                        Some(self.handle_apic_mmio_ept_violation())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -939,6 +1051,35 @@ impl VmxVcpu {
         self.regs_mut().rdx = val >> 32;
     }
 
+    fn handle_apic_base_msr(&mut self, write: bool) -> AxResult {
+        const VMEXIT_INSTR_LEN_RDMSR_WRMSR: u8 = 2;
+        self.advance_rip(VMEXIT_INSTR_LEN_RDMSR_WRMSR)?;
+
+        const APIC_BASE_ADDR: u64 = 0xFEE0_0000;
+        const APIC_GLOBAL_ENABLE: u64 = 1 << 11;
+        const X2APIC_ENABLE: u64 = 1 << 10;
+
+        if write {
+            let value = self.read_edx_eax();
+            let new_base = value & 0xFFFF_F000;
+            let x2apic = (value & X2APIC_ENABLE) != 0;
+            let enabled = (value & APIC_GLOBAL_ENABLE) != 0;
+            info!(
+                "[APIC-BASE] write: value={value:#x}, base={new_base:#x}, x2apic={x2apic}, enabled={enabled}"
+            );
+            if new_base != APIC_BASE_ADDR {
+                warn!(
+                    "[APIC-BASE] guest tried to change APIC base to {new_base:#x}, ignoring"
+                );
+            }
+        } else {
+            let value = APIC_BASE_ADDR | APIC_GLOBAL_ENABLE | X2APIC_ENABLE;
+            info!("[APIC-BASE] read: returning {value:#x}");
+            self.write_edx_eax(value);
+        }
+        Ok(())
+    }
+
     fn handle_apic_msr_access(&mut self, write: bool, msr: u32) -> AxResult {
         const VMEXIT_INSTR_LEN_RDMSR_WRMSR: u8 = 2;
 
@@ -948,7 +1089,7 @@ impl VmxVcpu {
         if write {
             let value = self.read_edx_eax() as usize;
 
-            trace!("handle_vlapic_msr_write: msr={msr:#x}, value={value:#x}");
+            info!("[APIC-MSR] write: msr={msr:#x}, value={value:#x}");
 
             <EmulatedLocalApic as BaseDeviceOps<SysRegAddrRange>>::handle_write(
                 &self.vlapic,
@@ -963,11 +1104,49 @@ impl VmxVcpu {
                 AccessWidth::Qword,
             )? as u64;
 
-            trace!("handle_vlapic_msr_read: msr={msr:#x}, value={value:#x}");
+            info!("[APIC-MSR] read: msr={msr:#x}, value={value:#x}");
 
             self.write_edx_eax(value);
             Ok(())
         }
+    }
+
+    fn handle_tsc_deadline_msr(&mut self, write: bool) -> AxResult {
+        const VMEXIT_INSTR_LEN_RDMSR_WRMSR: u8 = 2;
+        self.advance_rip(VMEXIT_INSTR_LEN_RDMSR_WRMSR)?;
+
+        if write {
+            let value = self.read_edx_eax();
+            debug!("[TSC-DEADLINE] write: value={value:#x}");
+            if value != 0 {
+                let current_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+                if value > current_tsc {
+                    let delta = value - current_tsc;
+                    let (_vm_id, _vcpu_id) = self.vlapic.timer_where_am_i();
+                    let vector = self.vlapic.timer_vector();
+                    let is_masked = self.vlapic.timer_is_masked();
+                    let timer_val = self.vlapic.timer_read_lvt();
+
+                    let _ = self.vlapic.timer_stop();
+
+                    debug!(
+                        "[TSC-DEADLINE] Setting deadline: current_tsc={current_tsc:#x}, \
+                         deadline={value:#x}, delta={delta:#x}, vector={vector}, \
+                         masked={is_masked}, lvt={timer_val:#x}"
+                    );
+
+                    self.vlapic.set_tsc_deadline(value);
+                }
+            } else {
+                let _ = self.vlapic.timer_stop();
+            }
+        } else {
+            let value = self.vlapic.get_tsc_deadline();
+            debug!("[TSC-DEADLINE] read: value={value:#x}");
+            self.write_edx_eax(value);
+        }
+
+        Ok(())
     }
 
     fn handle_apic_access(&mut self, exit_info: &VmxExitInfo) -> AxResult {
@@ -991,7 +1170,151 @@ impl VmxVcpu {
         self.advance_rip(exit_info.exit_instruction_length as _)?;
 
         unimplemented!("apic access");
-        // TODO
+    }
+
+    fn handle_apic_mmio_ept_violation(&mut self) -> AxResult {
+        let info = self.nested_page_fault_info()?;
+        let gpa = info.fault_guest_paddr.as_usize();
+        let apic_offset = (gpa - 0xFEE0_0000) as u32;
+        let is_write = info.access_flags.contains(axaddrspace::MappingFlags::WRITE);
+
+        let instr_len = VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
+        if instr_len == 0 {
+            warn!(
+                "[APIC-MMIO] EPT violation with instr_len=0: GPA={:#x}, offset={:#x}, write={}",
+                gpa, apic_offset, is_write
+            );
+            return ax_err!(BadState, "APIC MMIO EPT violation with no instruction length");
+        }
+
+        let apic_msr = 0x800 + (apic_offset >> 4);
+
+        if is_write {
+            let value = self.regs().rax as u32;
+            info!(
+                "[APIC-MMIO] write: offset={:#x}, msr={:#x}, value={:#x}",
+                apic_offset, apic_msr, value
+            );
+            <EmulatedLocalApic as BaseDeviceOps<SysRegAddrRange>>::handle_write(
+                &self.vlapic,
+                SysRegAddr::new(apic_msr as _),
+                AccessWidth::Dword,
+                value as usize,
+            )?;
+        } else {
+            let value = <EmulatedLocalApic as BaseDeviceOps<SysRegAddrRange>>::handle_read(
+                &self.vlapic,
+                SysRegAddr::new(apic_msr as _),
+                AccessWidth::Dword,
+            )? as u64;
+            info!(
+                "[APIC-MMIO] read: offset={:#x}, msr={:#x}, value={:#x}",
+                apic_offset, apic_msr, value
+            );
+            self.regs_mut().rax = value;
+        }
+
+        self.advance_rip(instr_len as _)?;
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn read_guest_instr_bytes(&self, max_len: usize) -> Option<([u8; 15], usize)> {
+        let guest_rip = self.rip() as u64;
+        let cr3 = VmcsGuestNW::CR3.read().ok()? as u64;
+        let ept_root = self.ept_root?;
+
+        let gpa = self.gva_to_gpa_via_guest_pt(cr3, guest_rip)?;
+        let hpa = self.gpa_to_hpa_via_ept(ept_root, gpa)?;
+
+        let mut bytes = [0u8; 15];
+        for i in 0..max_len.min(15) {
+            let addr = hpa + i;
+            bytes[i] = unsafe { core::ptr::read_volatile(addr as *const u8) };
+        }
+        Some((bytes, max_len.min(15)))
+    }
+
+    #[allow(dead_code)]
+    fn gva_to_gpa_via_guest_pt(&self, cr3: u64, gva: u64) -> Option<u64> {
+        let pml4_index = ((gva >> 39) & 0x1FF) as usize;
+        let pdpt_index = ((gva >> 30) & 0x1FF) as usize;
+        let pd_index = ((gva >> 21) & 0x1FF) as usize;
+        let pt_index = ((gva >> 12) & 0x1FF) as usize;
+        let offset = (gva & 0xFFF) as usize;
+
+        let pml4e = self.read_phys_u64((cr3 & 0xF_FFFF_F000) + (pml4_index * 8) as u64)?;
+        if pml4e & 1 == 0 {
+            return None;
+        }
+
+        let pdpte = self.read_phys_u64((pml4e & 0xF_FFFF_F000) + (pdpt_index * 8) as u64)?;
+        if pdpte & 1 == 0 {
+            return None;
+        }
+        if pdpte & 0x80 != 0 {
+            return Some((pdpte & 0xF_FFFF_F000) + (gva & 0x3FFF_FFFF));
+        }
+
+        let pde = self.read_phys_u64((pdpte & 0xF_FFFF_F000) + (pd_index * 8) as u64)?;
+        if pde & 1 == 0 {
+            return None;
+        }
+        if pde & 0x80 != 0 {
+            return Some((pde & 0xF_FFFF_F000) + (gva & 0x1F_FFFF));
+        }
+
+        let pte = self.read_phys_u64((pde & 0xF_FFFF_F000) + (pt_index * 8) as u64)?;
+        if pte & 1 == 0 {
+            return None;
+        }
+
+        Some((pte & 0xF_FFFF_F000) + offset as u64)
+    }
+
+    #[allow(dead_code)]
+    fn gpa_to_hpa_via_ept(&self, ept_root: HostPhysAddr, gpa: u64) -> Option<usize> {
+        let pml4_index = ((gpa >> 39) & 0x1FF) as usize;
+        let pdpt_index = ((gpa >> 30) & 0x1FF) as usize;
+        let pd_index = ((gpa >> 21) & 0x1FF) as usize;
+        let pt_index = ((gpa >> 12) & 0x1FF) as usize;
+        let offset = (gpa & 0xFFF) as usize;
+
+        let pml4e = self.read_phys_u64(ept_root.as_usize() as u64 + (pml4_index * 8) as u64)?;
+        if pml4e & 7 == 0 {
+            return None;
+        }
+
+        let pdpte = self.read_phys_u64((pml4e & 0xF_FFFF_F000) + (pdpt_index * 8) as u64)?;
+        if pdpte & 7 == 0 {
+            return None;
+        }
+        if pdpte & 0x80 != 0 {
+            return Some(((pdpte & 0xF_FFFF_F000) + offset as u64) as usize);
+        }
+
+        let pde = self.read_phys_u64((pdpte & 0xF_FFFF_F000) + (pd_index * 8) as u64)?;
+        if pde & 7 == 0 {
+            return None;
+        }
+        if pde & 0x80 != 0 {
+            return Some(((pde & 0xF_FFFF_F000) + (gpa & 0x1F_FFFF)) as usize);
+        }
+
+        let pte = self.read_phys_u64((pde & 0xF_FFFF_F000) + (pt_index * 8) as u64)?;
+        if pte & 7 == 0 {
+            return None;
+        }
+
+        Some(((pte & 0xF_FFFF_F000) + offset as u64) as usize)
+    }
+
+    #[allow(dead_code)]
+    fn read_phys_u64(&self, paddr: u64) -> Option<u64> {
+        const PHYS_VIRT_OFFSET: u64 = 0xffff_8000_0000_0000;
+        let vaddr = paddr + PHYS_VIRT_OFFSET;
+        Some(unsafe { core::ptr::read_volatile(vaddr as *const u64) })
     }
 
     fn handle_vmx_preemption_timer(&mut self) -> AxResult {
@@ -999,6 +1322,16 @@ impl VmxVcpu {
         // Specifically, the timer counts down by 1 every time bit X in the TSC changes due to a TSC increment.
         // The value of X is in the range 0–31 and can be determined by consulting the VMX capability MSR IA32_VMX_MISC (see Appendix A.6).
         VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(VMX_PREEMPTION_TIMER_SET_VALUE)?;
+        Ok(())
+    }
+
+    fn handle_hlt(&mut self) -> AxResult {
+        // HLT instruction: guest is waiting for an interrupt.
+        // Advance RIP past HLT so the guest doesn't re-execute it.
+        // The caller (vcpu_run loop) is responsible for yielding or
+        // waiting for an interrupt before re-entering the VM.
+        const VM_EXIT_INSTR_LEN_HLT: u8 = 1;
+        self.advance_rip(VM_EXIT_INSTR_LEN_HLT)?;
         Ok(())
     }
 
@@ -1046,6 +1379,7 @@ impl VmxVcpu {
         const LEAF_FEATURE_INFO: u32 = 0x1;
         const LEAF_STRUCTURED_EXTENDED_FEATURE_FLAGS_ENUMERATION: u32 = 0x7;
         const LEAF_PROCESSOR_EXTENDED_STATE_ENUMERATION: u32 = 0xd;
+        const LEAF_TSC_CORE_CRYSTAL_RATIO: u32 = 0x15;
         const EAX_FREQUENCY_INFO: u32 = 0x16;
         const LEAF_HYPERVISOR_INFO: u32 = 0x4000_0000;
         const LEAF_HYPERVISOR_FEATURE: u32 = 0x4000_0001;
@@ -1059,10 +1393,14 @@ impl VmxVcpu {
                 const FEATURE_VMX: u32 = 1 << 5;
                 const FEATURE_HYPERVISOR: u32 = 1 << 31;
                 const FEATURE_MCE: u32 = 1 << 7;
+                const FEATURE_TSC_DEADLINE: u32 = 1 << 24;
+                const FEATURE_MONITOR: u32 = 1 << 3;
                 let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
                 res.ecx &= !FEATURE_VMX;
+                res.ecx &= !FEATURE_TSC_DEADLINE;
+                res.ecx &= !FEATURE_MONITOR;
                 res.ecx |= FEATURE_HYPERVISOR;
-                res.eax &= !FEATURE_MCE;
+                res.edx &= !FEATURE_MCE;
                 res
             }
             // See SDM Table 3-8. Information Returned by CPUID Instruction (Contd.)
@@ -1096,9 +1434,16 @@ impl VmxVcpu {
                 ecx: 0,
                 edx: 0,
             },
+            LEAF_TSC_CORE_CRYSTAL_RATIO => {
+                let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
+                if res.eax == 0 {
+                    res.eax = 1;
+                    res.ebx = 1;
+                    res.ecx = 100_000_000;
+                }
+                res
+            }
             EAX_FREQUENCY_INFO => {
-                /// Timer interrupt frequencyin Hz.
-                /// Todo: this should be the same as `ax_config::TIMER_FREQUENCY` defined in ArceOS's config file.
                 const TIMER_FREQUENCY_MHZ: u32 = 3_000;
                 let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
                 if res.eax == 0 {
@@ -1110,6 +1455,19 @@ impl VmxVcpu {
                 }
                 res
             }
+            0x8000_0000 => {
+                let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
+                const MAX_EXT_LEAF: u32 = 0x8000_0008;
+                if res.eax > MAX_EXT_LEAF {
+                    res.eax = MAX_EXT_LEAF;
+                }
+                res
+            }
+            0x8000_0001 => {
+                let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
+                res.ecx &= !(1 << 2);
+                res
+            }
             _ => cpuid!(regs_clone.rax, regs_clone.rcx),
         };
 
@@ -1117,6 +1475,18 @@ impl VmxVcpu {
             "VM exit: CPUID({:#x}, {:#x}): {:?}",
             regs_clone.rax, regs_clone.rcx, res
         );
+
+        {
+            static CPUID_OUT_COUNT: core::sync::atomic::AtomicU64 =
+                core::sync::atomic::AtomicU64::new(0);
+            let out_count = CPUID_OUT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if out_count < 50 || out_count == 100 || out_count == 1000 || out_count == 10000 {
+                info!(
+                    "[CPUID-OUT] #{out_count}: leaf={:#x} => EAX={:#x}, EBX={:#x}, ECX={:#x}, EDX={:#x}",
+                    function, res.eax, res.ebx, res.ecx, res.edx
+                );
+            }
+        }
 
         let regs = self.regs_mut();
         regs.rax = res.eax as _;
@@ -1258,9 +1628,9 @@ impl AxArchVCpu for VmxVcpu {
     fn run(&mut self) -> AxResult<AxVCpuExitReason> {
         match self.inner_run() {
             Some(exit_info) => Ok(if exit_info.entry_failure {
+                let exit_reason_raw = exit_info.exit_reason as u64;
                 AxVCpuExitReason::FailEntry {
-                    // Todo: get `hardware_entry_failure_reason` somehow.
-                    hardware_entry_failure_reason: 0,
+                    hardware_entry_failure_reason: exit_reason_raw,
                 }
             } else {
                 match exit_info.exit_reason {
@@ -1345,6 +1715,10 @@ impl AxArchVCpu for VmxVcpu {
                             vector: int_info.vector as _,
                         }
                     }
+                    VmxExitReason::HLT => {
+                        self.handle_hlt()?;
+                        AxVCpuExitReason::Hlt
+                    }
                     VmxExitReason::MSR_READ => {
                         // `reg` is unused here.
                         AxVCpuExitReason::SysRegRead {
@@ -1374,7 +1748,30 @@ impl AxArchVCpu for VmxVcpu {
                         }
                     }
                     _ => {
-                        if exit_info.exit_reason == VmxExitReason::EXCEPTION_NMI
+                        if exit_info.exit_reason == VmxExitReason::TRIPLE_FAULT {
+                            let idtr_base = VmcsGuestNW::IDTR_BASE.read().unwrap_or(0);
+                            let idtr_limit = VmcsGuest32::IDTR_LIMIT.read().unwrap_or(0);
+                            let rsp = VmcsGuestNW::RSP.read().unwrap_or(0);
+                            let rflags = VmcsGuestNW::RFLAGS.read().unwrap_or(0);
+                            let cr0 = VmcsGuestNW::CR0.read().unwrap_or(0);
+                            let cr3 = VmcsGuestNW::CR3.read().unwrap_or(0);
+                            let cr4 = VmcsGuestNW::CR4.read().unwrap_or(0);
+                            let cs = VmcsGuest16::CS_SELECTOR.read().unwrap_or(0);
+                            let cs_base = VmcsGuestNW::CS_BASE.read().unwrap_or(0);
+                            let interruptibility = VmcsGuest32::INTERRUPTIBILITY_STATE.read().unwrap_or(0);
+                            let idt_vec = vmcs::idt_vectoring_info().ok().flatten();
+                            error!(
+                                "[TRIPLE_FAULT] RIP={:#x}, RSP={:#x}, RFLAGS={:#x}, \
+                                 IDTR={:#x}:{:#x}, CR0={:#x}, CR3={:#x}, CR4={:#x}, \
+                                 CS={:#x}:{:#x}, INTBL={:#x}, IDT-vec={:?}",
+                                self.rip(), rsp, rflags,
+                                idtr_base, idtr_limit,
+                                cr0, cr3, cr4,
+                                cs, cs_base,
+                                interruptibility,
+                                idt_vec
+                            );
+                        } else if exit_info.exit_reason == VmxExitReason::EXCEPTION_NMI
                             && let Ok(int_info) = self.interrupt_exit_info()
                         {
                             warn!(
@@ -1414,7 +1811,27 @@ impl AxArchVCpu for VmxVcpu {
             warn!("inject_interrupt called with vector 0, ignoring");
             return Ok(());
         }
-        self.queue_event(vector as u8, None);
+        self.queue_external_interrupt(vector as u8);
+        Ok(())
+    }
+
+    fn handle_timer_expired(&mut self) -> AxResult {
+        let vector = self.vlapic.timer_vector();
+        let is_masked = self.vlapic.timer_is_masked();
+        let is_periodic = self.vlapic.timer_is_periodic();
+
+        info!(
+            "[VLAPIC] timer expired: vector={vector:#x}, masked={is_masked}, periodic={is_periodic}"
+        );
+
+        if !is_masked && vector > 0 {
+            self.queue_external_interrupt(vector);
+        }
+
+        if is_periodic {
+            self.vlapic.timer_restart()?;
+        }
+
         Ok(())
     }
 

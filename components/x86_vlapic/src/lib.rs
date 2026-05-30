@@ -93,6 +93,42 @@ impl EmulatedLocalApic {
     pub fn virtual_apic_page_addr(&self) -> HostPhysAddr {
         self.get_vlapic_regs().virtual_apic_page_addr()
     }
+
+    pub fn set_tsc_deadline(&self, deadline: u64) {
+        self.get_mut_vlapic_regs().set_tsc_deadline(deadline);
+    }
+
+    pub fn get_tsc_deadline(&self) -> u64 {
+        self.get_vlapic_regs().get_tsc_deadline()
+    }
+
+    pub fn timer_vector(&self) -> u8 {
+        self.get_vlapic_regs().timer_vector()
+    }
+
+    pub fn timer_is_masked(&self) -> bool {
+        self.get_vlapic_regs().timer_is_masked()
+    }
+
+    pub fn timer_read_lvt(&self) -> u32 {
+        self.get_vlapic_regs().timer_read_lvt()
+    }
+
+    pub fn timer_stop(&self) -> AxResult {
+        self.get_mut_vlapic_regs().timer_stop()
+    }
+
+    pub fn timer_where_am_i(&self) -> (VMId, VCpuId) {
+        self.get_vlapic_regs().timer_where_am_i()
+    }
+
+    pub fn timer_is_periodic(&self) -> bool {
+        self.get_vlapic_regs().timer_is_periodic()
+    }
+
+    pub fn timer_restart(&self) -> AxResult {
+        self.get_mut_vlapic_regs().timer_restart()
+    }
 }
 
 impl BaseDeviceOps<AddrRange<GuestPhysAddr>> for EmulatedLocalApic {
