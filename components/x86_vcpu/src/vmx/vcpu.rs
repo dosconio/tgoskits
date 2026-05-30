@@ -21,7 +21,7 @@ use core::{
 
 use ax_errno::{AxResult, ax_err, ax_err_type};
 use axaddrspace::{
-    GuestPhysAddr, GuestVirtAddr, HostPhysAddr, NestedPageFaultInfo,
+    GuestPhysAddr, GuestVirtAddr, HostPhysAddr, MappingFlags, NestedPageFaultInfo,
     device::{AccessWidth, Port, SysRegAddr, SysRegAddrRange},
 };
 use axdevice_base::BaseDeviceOps;
@@ -36,6 +36,7 @@ use x86::{
     segmentation::SegmentSelector,
 };
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags, EferFlags};
+use x86_vioapic::{GLOBAL_VIOAPIC, IOAPIC_MMIO_BASE, IOAPIC_MMIO_SIZE};
 use x86_vlapic::EmulatedLocalApic;
 
 use super::{
@@ -267,14 +268,16 @@ impl VmxVcpu {
                 static CPUID_COUNT: core::sync::atomic::AtomicU64 =
                     core::sync::atomic::AtomicU64::new(0);
                 let count = CPUID_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if count < 50 || count == 100 || count == 1000 || count == 10000 || count == 100000 {
+                if count < 50 || count == 100 || count == 1000 || count == 10000 || count == 100000
+                {
                     let leaf = self.regs().rax as u32;
                     let rflags = VmcsGuestNW::RFLAGS.read().unwrap_or(0);
                     let if_flag = (rflags >> 9) & 1;
                     let regs = self.regs();
                     info!(
                         "[CPUID-IN] #{count}: leaf={leaf:#x}, sub={:#x}, RIP={:#x}, IF={if_flag}",
-                        regs.rcx as u32, self.rip()
+                        regs.rcx as u32,
+                        self.rip()
                     );
                 }
             }
@@ -510,10 +513,8 @@ impl VmxVcpu {
         // self.msr_bitmap.set_write_intercept(msr, true);
 
         const IA32_APIC_BASE: u32 = 0x1B;
-        self.msr_bitmap
-            .set_read_intercept(IA32_APIC_BASE, true);
-        self.msr_bitmap
-            .set_write_intercept(IA32_APIC_BASE, true);
+        self.msr_bitmap.set_read_intercept(IA32_APIC_BASE, true);
+        self.msr_bitmap.set_write_intercept(IA32_APIC_BASE, true);
 
         const IA32_UMWAIT_CONTROL: u32 = 0xe1;
         self.msr_bitmap
@@ -953,6 +954,20 @@ impl VmxVcpu {
     /// Try to inject a pending event before next VM entry.
     fn inject_pending_events(&mut self) -> AxResult {
         vmcs::clear_injection()?;
+
+        if let Some(vioapic) = GLOBAL_VIOAPIC.get() {
+            let vcpu_id = self.vlapic.timer_where_am_i().1 as u32;
+            let pending = vioapic.take_pending_irqs(vcpu_id);
+            for vector in pending {
+                debug!(
+                    "[IOAPIC] Injecting pending IRQ vector={:#x} to vcpu={}",
+                    vector, vcpu_id
+                );
+                self.vlapic.set_intr(vcpu_id, vector as u32);
+                self.queue_external_interrupt(vector);
+            }
+        }
+
         if let Some(event) = self.pending_events.front() {
             let is_nmi = event.int_type == VmxInterruptionType::NMI;
             let can_inject = is_nmi || self.allow_interrupt();
@@ -1024,10 +1039,11 @@ impl VmxVcpu {
                     if vc < 20 || vc == 100 || vc == 1000 {
                         info!(
                             "[EPT-VIOL] #{vc}: GPA={gpa:#x}, RIP={:#x}, flags={:?}",
-                            self.rip(), flags
+                            self.rip(),
+                            flags
                         );
                     }
-                    if gpa >= 0xFEE0_0000 && gpa < 0xFEE0_1000 {
+                    if (0xFEE0_0000..0xFEE0_1000).contains(&gpa) {
                         Some(self.handle_apic_mmio_ept_violation())
                     } else {
                         None
@@ -1065,12 +1081,11 @@ impl VmxVcpu {
             let x2apic = (value & X2APIC_ENABLE) != 0;
             let enabled = (value & APIC_GLOBAL_ENABLE) != 0;
             info!(
-                "[APIC-BASE] write: value={value:#x}, base={new_base:#x}, x2apic={x2apic}, enabled={enabled}"
+                "[APIC-BASE] write: value={value:#x}, base={new_base:#x}, x2apic={x2apic}, \
+                 enabled={enabled}"
             );
             if new_base != APIC_BASE_ADDR {
-                warn!(
-                    "[APIC-BASE] guest tried to change APIC base to {new_base:#x}, ignoring"
-                );
+                warn!("[APIC-BASE] guest tried to change APIC base to {new_base:#x}, ignoring");
             }
         } else {
             let value = APIC_BASE_ADDR | APIC_GLOBAL_ENABLE | X2APIC_ENABLE;
@@ -1184,7 +1199,10 @@ impl VmxVcpu {
                 "[APIC-MMIO] EPT violation with instr_len=0: GPA={:#x}, offset={:#x}, write={}",
                 gpa, apic_offset, is_write
             );
-            return ax_err!(BadState, "APIC MMIO EPT violation with no instruction length");
+            return ax_err!(
+                BadState,
+                "APIC MMIO EPT violation with no instruction length"
+            );
         }
 
         let apic_msr = 0x800 + (apic_offset >> 4);
@@ -1229,9 +1247,9 @@ impl VmxVcpu {
         let hpa = self.gpa_to_hpa_via_ept(ept_root, gpa)?;
 
         let mut bytes = [0u8; 15];
-        for i in 0..max_len.min(15) {
+        for (i, byte) in bytes.iter_mut().enumerate().take(max_len.min(15)) {
             let addr = hpa + i;
-            bytes[i] = unsafe { core::ptr::read_volatile(addr as *const u8) };
+            *byte = unsafe { core::ptr::read_volatile(addr as *const u8) };
         }
         Some((bytes, max_len.min(15)))
     }
@@ -1482,7 +1500,8 @@ impl VmxVcpu {
             let out_count = CPUID_OUT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             if out_count < 50 || out_count == 100 || out_count == 1000 || out_count == 10000 {
                 info!(
-                    "[CPUID-OUT] #{out_count}: leaf={:#x} => EAX={:#x}, EBX={:#x}, ECX={:#x}, EDX={:#x}",
+                    "[CPUID-OUT] #{out_count}: leaf={:#x} => EAX={:#x}, EBX={:#x}, ECX={:#x}, \
+                     EDX={:#x}",
                     function, res.eax, res.ebx, res.ecx, res.edx
                 );
             }
@@ -1728,6 +1747,33 @@ impl AxArchVCpu for VmxVcpu {
                     }
                     VmxExitReason::EPT_VIOLATION => {
                         let info = self.nested_page_fault_info()?;
+                        let gpa = info.fault_guest_paddr.as_usize();
+
+                        if gpa >= IOAPIC_MMIO_BASE as usize
+                            && gpa < (IOAPIC_MMIO_BASE + IOAPIC_MMIO_SIZE) as usize
+                        {
+                            let instr_len =
+                                VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
+                            if instr_len > 0 {
+                                self.advance_rip(instr_len as _)?;
+                                if info.access_flags.contains(MappingFlags::WRITE) {
+                                    return Ok(AxVCpuExitReason::MmioWrite {
+                                        addr: info.fault_guest_paddr,
+                                        width: AccessWidth::Dword,
+                                        data: self.regs().rax,
+                                    });
+                                } else {
+                                    return Ok(AxVCpuExitReason::MmioRead {
+                                        addr: info.fault_guest_paddr,
+                                        width: AccessWidth::Dword,
+                                        reg: 0,
+                                        reg_width: AccessWidth::Dword,
+                                        signed_ext: false,
+                                    });
+                                }
+                            }
+                        }
+
                         info!(
                             "EPT_VIOLATION: GPA={:#x}, access={:?}, RIP={:#x}",
                             info.fault_guest_paddr,
@@ -1758,16 +1804,23 @@ impl AxArchVCpu for VmxVcpu {
                             let cr4 = VmcsGuestNW::CR4.read().unwrap_or(0);
                             let cs = VmcsGuest16::CS_SELECTOR.read().unwrap_or(0);
                             let cs_base = VmcsGuestNW::CS_BASE.read().unwrap_or(0);
-                            let interruptibility = VmcsGuest32::INTERRUPTIBILITY_STATE.read().unwrap_or(0);
+                            let interruptibility =
+                                VmcsGuest32::INTERRUPTIBILITY_STATE.read().unwrap_or(0);
                             let idt_vec = vmcs::idt_vectoring_info().ok().flatten();
                             error!(
                                 "[TRIPLE_FAULT] RIP={:#x}, RSP={:#x}, RFLAGS={:#x}, \
                                  IDTR={:#x}:{:#x}, CR0={:#x}, CR3={:#x}, CR4={:#x}, \
                                  CS={:#x}:{:#x}, INTBL={:#x}, IDT-vec={:?}",
-                                self.rip(), rsp, rflags,
-                                idtr_base, idtr_limit,
-                                cr0, cr3, cr4,
-                                cs, cs_base,
+                                self.rip(),
+                                rsp,
+                                rflags,
+                                idtr_base,
+                                idtr_limit,
+                                cr0,
+                                cr3,
+                                cr4,
+                                cs,
+                                cs_base,
                                 interruptibility,
                                 idt_vec
                             );
@@ -1821,7 +1874,8 @@ impl AxArchVCpu for VmxVcpu {
         let is_periodic = self.vlapic.timer_is_periodic();
 
         info!(
-            "[VLAPIC] timer expired: vector={vector:#x}, masked={is_masked}, periodic={is_periodic}"
+            "[VLAPIC] timer expired: vector={vector:#x}, masked={is_masked}, \
+             periodic={is_periodic}"
         );
 
         if !is_masked && vector > 0 {

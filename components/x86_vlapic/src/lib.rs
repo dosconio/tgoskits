@@ -129,6 +129,14 @@ impl EmulatedLocalApic {
     pub fn timer_restart(&self) -> AxResult {
         self.get_mut_vlapic_regs().timer_restart()
     }
+
+    pub fn set_intr(&self, vcpu_id: u32, vector: u32) {
+        self.get_mut_vlapic_regs().set_intr(vcpu_id, vector, false);
+    }
+
+    pub fn has_pending_interrupt(&self) -> bool {
+        self.get_vlapic_regs().has_pending_interrupt()
+    }
 }
 
 impl BaseDeviceOps<AddrRange<GuestPhysAddr>> for EmulatedLocalApic {

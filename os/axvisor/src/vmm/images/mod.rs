@@ -599,6 +599,17 @@ impl ImageLoader {
         self.vm.get_devices().lock().add_port_dev(Arc::new(serial));
         info!("Registered Guest Serial at I/O ports 0x3F8-0x3FE");
 
+        // Create and register vIOAPIC as MMIO device
+        use x86_vioapic::{GLOBAL_VIOAPIC, IoApic};
+        let vioapic = Arc::new(IoApic::new(0, 0));
+        let _ = GLOBAL_VIOAPIC.call_once(|| vioapic.clone());
+        self.vm.get_devices().lock().add_mmio_dev(vioapic);
+        info!(
+            "Registered vIOAPIC at MMIO {:#x}-{:#x}",
+            x86_vioapic::IOAPIC_MMIO_BASE,
+            x86_vioapic::IOAPIC_MMIO_BASE + x86_vioapic::IOAPIC_MMIO_SIZE
+        );
+
         Ok(())
     }
 

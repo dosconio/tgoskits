@@ -206,15 +206,18 @@ impl ApicTimer {
             return 0;
         }
         let current_ticks = current_ticks();
-        let deadline_ticks =
-            self.last_start_ticks + ((self.initial_count_register as u64) << self.start_divide_shift);
+        let deadline_ticks = self.last_start_ticks
+            + ((self.initial_count_register as u64) << self.start_divide_shift);
         if current_ticks >= deadline_ticks {
             trace!("read_ccr: timer expired, returning 0");
             return 0;
         }
         let remaining_ticks = deadline_ticks - current_ticks;
         let ccr = (remaining_ticks >> self.start_divide_shift) as u32;
-        trace!("read_ccr: ccr={ccr:#x}, current_ticks={current_ticks:#x}, deadline_ticks={deadline_ticks:#x}");
+        trace!(
+            "read_ccr: ccr={ccr:#x}, current_ticks={current_ticks:#x}, \
+             deadline_ticks={deadline_ticks:#x}"
+        );
         ccr
     }
 

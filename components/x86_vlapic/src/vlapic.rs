@@ -388,13 +388,48 @@ impl VirtualApicRegs {
         unimplemented!("x2apic handle_self_ipi");
     }
 
-    fn set_intr(&mut self, vcpu_id: u32, vector: u32, level: bool) {
-        unimplemented!(
-            "set_intr, vcpu_id: {}, vector: {}, level: {}",
-            vcpu_id,
-            vector,
-            level
+    pub(crate) fn has_pending_interrupt(&self) -> bool {
+        for i in 0..8 {
+            let irr = unsafe {
+                let base = self.virtual_lapic.as_ptr() as *const u8;
+                let irr_ptr = base.add(0x200 + i * 16) as *const u32;
+                irr_ptr.read_volatile()
+            };
+            if irr != 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn set_intr(&mut self, vcpu_id: u32, vector: u32, _level: bool) {
+        let apic_enabled = self
+            .regs()
+            .SVR
+            .is_set(SPURIOUS_INTERRUPT_VECTOR::APICSoftwareEnableDisable);
+        if !apic_enabled {
+            debug!("[VLAPIC] APIC disabled, ignoring interrupt vector {vector} for vcpu {vcpu_id}");
+            return;
+        }
+
+        let (idx, bitpos) = extract_index_and_bitpos_u32(vector);
+        unsafe {
+            let base = self.virtual_lapic.as_ptr() as *mut u8;
+            let irr_ptr = base.add(0x200 + idx * 16) as *mut u32;
+            let mut irr_val = irr_ptr.read_volatile();
+            if irr_val & (1 << bitpos) != 0 {
+                return;
+            }
+            irr_val |= 1 << bitpos;
+            irr_ptr.write_volatile(irr_val);
+        }
+
+        debug!(
+            "[VLAPIC] set_intr: vcpu={}, vector={}, idx={}, bit={}",
+            vcpu_id, vector, idx, bitpos
         );
+
+        let _ = vcpu_id;
     }
 
     fn inject_nmi(&mut self, vcpu_id: u32) {
@@ -591,9 +626,7 @@ impl VirtualApicRegs {
             .SVR
             .is_set(SPURIOUS_INTERRUPT_VECTOR::APICSoftwareEnableDisable);
 
-        info!(
-            "[VLAPIC] write_lvt({offset}): raw_val={val:#010x}, apic_disabled={apic_disabled}"
-        );
+        info!("[VLAPIC] write_lvt({offset}): raw_val={val:#010x}, apic_disabled={apic_disabled}");
 
         // Mask::Masked, Delivery Status:SendPending, Vector::SET(0xff)
         let mut mask = APIC_LVT_M | APIC_LVT_DS | APIC_LVT_VECTOR;
@@ -814,7 +847,8 @@ impl VirtualApicRegs {
                 let regs_val = self.regs().LVT_TIMER.get();
                 let timer_lvt_val = self.virtual_timer.read_lvt();
                 info!(
-                    "[VLAPIC] read LvtTimer: lvt_last={lvt_last_val:#010x}, regs={regs_val:#010x}, timer_lvt={timer_lvt_val:#010x}"
+                    "[VLAPIC] read LvtTimer: lvt_last={lvt_last_val:#010x}, \
+                     regs={regs_val:#010x}, timer_lvt={timer_lvt_val:#010x}"
                 );
                 value = lvt_last_val as _;
             }
@@ -922,9 +956,16 @@ impl VirtualApicRegs {
                 self.write_lvt(offset)?;
             }
             ApicRegOffset::LvtTimer => {
-                info!("[VLAPIC] handle_write LvtTimer: data={data32:#010x}, current LVT_TIMER={:#010x}", self.regs().LVT_TIMER.get());
+                info!(
+                    "[VLAPIC] handle_write LvtTimer: data={data32:#010x}, current \
+                     LVT_TIMER={:#010x}",
+                    self.regs().LVT_TIMER.get()
+                );
                 self.regs().LVT_TIMER.set(data32);
-                info!("[VLAPIC] handle_write LvtTimer: after set, LVT_TIMER={:#010x}", self.regs().LVT_TIMER.get());
+                info!(
+                    "[VLAPIC] handle_write LvtTimer: after set, LVT_TIMER={:#010x}",
+                    self.regs().LVT_TIMER.get()
+                );
                 self.write_lvt(offset)?;
             }
             ApicRegOffset::LvtThermal => {

@@ -130,3 +130,4 @@ starry-process
 starry-vm
 tg-xtask
 x86_vcpu
+x86_vioapic

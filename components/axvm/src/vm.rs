@@ -578,7 +578,10 @@ impl AxVM {
                 AxVCpuExitReason::MmioWrite { addr, width, data } => {
                     diag_mmio_count += 1;
                     if diag_mmio_count <= 20 || diag_mmio_count % 10000 == 0 {
-                        info!("[DIAG] MMIO write: addr={:#x}, width={:?}, data={:#x}", addr, width, data);
+                        info!(
+                            "[DIAG] MMIO write: addr={:#x}, width={:?}, data={:#x}",
+                            addr, width, data
+                        );
                     }
                     self.get_devices()
                         .lock()
@@ -589,7 +592,10 @@ impl AxVM {
                     diag_io_count += 1;
                     let val = self.get_devices().lock().handle_port_read(*port, *width)?;
                     if diag_io_count <= 200 || diag_io_count % 10000 == 0 {
-                        info!("[DIAG] IO read #{diag_io_count}: port={:#x}, width={:?}, val={:#x}", port.0, width, val);
+                        info!(
+                            "[DIAG] IO read #{diag_io_count}: port={:#x}, width={:?}, val={:#x}",
+                            port.0, width, val
+                        );
                     }
                     #[cfg(not(target_arch = "riscv64"))]
                     vcpu.set_gpr(0, val);
@@ -602,7 +608,10 @@ impl AxVM {
                 AxVCpuExitReason::IoWrite { port, width, data } => {
                     diag_io_count += 1;
                     if diag_io_count <= 200 || diag_io_count % 10000 == 0 {
-                        info!("[DIAG] IO write #{diag_io_count}: port={:#x}, width={:?}, data={:#x}", port.0, width, data);
+                        info!(
+                            "[DIAG] IO write #{diag_io_count}: port={:#x}, width={:?}, data={:#x}",
+                            port.0, width, data
+                        );
                     }
                     self.get_devices()
                         .lock()

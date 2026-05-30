@@ -99,6 +99,7 @@ acpi_tables = { path = "../../components/acpi_tables" }
 pci_host = { path = "../../components/pci_host" }
 virtio_blk_pci = { path = "../../components/virtio_blk_pci" }
 pm_timer = { path = "../../components/pm_timer" }
+x86_vioapic = { path = "../../components/x86_vioapic" }
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 aarch64-cpu-ext = "0.1"
 arm-gic-driver = { workspace = true, features = ["rdif"] }

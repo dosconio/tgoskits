@@ -1957,6 +1957,7 @@ dependencies = [
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "virtio_blk_pci",
+ "x86_vioapic",
 ]
 
 [[package]]
@@ -9927,7 +9928,21 @@ dependencies = [
  "tock-registers 0.10.1",
  "x86",
  "x86_64",
+ "x86_vioapic",
  "x86_vlapic",
+]
+
+[[package]]
+name = "x86_vioapic"
+version = "0.1.0"
+dependencies = [
+ "ax-errno",
+ "ax-memory-addr",
+ "axaddrspace",
+ "axdevice_base",
+ "axvisor_api",
+ "log",
+ "spin 0.10.0",
 ]
 
 [[package]]

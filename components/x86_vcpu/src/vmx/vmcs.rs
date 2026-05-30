@@ -539,7 +539,11 @@ impl VmxInterruptInfo {
     }
 
     /// Convert from the interrupt vector, error code, and explicit interruption type.
-    pub fn from_with_type(vector: u8, err_code: Option<u32>, int_type: VmxInterruptionType) -> Self {
+    pub fn from_with_type(
+        vector: u8,
+        err_code: Option<u32>,
+        int_type: VmxInterruptionType,
+    ) -> Self {
         Self {
             vector,
             int_type,
