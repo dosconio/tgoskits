@@ -658,6 +658,12 @@ impl ImageLoader {
             x86_vioapic::IOAPIC_MMIO_BASE + x86_vioapic::IOAPIC_MMIO_SIZE
         );
 
+        // Create and register i8259 PIC as port I/O device
+        use i8259_pic::I8259Pic;
+        let pic = I8259Pic::new();
+        self.vm.get_devices().lock().add_port_dev(Arc::new(pic));
+        info!("Registered i8259 PIC at I/O ports 0x20-0x21, 0xA0-0xA1");
+
         Ok(())
     }
 

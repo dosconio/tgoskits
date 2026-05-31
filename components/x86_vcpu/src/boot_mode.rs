@@ -16,4 +16,6 @@ pub enum X86BootMode {
 pub struct X86VCpuSetupConfig {
     /// Boot mode for the guest VM.
     pub boot_mode: X86BootMode,
+    /// Size of guest RAM in bytes.
+    pub ram_size: usize,
 }

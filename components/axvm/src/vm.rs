@@ -369,7 +369,15 @@ impl AxVM {
                     VMBootMode::Trampoline => x86_vcpu::X86BootMode::Trampoline,
                     VMBootMode::Uefi => x86_vcpu::X86BootMode::Uefi,
                 };
-                crate::vcpu::AxVCpuSetupConfig { boot_mode }
+                let ram_size = inner_mut
+                    .memory_regions
+                    .iter()
+                    .map(|r| r.size())
+                    .sum::<usize>();
+                crate::vcpu::AxVCpuSetupConfig {
+                    boot_mode,
+                    ram_size,
+                }
             };
             #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
             #[allow(clippy::let_unit_value)]
@@ -568,7 +576,7 @@ impl AxVM {
                     signed_ext: _,
                 } => {
                     diag_mmio_count += 1;
-                    if diag_mmio_count <= 20 || diag_mmio_count % 10000 == 0 {
+                    if diag_mmio_count <= 20 || diag_mmio_count.is_multiple_of(10000) {
                         info!("[DIAG] MMIO read: addr={:#x}, width={:?}", addr, width);
                     }
                     let val = self.get_devices().lock().handle_mmio_read(*addr, *width)?;
@@ -577,7 +585,7 @@ impl AxVM {
                 }
                 AxVCpuExitReason::MmioWrite { addr, width, data } => {
                     diag_mmio_count += 1;
-                    if diag_mmio_count <= 20 || diag_mmio_count % 10000 == 0 {
+                    if diag_mmio_count <= 20 || diag_mmio_count.is_multiple_of(10000) {
                         info!(
                             "[DIAG] MMIO write: addr={:#x}, width={:?}, data={:#x}",
                             addr, width, data
@@ -591,7 +599,7 @@ impl AxVM {
                 AxVCpuExitReason::IoRead { port, width } => {
                     diag_io_count += 1;
                     let val = self.get_devices().lock().handle_port_read(*port, *width)?;
-                    if diag_io_count <= 200 || diag_io_count % 10000 == 0 {
+                    if diag_io_count <= 200 || diag_io_count.is_multiple_of(10000) {
                         info!(
                             "[DIAG] IO read #{diag_io_count}: port={:#x}, width={:?}, val={:#x}",
                             port.0, width, val
@@ -607,7 +615,7 @@ impl AxVM {
                 }
                 AxVCpuExitReason::IoWrite { port, width, data } => {
                     diag_io_count += 1;
-                    if diag_io_count <= 200 || diag_io_count % 10000 == 0 {
+                    if diag_io_count <= 200 || diag_io_count.is_multiple_of(10000) {
                         info!(
                             "[DIAG] IO write #{diag_io_count}: port={:#x}, width={:?}, data={:#x}",
                             port.0, width, data
@@ -758,7 +766,7 @@ impl AxVM {
                 }
                 AxVCpuExitReason::NestedPageFault { addr, access_flags } => {
                     diag_ept_count += 1;
-                    if diag_ept_count <= 20 || diag_ept_count % 10000 == 0 {
+                    if diag_ept_count <= 20 || diag_ept_count.is_multiple_of(10000) {
                         info!(
                             "[DIAG] EPT violation #{diag_ept_count}: GPA={:#x}, access={:?}",
                             addr, access_flags

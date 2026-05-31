@@ -87,6 +87,7 @@ members = [
     "components/ctor_bare/ctor_bare_macros",
     "drivers/net/fxmac_rs",
     "components/fw_cfg",
+    "components/i8259_pic",
     "components/pm_timer",
     "components/handler_table",
     "components/int_ratio",

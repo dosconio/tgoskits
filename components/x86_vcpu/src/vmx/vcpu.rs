@@ -126,6 +126,9 @@ pub struct VmxVcpu {
     /// The XState of the VCpu. Both host and guest.
     xstate: XState,
 
+    /// End of guest RAM (for EPT violation handling).
+    ram_end: usize,
+
     // Tracing-related fields
     #[cfg(feature = "tracing")]
     /// The guest registers when the VM-exit happens.
@@ -150,6 +153,7 @@ impl VmxVcpu {
             pending_events: VecDeque::with_capacity(8),
             vlapic: EmulatedLocalApic::new(vm_id, vcpu_id),
             xstate: XState::new(),
+            ram_end: 0,
             #[cfg(feature = "tracing")]
             guest_regs_exiting: GeneralRegisters::default(),
         };
@@ -163,7 +167,9 @@ impl VmxVcpu {
         ept_root: HostPhysAddr,
         entry: GuestPhysAddr,
         boot_mode: X86BootMode,
+        ram_size: usize,
     ) -> AxResult {
+        self.ram_end = ram_size;
         self.setup_vmcs(entry, ept_root, boot_mode)?;
         Ok(())
     }
@@ -1796,7 +1802,9 @@ impl AxArchVCpu for VmxVcpu {
             self.entry.unwrap(),
             self.ept_root.unwrap(),
             config.boot_mode,
-        )
+        )?;
+        self.ram_end = config.ram_size;
+        Ok(())
     }
 
     fn run(&mut self) -> AxResult<AxVCpuExitReason> {
@@ -1927,6 +1935,22 @@ impl AxArchVCpu for VmxVcpu {
                                     });
                                 }
                             }
+                        }
+
+                        if self.ram_end > 0 && gpa >= self.ram_end {
+                            info!(
+                                "[EPT-VIOL] GPA={:#x} beyond ram_end={:#x}, injecting #PF",
+                                gpa, self.ram_end
+                            );
+                            let mut err_code = 0u32;
+                            if info.access_flags.contains(MappingFlags::WRITE) {
+                                err_code |= 1 << 1;
+                            }
+                            if info.access_flags.contains(MappingFlags::EXECUTE) {
+                                err_code |= 1 << 4;
+                            }
+                            self.queue_event(14, Some(err_code));
+                            return Ok(AxVCpuExitReason::Nothing);
                         }
 
                         info!(

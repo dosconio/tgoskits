@@ -1942,6 +1942,7 @@ dependencies = [
  "fdt-parser",
  "fw_cfg",
  "hashbrown 0.14.5",
+ "i8259_pic",
  "lazy_static",
  "log",
  "pci_host",
@@ -4347,6 +4348,16 @@ dependencies = [
  "tower-service",
  "tracing",
  "windows-registry",
+]
+
+[[package]]
+name = "i8259_pic"
+version = "0.1.0"
+dependencies = [
+ "ax-errno",
+ "axaddrspace",
+ "axdevice_base",
+ "log",
 ]
 
 [[package]]

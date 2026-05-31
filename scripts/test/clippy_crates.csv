@@ -92,6 +92,7 @@ fxmac_rs
 loongarch_vcpu
 nvme-driver
 pcie
+i8259_pic
 pci_host
 pm_timer
 virtio_blk_pci

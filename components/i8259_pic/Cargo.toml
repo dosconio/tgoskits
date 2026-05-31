@@ -1,0 +1,13 @@
+[package]
+name = "i8259_pic"
+version = "0.1.0"
+edition.workspace = true
+authors = ["Axvisor Team"]
+description = "Intel 8259 PIC (Programmable Interrupt Controller) emulation"
+license = "Apache-2.0"
+
+[dependencies]
+log = "0.4"
+ax-errno = { workspace = true }
+axaddrspace = { workspace = true }
+axdevice_base = { workspace = true }
