@@ -21,9 +21,11 @@ phys_cpu_sets = [1]
 # Entry point is ignored in UEFI mode; BSP starts at 0xFFFFFFF0 (reset vector)
 entry_point = 0x10000000
 image_location = "fs"
-# Kernel path is empty - OVMF will load kernel from disk (e.g., EFI partition)
-kernel_path = ""
+# Kernel path for fw_cfg direct kernel boot (Path A)
+kernel_path = "/guest/linux/linux-qemu"
 kernel_load_addr = 0x10000000
+# Kernel command line (passed via fw_cfg for direct kernel boot)
+cmdline = "console=ttyS0 earlyprintk=serial root=/dev/ram0 ro"
 
 # UEFI boot mode - uses OVMF firmware instead of axvm-bios
 boot_mode = "uefi"

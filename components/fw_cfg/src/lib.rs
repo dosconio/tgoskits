@@ -115,6 +115,14 @@ impl FwCfgDevice {
                 data: (cpu_num as u16).to_le_bytes().to_vec(),
             },
         );
+
+        items.insert(
+            FW_CFG_MAX_CPUS,
+            FwCfgItem {
+                size: 2,
+                data: (cpu_num as u16).to_le_bytes().to_vec(),
+            },
+        );
     }
 
     /// Add a file item to fw_cfg.
@@ -151,15 +159,14 @@ impl FwCfgDevice {
         let count = files.len() as u32;
 
         let mut data = Vec::with_capacity(4 + count as usize * 64);
-        data.extend_from_slice(&count.to_le_bytes());
+        data.extend_from_slice(&count.to_be_bytes());
 
         for (name, &selector) in files.iter() {
             let items = self.items.lock();
             if let Some(item) = items.get(&selector) {
-                // Each file entry: u32 size, u16 select, u16 reserved, [u8; 56] name
-                data.extend_from_slice(&(item.size as u32).to_le_bytes());
-                data.extend_from_slice(&selector.to_le_bytes());
-                data.extend_from_slice(&0u16.to_le_bytes()); // reserved
+                data.extend_from_slice(&(item.size as u32).to_be_bytes());
+                data.extend_from_slice(&selector.to_be_bytes());
+                data.extend_from_slice(&0u16.to_be_bytes()); // reserved
                 let mut name_buf = [0u8; 56];
                 let name_bytes = name.as_bytes();
                 let copy_len = name_bytes.len().min(55);

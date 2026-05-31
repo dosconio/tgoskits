@@ -969,8 +969,8 @@ impl VmxVcpu {
         }
 
         if let Some(event) = self.pending_events.front() {
-            let is_nmi = event.int_type == VmxInterruptionType::NMI;
-            let can_inject = is_nmi || self.allow_interrupt();
+            let can_inject =
+                !matches!(event.int_type, VmxInterruptionType::External) || self.allow_interrupt();
             if can_inject {
                 info!(
                     "[INTR] Injecting interrupt vector={:#x} type={:?}",
@@ -1194,16 +1194,27 @@ impl VmxVcpu {
         let is_write = info.access_flags.contains(axaddrspace::MappingFlags::WRITE);
 
         let instr_len = VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
-        if instr_len == 0 {
-            warn!(
-                "[APIC-MMIO] EPT violation with instr_len=0: GPA={:#x}, offset={:#x}, write={}",
-                gpa, apic_offset, is_write
-            );
-            return ax_err!(
-                BadState,
-                "APIC MMIO EPT violation with no instruction length"
-            );
-        }
+        let instr_len: u8 = if instr_len == 0 {
+            if let Some((bytes, actual_len)) = self.read_guest_instr_bytes(15) {
+                let decoded = Self::decode_x86_instruction_length(&bytes[..actual_len]);
+                warn!(
+                    "[APIC-MMIO] instr_len=0, decoded={}, RIP={:#x}, bytes={:02x?}",
+                    decoded,
+                    self.rip(),
+                    &bytes[..actual_len.min(6)]
+                );
+                if decoded > 0 { decoded } else { 2 }
+            } else {
+                warn!(
+                    "[APIC-MMIO] instr_len=0, failed to read guest instr, using default=2, \
+                     RIP={:#x}",
+                    self.rip()
+                );
+                2
+            }
+        } else {
+            instr_len as u8
+        };
 
         let apic_msr = 0x800 + (apic_offset >> 4);
 
@@ -1232,12 +1243,11 @@ impl VmxVcpu {
             self.regs_mut().rax = value;
         }
 
-        self.advance_rip(instr_len as _)?;
+        self.advance_rip(instr_len)?;
 
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn read_guest_instr_bytes(&self, max_len: usize) -> Option<([u8; 15], usize)> {
         let guest_rip = self.rip() as u64;
         let cr3 = VmcsGuestNW::CR3.read().ok()? as u64;
@@ -1246,28 +1256,121 @@ impl VmxVcpu {
         let gpa = self.gva_to_gpa_via_guest_pt(cr3, guest_rip)?;
         let hpa = self.gpa_to_hpa_via_ept(ept_root, gpa)?;
 
+        const PHYS_VIRT_OFFSET: u64 = 0xffff_8000_0000_0000;
         let mut bytes = [0u8; 15];
         for (i, byte) in bytes.iter_mut().enumerate().take(max_len.min(15)) {
-            let addr = hpa + i;
-            *byte = unsafe { core::ptr::read_volatile(addr as *const u8) };
+            let vaddr = (hpa + i) as u64 + PHYS_VIRT_OFFSET;
+            *byte = unsafe { core::ptr::read_volatile(vaddr as *const u8) };
         }
         Some((bytes, max_len.min(15)))
     }
 
-    #[allow(dead_code)]
+    fn decode_x86_instruction_length(bytes: &[u8]) -> u8 {
+        if bytes.is_empty() {
+            return 0;
+        }
+
+        let mut i = 0;
+
+        loop {
+            if i >= bytes.len() {
+                return i as u8;
+            }
+            match bytes[i] {
+                0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 => {
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+
+        if bytes[i] >= 0x40 && bytes[i] <= 0x4F {
+            i += 1;
+            if i >= bytes.len() {
+                return i as u8;
+            }
+        }
+
+        let opcode = bytes[i];
+        i += 1;
+
+        let has_modrm = if opcode == 0x0F {
+            if i >= bytes.len() {
+                return i as u8;
+            }
+            i += 1;
+            true
+        } else {
+            Self::x86_opcode_has_modrm(opcode)
+        };
+
+        if has_modrm && i < bytes.len() {
+            let modrm = bytes[i];
+            i += 1;
+
+            let mod_field = (modrm >> 6) & 3;
+            let rm_field = modrm & 7;
+
+            if mod_field != 3 && rm_field == 4 && i < bytes.len() {
+                i += 1;
+            }
+
+            match mod_field {
+                0 if rm_field == 5 => {
+                    i += 4;
+                }
+                1 => {
+                    i += 1;
+                }
+                2 => {
+                    i += 4;
+                }
+                _ => {}
+            }
+        }
+
+        i as u8
+    }
+
+    fn x86_opcode_has_modrm(opcode: u8) -> bool {
+        !matches!(
+            opcode,
+            0x06 | 0x07 | 0x0E |
+                0x16 | 0x17 | 0x1E | 0x1F |
+                0x27 | 0x2F | 0x37 | 0x3F |
+                0x6A |
+                0x70..=0x7F |
+                0x9A |
+                0xA0..=0xA3 |
+                0xA8..=0xA9 |
+                0xB0..=0xBF |
+                0xC2 | 0xC3 | 0xC8 | 0xCA | 0xCB | 0xCD |
+                0xD4..=0xD6 |
+                0xE0..=0xE7 |
+                0xEB |
+                0xEC..=0xEF |
+                0xF4 | 0xF5
+        )
+    }
+
     fn gva_to_gpa_via_guest_pt(&self, cr3: u64, gva: u64) -> Option<u64> {
+        let ept_root = self.ept_root?;
         let pml4_index = ((gva >> 39) & 0x1FF) as usize;
         let pdpt_index = ((gva >> 30) & 0x1FF) as usize;
         let pd_index = ((gva >> 21) & 0x1FF) as usize;
         let pt_index = ((gva >> 12) & 0x1FF) as usize;
         let offset = (gva & 0xFFF) as usize;
 
-        let pml4e = self.read_phys_u64((cr3 & 0xF_FFFF_F000) + (pml4_index * 8) as u64)?;
+        let pml4e_gpa = (cr3 & 0xF_FFFF_F000) + (pml4_index * 8) as u64;
+        let pml4e_hpa = self.gpa_to_hpa_via_ept(ept_root, pml4e_gpa)? as u64;
+        let pml4e = self.read_phys_u64(pml4e_hpa)?;
         if pml4e & 1 == 0 {
             return None;
         }
 
-        let pdpte = self.read_phys_u64((pml4e & 0xF_FFFF_F000) + (pdpt_index * 8) as u64)?;
+        let pdpte_gpa = (pml4e & 0xF_FFFF_F000) + (pdpt_index * 8) as u64;
+        let pdpte_hpa = self.gpa_to_hpa_via_ept(ept_root, pdpte_gpa)? as u64;
+        let pdpte = self.read_phys_u64(pdpte_hpa)?;
         if pdpte & 1 == 0 {
             return None;
         }
@@ -1275,7 +1378,9 @@ impl VmxVcpu {
             return Some((pdpte & 0xF_FFFF_F000) + (gva & 0x3FFF_FFFF));
         }
 
-        let pde = self.read_phys_u64((pdpte & 0xF_FFFF_F000) + (pd_index * 8) as u64)?;
+        let pde_gpa = (pdpte & 0xF_FFFF_F000) + (pd_index * 8) as u64;
+        let pde_hpa = self.gpa_to_hpa_via_ept(ept_root, pde_gpa)? as u64;
+        let pde = self.read_phys_u64(pde_hpa)?;
         if pde & 1 == 0 {
             return None;
         }
@@ -1283,7 +1388,9 @@ impl VmxVcpu {
             return Some((pde & 0xF_FFFF_F000) + (gva & 0x1F_FFFF));
         }
 
-        let pte = self.read_phys_u64((pde & 0xF_FFFF_F000) + (pt_index * 8) as u64)?;
+        let pte_gpa = (pde & 0xF_FFFF_F000) + (pt_index * 8) as u64;
+        let pte_hpa = self.gpa_to_hpa_via_ept(ept_root, pte_gpa)? as u64;
+        let pte = self.read_phys_u64(pte_hpa)?;
         if pte & 1 == 0 {
             return None;
         }
@@ -1291,7 +1398,6 @@ impl VmxVcpu {
         Some((pte & 0xF_FFFF_F000) + offset as u64)
     }
 
-    #[allow(dead_code)]
     fn gpa_to_hpa_via_ept(&self, ept_root: HostPhysAddr, gpa: u64) -> Option<usize> {
         let pml4_index = ((gpa >> 39) & 0x1FF) as usize;
         let pdpt_index = ((gpa >> 30) & 0x1FF) as usize;
@@ -1328,7 +1434,6 @@ impl VmxVcpu {
         Some(((pte & 0xF_FFFF_F000) + offset as u64) as usize)
     }
 
-    #[allow(dead_code)]
     fn read_phys_u64(&self, paddr: u64) -> Option<u64> {
         const PHYS_VIRT_OFFSET: u64 = 0xffff_8000_0000_0000;
         let vaddr = paddr + PHYS_VIRT_OFFSET;
@@ -1395,10 +1500,13 @@ impl VmxVcpu {
 
         const VM_EXIT_INSTR_LEN_CPUID: u8 = 2;
         const LEAF_FEATURE_INFO: u32 = 0x1;
+        const LEAF_CACHE_PARAMETERS: u32 = 0x4;
         const LEAF_STRUCTURED_EXTENDED_FEATURE_FLAGS_ENUMERATION: u32 = 0x7;
         const LEAF_PROCESSOR_EXTENDED_STATE_ENUMERATION: u32 = 0xd;
         const LEAF_TSC_CORE_CRYSTAL_RATIO: u32 = 0x15;
         const EAX_FREQUENCY_INFO: u32 = 0x16;
+        const LEAF_X2APIC_TOPOLOGY: u32 = 0xb;
+        const LEAF_X2APIC_TOPOLOGY_V2: u32 = 0x1f;
         const LEAF_HYPERVISOR_INFO: u32 = 0x4000_0000;
         const LEAF_HYPERVISOR_FEATURE: u32 = 0x4000_0001;
         const VENDOR_STR: &[u8; 12] = b"RVMRVMRVMRVM";
@@ -1419,6 +1527,14 @@ impl VmxVcpu {
                 res.ecx &= !FEATURE_MONITOR;
                 res.ecx |= FEATURE_HYPERVISOR;
                 res.edx &= !FEATURE_MCE;
+                res.ebx = 0x0001_0800; // BrandIndex=0, CLFLUSH=64B, MaxLogicalProc=1, APIC ID=0
+                res
+            }
+            LEAF_CACHE_PARAMETERS => {
+                let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
+                if regs_clone.rcx > 0 {
+                    res.eax = 0;
+                }
                 res
             }
             // See SDM Table 3-8. Information Returned by CPUID Instruction (Contd.)
@@ -1439,6 +1555,40 @@ impl VmxVcpu {
                 self.load_host_xstate();
 
                 res
+            }
+            LEAF_X2APIC_TOPOLOGY => {
+                if regs_clone.rcx == 0 {
+                    CpuIdResult {
+                        eax: 0,
+                        ebx: 1,
+                        ecx: 0x100,
+                        edx: 0,
+                    }
+                } else {
+                    CpuIdResult {
+                        eax: 0,
+                        ebx: 0,
+                        ecx: 0,
+                        edx: 0,
+                    }
+                }
+            }
+            LEAF_X2APIC_TOPOLOGY_V2 => {
+                if regs_clone.rcx == 0 {
+                    CpuIdResult {
+                        eax: 0,
+                        ebx: 1,
+                        ecx: 0x100,
+                        edx: 0,
+                    }
+                } else {
+                    CpuIdResult {
+                        eax: 0,
+                        ebx: 0,
+                        ecx: 0,
+                        edx: 0,
+                    }
+                }
             }
             LEAF_HYPERVISOR_INFO => CpuIdResult {
                 eax: LEAF_HYPERVISOR_FEATURE,
@@ -1484,6 +1634,11 @@ impl VmxVcpu {
             0x8000_0001 => {
                 let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
                 res.ecx &= !(1 << 2);
+                res
+            }
+            0x8000_0008 => {
+                let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
+                res.ecx = 0;
                 res
             }
             _ => cpuid!(regs_clone.rax, regs_clone.rcx),
@@ -1791,6 +1946,42 @@ impl AxArchVCpu for VmxVcpu {
                         AxVCpuExitReason::SysRegWrite {
                             addr: SysRegAddr::new(self.regs().rcx as _),
                             value,
+                        }
+                    }
+                    VmxExitReason::EXCEPTION_NMI => {
+                        let int_info = self.interrupt_exit_info()?;
+                        if !int_info.valid {
+                            warn!("VMX EXCEPTION_NMI: invalid interrupt info");
+                            return Ok(AxVCpuExitReason::Halt);
+                        }
+                        let vector = int_info.vector;
+                        let int_type = int_info.int_type;
+                        match int_type {
+                            VmxInterruptionType::NMI => {
+                                info!("VMX EXCEPTION_NMI: NMI received, injecting");
+                                self.queue_event(vector, None);
+                                AxVCpuExitReason::Nothing
+                            }
+                            VmxInterruptionType::HardException
+                            | VmxInterruptionType::SoftException
+                            | VmxInterruptionType::PrivSoftException => {
+                                info!(
+                                    "VMX EXCEPTION_NMI: inject exception vector={}, type={:?}, \
+                                     err={:?}",
+                                    vector, int_type, int_info.err_code
+                                );
+                                self.queue_event(vector, int_info.err_code);
+                                AxVCpuExitReason::Nothing
+                            }
+                            _ => {
+                                warn!(
+                                    "VMX EXCEPTION_NMI: unhandled type={:?}, vector={}, RIP={:#x}",
+                                    int_type,
+                                    vector,
+                                    self.rip()
+                                );
+                                AxVCpuExitReason::Halt
+                            }
                         }
                     }
                     _ => {

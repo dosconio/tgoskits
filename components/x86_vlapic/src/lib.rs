@@ -154,14 +154,24 @@ impl BaseDeviceOps<AddrRange<GuestPhysAddr>> for EmulatedLocalApic {
 
     fn handle_read(&self, addr: GuestPhysAddr, width: AccessWidth) -> AxResult<usize> {
         debug!("EmulatedLocalApic::handle_read: addr={addr:?}, width={width:?}");
-        let reg_off = xapic_mmio_access_reg_offset(addr);
-        self.get_vlapic_regs().handle_read(reg_off, width)
+        match xapic_mmio_access_reg_offset(addr) {
+            Some(reg_off) => self.get_vlapic_regs().handle_read(reg_off, width),
+            None => {
+                warn!("APIC MMIO read to reserved offset: {addr:#x?}");
+                Ok(0)
+            }
+        }
     }
 
     fn handle_write(&self, addr: GuestPhysAddr, width: AccessWidth, val: usize) -> AxResult {
         debug!("EmulatedLocalApic::handle_write: addr={addr:?}, width={width:?}, val={val:#x}");
-        let reg_off = xapic_mmio_access_reg_offset(addr);
-        self.get_mut_vlapic_regs().handle_write(reg_off, val, width)
+        match xapic_mmio_access_reg_offset(addr) {
+            Some(reg_off) => self.get_mut_vlapic_regs().handle_write(reg_off, val, width),
+            None => {
+                warn!("APIC MMIO write to reserved offset: {addr:#x?}, val={val:#x}");
+                Ok(())
+            }
+        }
     }
 }
 
@@ -180,13 +190,23 @@ impl BaseDeviceOps<SysRegAddrRange> for EmulatedLocalApic {
 
     fn handle_read(&self, addr: SysRegAddr, width: AccessWidth) -> AxResult<usize> {
         debug!("EmulatedLocalApic::handle_read: addr={addr:?}, width={width:?}");
-        let reg_off = x2apic_msr_access_reg(addr);
-        self.get_vlapic_regs().handle_read(reg_off, width)
+        match x2apic_msr_access_reg(addr) {
+            Some(reg_off) => self.get_vlapic_regs().handle_read(reg_off, width),
+            None => {
+                warn!("APIC MSR read to reserved offset: {addr:?}");
+                Ok(0)
+            }
+        }
     }
 
     fn handle_write(&self, addr: SysRegAddr, width: AccessWidth, val: usize) -> AxResult {
         debug!("EmulatedLocalApic::handle_write: addr={addr:?}, width={width:?}, val={val:#x}");
-        let reg_off = x2apic_msr_access_reg(addr);
-        self.get_mut_vlapic_regs().handle_write(reg_off, val, width)
+        match x2apic_msr_access_reg(addr) {
+            Some(reg_off) => self.get_mut_vlapic_regs().handle_write(reg_off, val, width),
+            None => {
+                warn!("APIC MSR write to reserved offset: {addr:?}, val={val:#x}");
+                Ok(())
+            }
+        }
     }
 }

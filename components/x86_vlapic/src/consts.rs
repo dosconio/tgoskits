@@ -132,6 +132,7 @@ pub enum ApicRegOffset {
 }
 
 impl ApicRegOffset {
+    #[allow(dead_code)]
     const fn from(value: usize) -> Self {
         match value as u32 {
             0x2 => ApicRegOffset::ID,
@@ -162,6 +163,39 @@ impl ApicRegOffset {
             0x3E => ApicRegOffset::TimerDivConf,
             0x3F => ApicRegOffset::SelfIPI,
             _ => panic!("Invalid APIC register offset"),
+        }
+    }
+
+    pub(crate) const fn try_from(value: usize) -> Option<Self> {
+        match value as u32 {
+            0x2 => Some(ApicRegOffset::ID),
+            0x3 => Some(ApicRegOffset::Version),
+            0x8 => Some(ApicRegOffset::TPR),
+            0x9 => Some(ApicRegOffset::APR),
+            0xA => Some(ApicRegOffset::PPR),
+            0xB => Some(ApicRegOffset::EOI),
+            0xC => Some(ApicRegOffset::RRR),
+            0xD => Some(ApicRegOffset::LDR),
+            0xE => Some(ApicRegOffset::DFR),
+            0xF => Some(ApicRegOffset::SIVR),
+            0x10..=0x17 => Some(ApicRegOffset::ISR(ISRIndex::from(value - 0x10))),
+            0x18..=0x1F => Some(ApicRegOffset::TMR(TMRIndex::from(value - 0x18))),
+            0x20..=0x27 => Some(ApicRegOffset::IRR(IRRIndex::from(value - 0x20))),
+            0x28 => Some(ApicRegOffset::ESR),
+            0x2F => Some(ApicRegOffset::LvtCMCI),
+            0x30 => Some(ApicRegOffset::ICRLow),
+            0x31 => Some(ApicRegOffset::ICRHi),
+            0x32 => Some(ApicRegOffset::LvtTimer),
+            0x33 => Some(ApicRegOffset::LvtThermal),
+            0x34 => Some(ApicRegOffset::LvtPmc),
+            0x35 => Some(ApicRegOffset::LvtLint0),
+            0x36 => Some(ApicRegOffset::LvtLint1),
+            0x37 => Some(ApicRegOffset::LvtErr),
+            0x38 => Some(ApicRegOffset::TimerInitCount),
+            0x39 => Some(ApicRegOffset::TimerCurCount),
+            0x3E => Some(ApicRegOffset::TimerDivConf),
+            0x3F => Some(ApicRegOffset::SelfIPI),
+            _ => None,
         }
     }
 }
@@ -227,8 +261,8 @@ pub mod xapic {
 
     pub const XAPIC_BROADCAST_DEST_ID: u32 = 0xFF;
 
-    pub(crate) const fn xapic_mmio_access_reg_offset(addr: GuestPhysAddr) -> ApicRegOffset {
-        ApicRegOffset::from((addr.as_usize() & (APIC_MMIO_SIZE - 1)) >> 4)
+    pub(crate) const fn xapic_mmio_access_reg_offset(addr: GuestPhysAddr) -> Option<ApicRegOffset> {
+        ApicRegOffset::try_from((addr.as_usize() & (APIC_MMIO_SIZE - 1)) >> 4)
     }
 }
 
@@ -244,7 +278,7 @@ pub mod x2apic {
     /// in both logical destination and physical destination modes.
     pub const X2APIC_BROADCAST_DEST_ID: u32 = 0xFFFF_FFFF;
 
-    pub(crate) const fn x2apic_msr_access_reg(addr: SysRegAddr) -> ApicRegOffset {
-        ApicRegOffset::from(addr.addr() - X2APIC_MSE_REG_BASE)
+    pub(crate) const fn x2apic_msr_access_reg(addr: SysRegAddr) -> Option<ApicRegOffset> {
+        ApicRegOffset::try_from(addr.addr() - X2APIC_MSE_REG_BASE)
     }
 }

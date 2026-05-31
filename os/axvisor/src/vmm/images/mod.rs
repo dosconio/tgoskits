@@ -28,6 +28,9 @@ use crate::vmm::config::{config, get_vm_dtb_arc};
 use alloc::sync::Arc;
 
 #[cfg(target_arch = "x86_64")]
+use alloc::vec::Vec;
+
+#[cfg(target_arch = "x86_64")]
 mod guest_serial {
     use ax_errno::AxResult;
     use axaddrspace::device::{AccessWidth, Port, PortRange};
@@ -412,33 +415,9 @@ impl ImageLoader {
             );
         }
 
-        // Load kernel image (optional in UEFI mode — OVMF can load from disk)
-        if !self.config.kernel.kernel_path.is_empty() {
-            match self.config.kernel.image_location.as_deref() {
-                Some("memory") => {
-                    let vm_imags = config::get_memory_images()
-                        .iter()
-                        .find(|&v| v.id == self.config.base.id)
-                        .expect("VM images is missed");
-                    if !vm_imags.kernel.is_empty() {
-                        load_vm_image_from_memory(
-                            vm_imags.kernel,
-                            self.kernel_load_gpa,
-                            self.vm.clone(),
-                        )?;
-                    }
-                }
-                #[cfg(feature = "fs")]
-                Some("fs") => {
-                    let _ = fs::load_vm_image(
-                        &self.config.kernel.kernel_path,
-                        self.kernel_load_gpa,
-                        self.vm.clone(),
-                    )?;
-                }
-                _ => {}
-            }
-        }
+        // In UEFI mode, kernel is passed to OVMF via fw_cfg (Path A).
+        // OVMF's QemuLoadKernelImage driver loads it from fw_cfg at the right GPA.
+        // Skip loading kernel here to avoid conflicting with limited guest memory region.
 
         // Load ramdisk if provided
         if let Some(ramdisk_path) = &self.config.kernel.ramdisk_path {
@@ -549,7 +528,76 @@ impl ImageLoader {
         // Register kernel command line if provided
         if let Some(cmdline) = &self.config.kernel.cmdline {
             fw_cfg.add_file("etc/boot-cmdline", cmdline.as_bytes());
+            fw_cfg.add_file("opt/org.qemu/cmdline", cmdline.as_bytes());
         }
+
+        // Register kernel image as fw_cfg file for direct kernel boot (Path A)
+        #[cfg(feature = "fs")]
+        {
+            let kernel_path = &self.config.kernel.kernel_path;
+            if !kernel_path.is_empty() && fs::file_exists(kernel_path) {
+                match fs::read_file_bytes(kernel_path) {
+                    Ok(kernel_data) => {
+                        info!(
+                            "[fw_cfg] Registering kernel file: {} ({} bytes)",
+                            kernel_path,
+                            kernel_data.len()
+                        );
+                        fw_cfg.add_file("opt/org.qemu/kernel", &kernel_data);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[fw_cfg] Failed to read kernel file {}: {:?}, \
+                             skipping direct kernel boot",
+                            kernel_path, e
+                        );
+                    }
+                }
+            } else if !kernel_path.is_empty() {
+                warn!(
+                    "[fw_cfg] Kernel file not found: {}, skipping direct kernel boot",
+                    kernel_path
+                );
+            }
+        }
+
+        // Register initrd (ramdisk) as fw_cfg file for direct kernel boot (Path A)
+        #[cfg(feature = "fs")]
+        if let Some(ramdisk_path) = &self.config.kernel.ramdisk_path {
+            if !ramdisk_path.is_empty() && fs::file_exists(ramdisk_path) {
+                match fs::read_file_bytes(ramdisk_path) {
+                    Ok(initrd_data) => {
+                        info!(
+                            "[fw_cfg] Registering initrd file: {} ({} bytes)",
+                            ramdisk_path,
+                            initrd_data.len()
+                        );
+                        fw_cfg.add_file("opt/org.qemu/initrd", &initrd_data);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[fw_cfg] Failed to read initrd file {}: {:?}, \
+                             skipping initrd registration",
+                            ramdisk_path, e
+                        );
+                    }
+                }
+            } else if !ramdisk_path.is_empty() {
+                warn!(
+                    "[fw_cfg] Initrd file not found: {}, skipping initrd registration",
+                    ramdisk_path
+                );
+            }
+        }
+
+        // Build E820 memory map
+        let e820 = build_e820_table(ram_size);
+
+        // Register E820 table as fw_cfg file
+        fw_cfg.add_file("etc/e820", &e820);
+
+        // Set bootorder to prefer fw_cfg direct kernel boot (0x04 = fw_cfg)
+        fw_cfg.add_file("etc/bootorder", &[0x04u8]);
 
         // Register fw_cfg as a port I/O device
         self.vm.get_devices().lock().add_port_dev(Arc::new(fw_cfg));
@@ -634,6 +682,37 @@ impl ImageLoader {
         let _ = fs::load_vm_image(ramdisk_path, load_gpa, self.vm.clone())?;
         Ok(())
     }
+}
+
+/// Build an E820 memory map table for the guest.
+///
+/// The E820 table describes which physical address ranges are usable RAM (type 1)
+/// and which are reserved (type 2). OVMF reads this via fw_cfg "etc/e820" to
+/// determine the guest memory layout and avoid accessing unmapped regions.
+///
+/// Each entry is 20 bytes: addr (u64 LE), size (u64 LE), type (u32 LE).
+#[cfg(target_arch = "x86_64")]
+fn build_e820_table(ram_size: usize) -> Vec<u8> {
+    const E820_RAM: u32 = 1;
+    const E820_RESERVED: u32 = 2;
+    const FOUR_GB: u64 = 0x1_0000_0000;
+
+    let ram_size = ram_size as u64;
+    let mut data = Vec::new();
+
+    // Entry 0: RAM [0, ram_size)
+    data.extend_from_slice(&0u64.to_le_bytes());
+    data.extend_from_slice(&ram_size.to_le_bytes());
+    data.extend_from_slice(&E820_RAM.to_le_bytes());
+
+    // Entry 1: Reserved [ram_size, 4GB)
+    if ram_size < FOUR_GB {
+        data.extend_from_slice(&ram_size.to_le_bytes());
+        data.extend_from_slice(&(FOUR_GB - ram_size).to_le_bytes());
+        data.extend_from_slice(&E820_RESERVED.to_le_bytes());
+    }
+
+    data
 }
 
 pub fn load_vm_image_from_memory(
@@ -887,6 +966,21 @@ pub mod fs {
             })?
             .size() as usize;
         Ok((file, file_size))
+    }
+
+    pub fn read_file_bytes(path: &str) -> AxResult<alloc::vec::Vec<u8>> {
+        use std::io::Read;
+        let mut file = File::open(path).map_err(|err| {
+            ax_err_type!(NotFound, format!("Failed to open {}, err {:?}", path, err))
+        })?;
+        let mut buffer = alloc::vec::Vec::new();
+        file.read_to_end(&mut buffer)
+            .map_err(|err| ax_err_type!(Io, format!("Failed to read {}, err {:?}", path, err)))?;
+        Ok(buffer)
+    }
+
+    pub fn file_exists(path: &str) -> bool {
+        std::fs::metadata(path).is_ok()
     }
 }
 

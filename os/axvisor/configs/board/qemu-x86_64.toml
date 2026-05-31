@@ -5,4 +5,4 @@ features = [
 ]
 log = "Info"
 target = "x86_64-unknown-none"
-vm_configs = []
+vm_configs = ["os/axvisor/configs/vms/uefi-x86_64-qemu.toml"]
