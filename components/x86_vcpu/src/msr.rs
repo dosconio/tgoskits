@@ -44,6 +44,7 @@ pub enum Msr {
     IA32_VMX_TRUE_PROCBASED_CTLS = 0x48e,
     IA32_VMX_TRUE_EXIT_CTLS = 0x48f,
     IA32_VMX_TRUE_ENTRY_CTLS = 0x490,
+    IA32_VMX_TRUE_PROCBASED_CTLS2 = 0x491,
 
     IA32_XSS             = 0xda0,
 

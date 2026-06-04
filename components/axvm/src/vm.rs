@@ -372,6 +372,7 @@ impl AxVM {
                 let ram_size = inner_mut
                     .memory_regions
                     .iter()
+                    .filter(|r| r.gpa.as_usize() < 0xFF00_0000)
                     .map(|r| r.size())
                     .sum::<usize>();
                 crate::vcpu::AxVCpuSetupConfig {

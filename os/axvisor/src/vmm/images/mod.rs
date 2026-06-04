@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use ax_errno::AxResult;
-use axaddrspace::{GuestPhysAddr, HostVirtAddr};
+use axaddrspace::{GuestPhysAddr, HostPhysAddr, HostVirtAddr, MappingFlags};
 
 use axvm::VMMemoryRegion;
 use axvm::config::AxVMCrateConfig;
@@ -29,6 +29,40 @@ use alloc::sync::Arc;
 
 #[cfg(target_arch = "x86_64")]
 use alloc::vec::Vec;
+
+/// Guest memory accessor that wraps an `AxVMRef` to provide GPA→HVA
+/// translation for device emulation. This implements the
+/// `virtio_blk_pci::GuestMemoryAccessor` trait so that the virtio-blk
+/// device can read/write guest physical memory for VirtQueue processing.
+///
+/// Uses `read_from_guest_of::<u8>` / `write_to_guest_of::<u8>` which
+/// handle translation errors gracefully (no panic) and have no alignment
+/// requirements, making them safe for arbitrary VirtQueue addresses.
+#[cfg(target_arch = "x86_64")]
+struct VmGuestMemoryAccessor {
+    vm: VMRef,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl virtio_blk_pci::GuestMemoryAccessor for VmGuestMemoryAccessor {
+    fn read_guest_memory(&self, gpa: u64, buf: &mut [u8]) -> AxResult {
+        use axaddrspace::GuestPhysAddr;
+        for (i, byte) in buf.iter_mut().enumerate() {
+            let gpa = GuestPhysAddr::from(gpa as usize + i);
+            *byte = self.vm.read_from_guest_of::<u8>(gpa)?;
+        }
+        Ok(())
+    }
+
+    fn write_guest_memory(&self, gpa: u64, buf: &[u8]) -> AxResult {
+        use axaddrspace::GuestPhysAddr;
+        for (i, byte) in buf.iter().enumerate() {
+            let gpa = GuestPhysAddr::from(gpa as usize + i);
+            self.vm.write_to_guest_of(gpa, byte)?;
+        }
+        Ok(())
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
 mod guest_serial {
@@ -451,13 +485,13 @@ impl ImageLoader {
         use acpi_tables::{AcpiConfig, AcpiTableBuilder};
         use fw_cfg::FwCfgDevice;
 
-        // Calculate RAM size from memory_regions
+        // Calculate RAM size from memory_regions (exclude pflash regions)
         let ram_size: usize = self
             .config
             .kernel
             .memory_regions
             .iter()
-            .filter(|r| r.gpa == 0) // Only count RAM regions starting at 0
+            .filter(|r| r.gpa < 0xFF00_0000)
             .map(|r| r.size)
             .sum();
         let cpu_num = self.config.base.cpu_num;
@@ -466,6 +500,34 @@ impl ImageLoader {
             "Setting up fw_cfg and ACPI tables: ram_size={:#x}, cpu_num={}",
             ram_size, cpu_num
         );
+
+        // Map pflash0 alias for legacy BIOS area 0xF0000-0xFFFFF
+        // OVMF needs this area aliased to pflash0 content for legacy x86 boot
+        // compatibility (SEC phase in real mode reads this region)
+        let pflash0_gpa = 0xFFC0_0000usize;
+        let legacy_alias_gpa = 0xF0000usize;
+        let alias_size = 0x10000usize;
+        for region in self.vm.memory_regions() {
+            if region.gpa.as_usize() == pflash0_gpa {
+                let pflash_hpa = region.host_paddr();
+                let alias_offset = 0xFFFF_0000 - pflash0_gpa;
+                let alias_hpa = HostPhysAddr::from(pflash_hpa.as_usize() + alias_offset);
+                self.vm.map_region(
+                    GuestPhysAddr::from(legacy_alias_gpa),
+                    alias_hpa,
+                    alias_size,
+                    MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
+                )?;
+                info!(
+                    "Mapped pflash0 alias: GPA {:#x} -> HPA {:#x} (size {:#x}, offset {:#x})",
+                    legacy_alias_gpa,
+                    alias_hpa.as_usize(),
+                    alias_size,
+                    alias_offset
+                );
+                break;
+            }
+        }
 
         // Generate ACPI tables
         let acpi_config = AcpiConfig {
@@ -479,13 +541,14 @@ impl ImageLoader {
             ecam_segment: 0,
             ecam_bus_start: 0,
             ecam_bus_end: 0xFF,
-            rsdp_gpa: 0x000F_0000,
+            rsdp_gpa: 0x01F_0000,
         };
         let acpi_tables = AcpiTableBuilder::new(acpi_config).build();
 
         // Write ACPI tables into guest memory
-        // RSDP at 0xF0000
-        let rsdp_gpa = GuestPhysAddr::from(0xF0000usize);
+        // RSDP at 0x1F0000 (avoid conflicting with legacy BIOS area 0xF0000-0xFFFFF)
+        // OVMF needs this area aliased to pflash for compatibility with legacy x86 boot
+        let rsdp_gpa = GuestPhysAddr::from(0x1F0000usize);
         let mut rsdp_regions = self
             .vm
             .get_image_load_region(rsdp_gpa, acpi_tables.rsdp.len())?;
@@ -502,7 +565,7 @@ impl ImageLoader {
         );
 
         // Other tables follow RSDP
-        let tables_gpa = GuestPhysAddr::from(0xF0000usize + acpi_tables.rsdp.len());
+        let tables_gpa = GuestPhysAddr::from(0x1F0000usize + acpi_tables.rsdp.len());
         let mut table_regions = self
             .vm
             .get_image_load_region(tables_gpa, acpi_tables.tables.len())?;
@@ -609,8 +672,16 @@ impl ImageLoader {
 
         // Create virtio-blk-pci device (Bus 0, Device 1, Function 0)
         use virtio_blk_pci::VirtioBlkPci;
-        let blk_disk_size = 64 * 1024 * 1024; // 64 MiB disk
-        let virtio_blk = Arc::new(VirtioBlkPci::new(blk_disk_size, (0, 1, 0)));
+        let blk_disk_size = 64 * 1024 * 1024; // 64 MiB disk (sparse allocation)
+        let mut virtio_blk_device = VirtioBlkPci::new(blk_disk_size, (0, 1, 0));
+
+        // Set up guest memory accessor so the device can read/write guest memory
+        // for VirtQueue descriptor/avail/used ring processing
+        let gma = Arc::new(VmGuestMemoryAccessor {
+            vm: self.vm.clone(),
+        });
+        virtio_blk_device.set_mem_accessor(gma);
+        let virtio_blk = Arc::new(virtio_blk_device);
         info!(
             "Created virtio-blk-pci device: BDF=(0,1,0), disk_size={:#x}",
             blk_disk_size

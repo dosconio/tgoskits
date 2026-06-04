@@ -49,6 +49,17 @@ use crate::{
     utils::fls32,
 };
 
+/// Pending INIT/SIPI request from ICR write.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingInitSipi {
+    /// Target vCPU ID.
+    pub target_cpu: u32,
+    /// Delivery mode: INIT or StartUp.
+    pub mode: APICDeliveryMode,
+    /// SIPI vector (bits 7:0 of ICR low).
+    pub vector: u32,
+}
+
 /// Virtual-APIC Registers.
 pub struct VirtualApicRegs {
     /// The virtual-APIC page is a 4-KByte region of memory
@@ -76,6 +87,9 @@ pub struct VirtualApicRegs {
     /// to maintain a coherent snapshot of the register (e.g. lvt_last)
     lvt_last: LocalVectorTable,
     apic_page: PhysFrame,
+
+    /// Pending INIT/SIPI request from the most recent ICR write.
+    pending_init_sipi: Option<PendingInitSipi>,
 }
 
 impl VirtualApicRegs {
@@ -84,6 +98,8 @@ impl VirtualApicRegs {
         let apic_frame = PhysFrame::alloc_zero().expect("allocate virtual-APIC page failed");
 
         unsafe {
+            let id_ptr = apic_frame.as_mut_ptr().cast::<u8>().add(0x20) as *mut u32;
+            *id_ptr = vcpu_id as u32;
             let version_ptr = apic_frame.as_mut_ptr().cast::<u8>().add(0x30) as *mut u32;
             *version_ptr = 0x0105_0014;
         }
@@ -99,6 +115,7 @@ impl VirtualApicRegs {
             isrv: 0,
             apic_base: ApicBaseRegisterMsr::new(0),
             virtual_timer: ApicTimer::new(vm_id, vcpu_id),
+            pending_init_sipi: None,
         }
     }
 
@@ -442,12 +459,21 @@ impl VirtualApicRegs {
         mode: APICDeliveryMode,
         icr_low: InterruptCommandRegisterLowLocal,
     ) {
-        unimplemented!(
-            "process_init_sipi, vcpu_id: {}, mode: {:?} icr_low: {:#010X}",
-            vcpu_id,
-            mode,
-            icr_low.get()
+        let vector = icr_low.read(INTERRUPT_COMMAND_LOW::Vector);
+        info!(
+            "[VLAPIC] process_init_sipi: vcpu_id={}, mode={:?}, vector={:#x}",
+            vcpu_id, mode, vector
         );
+        self.pending_init_sipi = Some(PendingInitSipi {
+            target_cpu: vcpu_id,
+            mode,
+            vector,
+        });
+    }
+
+    /// Take the pending INIT/SIPI request, if any.
+    pub fn take_pending_init_sipi(&mut self) -> Option<PendingInitSipi> {
+        self.pending_init_sipi.take()
     }
 
     /// Figure 11-13. Logical Destination Register (LDR)

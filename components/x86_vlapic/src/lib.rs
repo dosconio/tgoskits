@@ -40,6 +40,7 @@ use axvisor_api::{
     memory,
     vmm::{VCpuId, VMId},
 };
+pub use vlapic::PendingInitSipi;
 
 use crate::{
     consts::{x2apic::x2apic_msr_access_reg, xapic::xapic_mmio_access_reg_offset},
@@ -136,6 +137,11 @@ impl EmulatedLocalApic {
 
     pub fn has_pending_interrupt(&self) -> bool {
         self.get_vlapic_regs().has_pending_interrupt()
+    }
+
+    /// Take the pending INIT/SIPI request, if any. Consumes the request.
+    pub fn take_pending_init_sipi(&self) -> Option<crate::vlapic::PendingInitSipi> {
+        self.get_mut_vlapic_regs().take_pending_init_sipi()
     }
 }
 

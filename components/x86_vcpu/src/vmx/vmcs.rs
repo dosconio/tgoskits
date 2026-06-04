@@ -677,7 +677,9 @@ pub fn set_control(
     let allowed0 = cap as u32;
     let allowed1 = (cap >> 32) as u32;
     assert_eq!(allowed0 & allowed1, allowed0);
-    debug!("set {control:?}: {old_value:#x} (+{set:#x}, -{clear:#x})");
+    info!(
+        "set {control:?}: {old_value:#x} (+{set:#x}, -{clear:#x}) MSR=0x{cap:016x}"
+    );
     if (set & clear) != 0 {
         return ax_err!(
             InvalidInput,
@@ -685,33 +687,42 @@ pub fn set_control(
         );
     }
     if (allowed1 & set) != set {
-        // failed if set 0-bits in allowed1
         return ax_err!(
             Unsupported,
             format_args!("can not set bits {:#x} in {:?}", set, control)
         );
     }
-    if (allowed0 & clear) != 0 {
-        // failed if clear 1-bits in allowed0
+    if (clear & !allowed0) != 0 {
         return ax_err!(
             Unsupported,
             format_args!("can not clear bits {:#x} in {:?}", clear, control)
         );
     }
-    // SDM Vol. 3C, Section 31.5.1, Algorithm 3
-    let flexible = !allowed0 & allowed1; // therse bits can be either 0 or 1
-    let unknown = flexible & !(set | clear); // hypervisor untouched bits
-    let default = unknown & old_value; // these bits keep unchanged in old value
-    let fixed1 = allowed0; // these bits are fixed to 1
-    control.write(fixed1 | default | set)?;
+    let mandatory1 = !allowed0 & allowed1;
+    // Preserve bits from old_value that are not being explicitly set or cleared.
+    // mandatory1 bits are always forced to 1, so they don't need preservation.
+    let preserve_mask = !(set | clear | mandatory1);
+    let default = preserve_mask & old_value;
+    let final_val = mandatory1 | default | set;
+    info!(
+        "[set_control] {:?}: allowed0={:#x} allowed1={:#x} mandatory1={:#x} old={:#x} set={:#x} \
+         clear={:#x} final={:#x}",
+        control, allowed0, allowed1, mandatory1, old_value, set, clear, final_val
+    );
+    control.write(final_val)?;
     Ok(())
 }
 
 pub fn set_ept_pointer(pml4_paddr: HostPhysAddr) -> AxResult {
     use super::instructions::{InvEptType, invept};
-    let eptp = super::structs::EPTPointer::from_table_phys(pml4_paddr).bits();
-    VmcsControl64::EPTP.write(eptp)?;
-    unsafe { invept(InvEptType::SingleContext, eptp).map_err(as_axerr)? };
+    let mut eptp = super::structs::EPTPointer::from_table_phys(pml4_paddr);
+    let ept_vpid_cap = Msr::IA32_VMX_EPT_VPID_CAP.read();
+    if ept_vpid_cap & (1 << 21) == 0 {
+        eptp.remove(super::structs::EPTPointer::ENABLE_ACCESSED_DIRTY);
+        info!("[EPT] EPT A/D flags not supported by hardware, disabling ENABLE_ACCESSED_DIRTY");
+    }
+    VmcsControl64::EPTP.write(eptp.bits())?;
+    unsafe { invept(InvEptType::SingleContext, eptp.bits()).map_err(as_axerr)? };
     Ok(())
 }
 

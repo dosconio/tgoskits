@@ -5,7 +5,7 @@ args = [
   "-machine",
   "q35",
   "-smp",
-  "1",
+  "2",
   "-enable-kvm",
   "-device",
   "virtio-blk-pci,drive=disk0",

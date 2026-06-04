@@ -14,8 +14,8 @@
 id = 1
 name = "uefi-vm"
 vm_type = 1
-cpu_num = 1
-phys_cpu_sets = [1]
+cpu_num = 2
+phys_cpu_sets = [1, 2]
 
 [kernel]
 # Entry point is ignored in UEFI mode; BSP starts at 0xFFFFFFF0 (reset vector)
@@ -33,24 +33,25 @@ boot_mode = "uefi"
 # Memory regions with format (`base_paddr`, `size`, `flags`, `map_type`).
 # For `map_type`, 0 means `MAP_ALLOC`, 1 means `MAP_IDENTICAL`, 2 means `MAP_RESERVED`.
 # Memory layout:
-# 0x0000_0000 - 0x01FF_FFFF: Low RAM (32 MiB) for OVMF (needs at least 24 MiB)
-# 0x000F_0000 - 0x000F_FFFF: ACPI table area (RSDP + tables)
-# 0xFFE0_0000 - 0xFFFF_FFFF: pflash0 (OVMF_CODE) - 2 MiB (includes reset vector at 0xFFFFFFF0)
-# 0xFFC0_0000 - 0xFFDF_FFFF: pflash1 (OVMF_VARS) - 2 MiB
+# 0x0000_0000 - 0x00F_FFFF: Low RAM (960 KiB) for OVMF SEC phase
+# 0x000F_0000 - 0x00F_FFFF: Hole for pflash alias (legacy BIOS area)
+# 0x0010_0000 - 0x01F_FFFF: ACPI table area (RSDP + tables) - within RAM
+# 0x0010_0000 - 0x1FF_FFFF: RAM continuation (31 MiB)
+# 0xFF80_0000 - 0xFFB_FFFF: pflash1 (OVMF_VARS) - 4 MiB
+# 0xFFC0_0000 - 0xFFF_FFFF: pflash0 (OVMF_CODE) - 4 MiB (includes reset vector at 0xFFFFFFF0)
 memory_regions = [
-  [0x0000_0000, 0x200_0000, 0x7, 0],   # Low RAM 32 MiB R|W|X (includes ACPI area at 0xF0000)
-  [0xFFE0_0000, 0x20_0000, 0x5, 0],    # pflash0 (OVMF_CODE) 2 MiB R|X (reset vector at 0xFFFFFFF0)
-  [0xFFC0_0000, 0x20_0000, 0x3, 0],    # pflash1 (OVMF_VARS) 2 MiB R|W
+  [0x0000_0000, 0xF_0000, 0x7, 0],     # Low RAM 0-0xEFFFF (960 KiB) R|W|X
+  [0x0010_0000, 0x1F0_0000, 0x7, 0],   # RAM 0x100000-0x1FFFFFF (31 MiB) R|W|X
+  [0xFF80_0000, 0x40_0000, 0x3, 0],    # pflash1 (OVMF_VARS) 4 MiB R|W
+  [0xFFC0_0000, 0x40_0000, 0x5, 0],    # pflash0 (OVMF_CODE) 4 MiB R|X (reset vector at 0xFFFFFFF0)
 ]
 
-# OVMF_CODE (pflash0) - Read-only firmware code
-# Must be mapped at 0xFFE00000 so that the reset vector at 0xFFFFFFF0 falls within
-# this region: 0xFFE00000 + 0x1FFFF0 = 0xFFFFFFF0 (last 16 bytes of 2 MiB flash).
-# OVMF images are typically 2 MiB (OVMF_CODE.fd) or 4 MiB (OVMF_CODE_4M.fd)
-pflash0 = { path = "/guest/ovmf/OVMF_CODE.fd", base_gpa = 0xFFE00000, size = 0x200000, read_only = true }
+# OVMF_CODE (pflash0) - Read-only firmware code (4 MiB variant)
+# Must end at 0xFFFFFFFF: 0xFFC00000 + 0x3FFFF0 = 0xFFFFFFF0 (reset vector)
+pflash0 = { path = "/guest/ovmf/OVMF_CODE.fd", base_gpa = 0xFFC00000, size = 0x400000, read_only = true }
 
-# OVMF_VARS (pflash1) - Read-write UEFI variable store
-pflash1 = { path = "/guest/ovmf/OVMF_VARS.fd", base_gpa = 0xFFC00000, size = 0x200000, read_only = false }
+# OVMF_VARS (pflash1) - Read-write UEFI variable store (4 MiB variant)
+pflash1 = { path = "/guest/ovmf/OVMF_VARS.fd", base_gpa = 0xFF800000, size = 0x400000, read_only = false }
 
 #
 # Device specifications

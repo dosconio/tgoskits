@@ -26,7 +26,10 @@ use axaddrspace::{
 };
 use axdevice_base::BaseDeviceOps;
 use axvcpu::{AxArchVCpu, AxVCpuExitReason};
-use axvisor_api::vmm::{VCpuId, VMId};
+use axvisor_api::{
+    memory::PhysFrame,
+    vmm::{VCpuId, VMId},
+};
 use bit_field::BitField;
 use raw_cpuid::CpuId;
 use x86::{
@@ -44,9 +47,9 @@ use super::{
     definitions::{VmxExitReason, VmxInterruptionType},
     structs::{IOBitmap, MsrBitmap, VmxRegion},
     vmcs::{
-        self, ApicAccessExitType, VmcsControl32, VmcsControl64, VmcsControlNW, VmcsGuest16,
-        VmcsGuest32, VmcsGuest64, VmcsGuestNW, VmcsHost16, VmcsHost32, VmcsHost64, VmcsHostNW,
-        VmcsReadOnly32,
+        self, ApicAccessExitType, VmcsControl16, VmcsControl32, VmcsControl64, VmcsControlNW,
+        VmcsGuest16, VmcsGuest32, VmcsGuest64, VmcsGuestNW, VmcsHost16, VmcsHost32, VmcsHost64,
+        VmcsHostNW, VmcsReadOnly32, VmcsReadOnlyNW,
     },
 };
 
@@ -111,10 +114,26 @@ pub struct VmxVcpu {
     // VMCS-related fields
     /// The VMCS region.
     vmcs: VmxRegion,
+    /// The shadow VMCS region for VMCS shadowing (required when VMCS_SHADOWING is mandatory1).
+    shadow_vmcs: VmxRegion,
     /// The I/O bitmap for the VMCS.
     io_bitmap: IOBitmap,
     /// The MSR bitmap for the VMCS.
     msr_bitmap: MsrBitmap,
+    /// The VMREAD bitmap for VMCS shadowing.
+    vmread_bitmap: PhysFrame,
+    /// The VMWRITE bitmap for VMCS shadowing.
+    vmwrite_bitmap: PhysFrame,
+    /// The PML page for Page Modification Logging.
+    pml_page: PhysFrame,
+    /// The EPTP-list page for EPTP switching (required when ENABLE_VM_FUNCTIONS is mandatory1).
+    eptp_list_page: PhysFrame,
+    /// The XSS-exiting bitmap.
+    xss_bitmap: PhysFrame,
+    /// The APIC-access page for APIC virtualization.
+    apic_access_page: PhysFrame,
+    /// The posted-interrupt descriptor (required when PIN_CTRL bit6 is forced by MSR).
+    posted_interrupt_desc: PhysFrame,
 
     // Interrupt-related fields
     /// Pending events to be injected to the guest.
@@ -148,8 +167,16 @@ impl VmxVcpu {
             ept_root: None,
             // is_host: false,
             vmcs: VmxRegion::new(vmcs_revision_id, false)?,
+            shadow_vmcs: VmxRegion::new(vmcs_revision_id, true)?,
             io_bitmap: IOBitmap::intercept_all()?,
             msr_bitmap: MsrBitmap::passthrough_all()?,
+            vmread_bitmap: PhysFrame::alloc_zero()?,
+            vmwrite_bitmap: PhysFrame::alloc_zero()?,
+            pml_page: PhysFrame::alloc_zero()?,
+            eptp_list_page: PhysFrame::alloc_zero()?,
+            xss_bitmap: PhysFrame::alloc_zero()?,
+            apic_access_page: PhysFrame::alloc_zero()?,
+            posted_interrupt_desc: PhysFrame::alloc_zero()?,
             pending_events: VecDeque::with_capacity(8),
             vlapic: EmulatedLocalApic::new(vm_id, vcpu_id),
             xstate: XState::new(),
@@ -251,6 +278,11 @@ impl VmxVcpu {
                 VmcsHostNW::RSP
                     .write(&self.host_stack_top as *const _ as usize)
                     .unwrap();
+
+                let rip_val = self.entry.unwrap().as_usize();
+                VmcsGuestNW::RIP.write(rip_val).unwrap();
+
+                self.dump_vmcs_state();
 
                 self.vmx_launch();
             }
@@ -556,6 +588,16 @@ impl VmxVcpu {
         self.setup_msr_bitmap()?;
         self.setup_vmcs_guest(entry, boot_mode)?;
         self.setup_vmcs_control(ept_root, true)?;
+        self.fixup_ia32e_guest_cr_and_efer()?;
+        // Update CR0/CR4 read shadows to match the fixed guest state after IA32E fixup.
+        // If PE/PG are masked in CR0_GUEST_HOST_MASK, the shadow must match guest CR0.
+        VmcsControlNW::CR0_READ_SHADOW.write(VmcsGuestNW::CR0.read()?)?;
+        VmcsControlNW::CR4_READ_SHADOW.write(VmcsGuestNW::CR4.read()?)?;
+        info!(
+            "[VMX setup] Post-fixup shadows: CR0_SHADOW={:#x} CR4_SHADOW={:#x}",
+            VmcsControlNW::CR0_READ_SHADOW.read().unwrap_or(0),
+            VmcsControlNW::CR4_READ_SHADOW.read().unwrap_or(0),
+        );
         self.unbind_from_current_processor()?;
         Ok(())
     }
@@ -563,6 +605,7 @@ impl VmxVcpu {
     fn setup_vmcs_host(&self) -> AxResult {
         VmcsHost64::IA32_PAT.write(Msr::IA32_PAT.read())?;
         VmcsHost64::IA32_EFER.write(Msr::IA32_EFER.read())?;
+        VmcsHost64::IA32_PERF_GLOBAL_CTRL.write(0)?;
 
         VmcsHostNW::CR0.write(Cr0::read_raw() as _)?;
         VmcsHostNW::CR3.write(Cr3::read_raw().0.start_address().as_u64() as _)?;
@@ -626,18 +669,18 @@ impl VmxVcpu {
         set_guest_segment!(DS, 0x93);
         set_guest_segment!(FS, 0x93);
         set_guest_segment!(GS, 0x93);
-        set_guest_segment!(TR, 0x8b); // present, system, 32-bit TSS busy
-        set_guest_segment!(LDTR, 0x82); // present, system, LDT
+        set_guest_segment!(TR, 0x1008b); // unusable
+        set_guest_segment!(LDTR, 0x10082); // unusable
 
-        // In UEFI mode, the reset vector is at 0xFFFFFFF0 which is near the top
-        // of the 4GB address space. CS base must be set to 0xFFFF0000 so that
-        // the linear address (CS_base + IP) = 0xFFFF0000 + 0xFFF0 = 0xFFFFFFF0.
-        // This matches the x86 hardware reset state: CS=0xF000, IP=0xFFF0.
+        // In UEFI mode, the OVMF firmware starts from the reset vector (0xFFFFFFF0).
+        // The guest starts in real mode with CS=F000:FFF0 pointing to the reset vector.
+        // OVMF will handle the mode transitions (real→protected→long) itself.
         info!("[VMX setup] boot_mode={:?}, setting CS for UEFI", boot_mode);
         if boot_mode == X86BootMode::Uefi {
             VmcsGuestNW::CS_BASE.write(0xFFFF0000)?;
             VmcsGuest16::CS_SELECTOR.write(0xF000)?;
-            info!("[VMX setup] Set CS_SELECTOR=0xF000, CS_BASE=0xFFFF0000");
+            VmcsGuest32::CS_ACCESS_RIGHTS.write(0x9b)?;
+            info!("[VMX setup] Set CS_SELECTOR=0xF000, CS_BASE=0xFFFF0000, CS_AR=0x9b");
         }
 
         VmcsGuestNW::GDTR_BASE.write(0)?;
@@ -648,11 +691,36 @@ impl VmxVcpu {
         VmcsGuestNW::CR3.write(0)?;
         VmcsGuestNW::DR7.write(0x400)?;
         VmcsGuestNW::RSP.write(0)?;
-        // In UEFI mode, RIP should be 0xFFF0 (the offset within the CS segment),
-        // not the full linear address 0xFFFFFFF0. The linear address is computed
-        // by the processor as CS.base + RIP = 0xFFFF0000 + 0xFFF0 = 0xFFFFFFF0.
+
+        {
+            let cr0_must0 = Msr::IA32_VMX_CR0_FIXED1.read()
+                & !(Cr0Flags::NOT_WRITE_THROUGH | Cr0Flags::CACHE_DISABLE).bits();
+            let cr0_must1 = Msr::IA32_VMX_CR0_FIXED0.read()
+                & !(Cr0Flags::PAGING | Cr0Flags::PROTECTED_MODE_ENABLE).bits();
+            VmcsGuestNW::CR0.write(cr0_must1 as usize)?;
+            info!(
+                "[VMX setup] GUEST_CR0={:#x} (must0={:#x}, must1={:#x})",
+                cr0_must1, cr0_must0, cr0_must1
+            );
+        }
+
+        {
+            let cr4_must0 = Msr::IA32_VMX_CR4_FIXED1.read();
+            let cr4_must1 = Msr::IA32_VMX_CR4_FIXED0.read();
+            let mut guest_cr4 = cr4_must1;
+            guest_cr4 |= Cr4Flags::PHYSICAL_ADDRESS_EXTENSION.bits();
+            VmcsGuestNW::CR4.write(guest_cr4 as usize)?;
+            info!(
+                "[VMX setup] GUEST_CR4={:#x} (must0={:#x}, must1={:#x})",
+                guest_cr4, cr4_must0, cr4_must1
+            );
+        }
+        // In UEFI mode, the guest starts in real mode at the reset vector.
+        // RIP is set to the reset vector address (0xFFFFFFF0).
+        // In real mode, only the lower 16 bits (IP=0xFFF0) are used;
+        // the physical address is CS.base(0xFFFF0000) + IP(0xFFF0) = 0xFFFFFFF0.
         let rip_val = if boot_mode == X86BootMode::Uefi {
-            0xFFF0usize
+            0xFFFFFFF0usize
         } else {
             entry.as_usize()
         };
@@ -673,27 +741,45 @@ impl VmxVcpu {
 
         VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(VMX_PREEMPTION_TIMER_SET_VALUE)?;
 
-        VmcsGuest64::LINK_PTR.write(u64::MAX)?; // SDM Vol. 3C, Section 24.4.2
+        VmcsGuest64::LINK_PTR.write(self.shadow_vmcs.phys_addr().as_usize() as u64)?;
         VmcsGuest64::IA32_DEBUGCTL.write(0)?;
         VmcsGuest64::IA32_PAT.write(Msr::IA32_PAT.read())?;
         VmcsGuest64::IA32_EFER.write(0)?;
+        VmcsGuest64::IA32_PERF_GLOBAL_CTRL.write(0)?;
+        VmcsGuest64::IA32_BNDCFGS.write(0)?;
         Ok(())
     }
 
-    fn setup_vmcs_control(&mut self, ept_root: HostPhysAddr, is_guest: bool) -> AxResult {
+    fn setup_vmcs_control(&mut self, ept_root: HostPhysAddr, _is_guest: bool) -> AxResult {
         // Intercept NMI and external interrupts.
         use PinbasedControls as PinCtrl;
 
         use super::vmcs::controls::*;
         let raw_cpuid = CpuId::new();
 
+        // Diagnostic: dump all VMX capability MSRs
+        info!(
+            "[VMX MSR] TRUE_PINBASED={:#018x} TRUE_PROCBASED={:#018x} PROCBASED2={:#018x} TRUE_PROCBASED2={:#018x}",
+            Msr::IA32_VMX_TRUE_PINBASED_CTLS.read(),
+            Msr::IA32_VMX_TRUE_PROCBASED_CTLS.read(),
+            Msr::IA32_VMX_PROCBASED_CTLS2.read(),
+            Msr::IA32_VMX_TRUE_PROCBASED_CTLS2.read(),
+        );
+        info!(
+            "[VMX MSR] TRUE_EXIT={:#018x} TRUE_ENTRY={:#018x}",
+            Msr::IA32_VMX_TRUE_EXIT_CTLS.read(),
+            Msr::IA32_VMX_TRUE_ENTRY_CTLS.read(),
+        );
+        info!(
+            "[VMX MSR] PROCBASED={:#018x} (non-TRUE for comparison)",
+            Msr::IA32_VMX_PROCBASED_CTLS.read(),
+        );
+
         vmcs::set_control(
             VmcsControl32::PINBASED_EXEC_CONTROLS,
             Msr::IA32_VMX_TRUE_PINBASED_CTLS,
-            Msr::IA32_VMX_PINBASED_CTLS.read() as u32,
+            VmcsControl32::PINBASED_EXEC_CONTROLS.read()?,
             (PinCtrl::NMI_EXITING | PinCtrl::EXTERNAL_INTERRUPT_EXITING).bits(),
-            // (PinCtrl::NMI_EXITING | PinCtrl::VMX_PREEMPTION_TIMER).bits(),
-            // PinCtrl::NMI_EXITING.bits(),
             0,
         )?;
 
@@ -703,53 +789,197 @@ impl VmxVcpu {
         vmcs::set_control(
             VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS,
             Msr::IA32_VMX_TRUE_PROCBASED_CTLS,
-            Msr::IA32_VMX_PROCBASED_CTLS.read() as u32,
+            VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?,
             (CpuCtrl::USE_IO_BITMAPS
                 | CpuCtrl::USE_MSR_BITMAPS
                 | CpuCtrl::SECONDARY_CONTROLS
                 | CpuCtrl::HLT_EXITING)
                 .bits(),
-            (CpuCtrl::CR3_LOAD_EXITING
-                | CpuCtrl::CR3_STORE_EXITING
-                | CpuCtrl::CR8_LOAD_EXITING
-                | CpuCtrl::CR8_STORE_EXITING)
-                .bits(),
+            0,
         )?;
 
-        // Enable EPT, RDTSCP, INVPCID, and unrestricted guest.
+        // SDM 26.2.1.1: If "use I/O bitmaps" is 1, "unconditional I/O exiting" must be 0.
+        // Both are mandatory1 per MSR, but they are mutually exclusive.
+        // Force-clear UNCOND_IO_EXITING by directly writing the VMCS field,
+        // bypassing set_control to resolve the cross-dependency conflict.
+        let prim_ctrl = VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
+        let io_bitmaps = prim_ctrl & CpuCtrl::USE_IO_BITMAPS.bits() != 0;
+        let uncond_io = prim_ctrl & CpuCtrl::UNCOND_IO_EXITING.bits() != 0;
+        info!(
+            "[VMX control] PRIM_CTRL={:#x}: IO_BITMAPS={}, UNCOND_IO={}",
+            prim_ctrl, io_bitmaps, uncond_io
+        );
+        if io_bitmaps && uncond_io {
+            let fixed = prim_ctrl & !CpuCtrl::UNCOND_IO_EXITING.bits();
+            VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.write(fixed)?;
+            let actual = VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
+            info!(
+                "[VMX control] Force-cleared UNCOND_IO_EXITING: {:#x} -> wrote {:#x}, read back {:#x}",
+                prim_ctrl, fixed, actual
+            );
+        }
+
+        // Enable EPT, VPID, RDTSCP, INVPCID, and unrestricted guest.
+        // Use a direct write to the VMCS field, then read back to see what the
+        // hardware actually accepts. The MSR-based set_control is unreliable for
+        // secondary controls on this CPU (PROCBASED2 MSR allowed0=0 is wrong).
         use SecondaryControls as CpuCtrl2;
-        let mut val =
-            // CpuCtrl2::VIRTUALIZE_APIC | 
-            CpuCtrl2::ENABLE_EPT | CpuCtrl2::UNRESTRICTED_GUEST;
+        let desired_bits =
+            (CpuCtrl2::ENABLE_EPT | CpuCtrl2::ENABLE_VPID | CpuCtrl2::UNRESTRICTED_GUEST).bits();
+        let mut set_bits = desired_bits;
         if let Some(features) = raw_cpuid.get_extended_processor_and_feature_identifiers()
             && features.has_rdtscp()
         {
-            val |= CpuCtrl2::ENABLE_RDTSCP;
+            set_bits |= CpuCtrl2::ENABLE_RDTSCP.bits();
         }
         if let Some(features) = raw_cpuid.get_extended_feature_info()
             && features.has_invpcid()
         {
-            val |= CpuCtrl2::ENABLE_INVPCID;
+            set_bits |= CpuCtrl2::ENABLE_INVPCID.bits();
         }
         if let Some(features) = raw_cpuid.get_extended_state_info()
             && features.has_xsaves_xrstors()
         {
-            val |= CpuCtrl2::ENABLE_XSAVES_XRSTORS;
+            set_bits |= CpuCtrl2::ENABLE_XSAVES_XRSTORS.bits();
         }
-        vmcs::set_control(
-            VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS,
-            Msr::IA32_VMX_PROCBASED_CTLS2,
-            Msr::IA32_VMX_PROCBASED_CTLS2.read() as u32,
-            val.bits(),
-            0,
-        )?;
+        let old_sec = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+        let new_sec = old_sec | set_bits;
+        info!(
+            "[VMX control] Direct SEC_CTRL write: old={:#x}, set={:#x}, new={:#x}",
+            old_sec, set_bits, new_sec
+        );
+        VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.write(new_sec)?;
+        let actual = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+        info!(
+            "[VMX control] Direct SEC_CTRL read back: {:#x} (wrote {:#x})",
+            actual, new_sec
+        );
+
+        // VMCS_SHADOWING (bit 14) requires LINK_PTR to point to a valid shadow
+        // VMCS (SDM 24.4.2). If the hardware forces it via mandatory1, we
+        // accept it and configure LINK_PTR accordingly. If not, we clear it.
+        let sec_ctrl = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+        if sec_ctrl & CpuCtrl2::VMCS_SHADOWING.bits() != 0 {
+            let cap = Msr::IA32_VMX_PROCBASED_CTLS2.read();
+            let allowed0 = cap as u32;
+            let vmcs_shadowing_bit = CpuCtrl2::VMCS_SHADOWING.bits();
+            let can_clear = (allowed0 & vmcs_shadowing_bit) != 0;
+            if can_clear {
+                vmcs::set_control(
+                    VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS,
+                    Msr::IA32_VMX_PROCBASED_CTLS2,
+                    sec_ctrl,
+                    0,
+                    vmcs_shadowing_bit,
+                )?;
+                let sec_ctrl = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+                if sec_ctrl & vmcs_shadowing_bit != 0 {
+                    info!(
+                        "[VMX control] VMCS_SHADOWING is mandatory1, SEC_CTRL={:#x}",
+                        sec_ctrl
+                    );
+                } else {
+                    info!("[VMX control] Cleared VMCS_SHADOWING");
+                }
+            } else {
+                info!(
+                    "[VMX control] VMCS_SHADOWING is mandatory1 (allowed0={:#x}), \
+                     keeping it enabled, SEC_CTRL={:#x}",
+                    allowed0, sec_ctrl
+                );
+            }
+        }
+
+        // Cross-dependency checks for secondary controls (SDM 26.2.1.1).
+        let sec_ctrl = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+        let x2apic_set = sec_ctrl & CpuCtrl2::VIRTUALIZE_X2APIC.bits() != 0;
+        let apic_reg_set = sec_ctrl & CpuCtrl2::VIRTUALIZE_APIC_REGISTER.bits() != 0;
+        let apic_set = sec_ctrl & CpuCtrl2::VIRTUALIZE_APIC.bits() != 0;
+        let pml_set = sec_ctrl & CpuCtrl2::ENABLE_PML.bits() != 0;
+        let shadowing_set = sec_ctrl & CpuCtrl2::VMCS_SHADOWING.bits() != 0;
+        let vid_set = sec_ctrl & CpuCtrl2::VIRTUAL_INTERRUPT_DELIVERY.bits() != 0;
+        let vmfunc_set = sec_ctrl & CpuCtrl2::ENABLE_VM_FUNCTIONS.bits() != 0;
+        info!(
+            "[VMX control] SEC_CTRL={:#x}: APIC={}, x2APIC={}, APIC_REG={}, VID={}, \
+             PML={}, SHADOWING={}, VMFUNC={}",
+            sec_ctrl, apic_set, x2apic_set, apic_reg_set, vid_set, pml_set, shadowing_set, vmfunc_set
+        );
+
+        // SDM 26.2.1.1: If "virtualize x2APIC mode" is 1, "virtualize APIC accesses" must be 1.
+        // force-set VIRTUALIZE_APIC to satisfy the cross-dependency.
+        if x2apic_set && !apic_set {
+            let sec_ctrl = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+            let fixed = sec_ctrl | CpuCtrl2::VIRTUALIZE_APIC.bits();
+            VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.write(fixed)?;
+            let actual = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+            info!(
+                "[VMX control] Force-set VIRTUALIZE_APIC: SEC_CTRL {:#x} -> wrote {:#x}, read back {:#x}",
+                sec_ctrl, fixed, actual
+            );
+        }
+
+        // SDM 26.2.1.1: If "enable VM functions" is 1, VM-function controls must be non-zero.
+        // We set VM_FUNCTION_CONTROLS=1 (EPTP switching) earlier in setup_vmcs_control.
+        // Verify that the write took effect.
+        if vmfunc_set {
+            let vmfunc_ctrl = VmcsControl64::VM_FUNCTION_CONTROLS.read()?;
+            info!(
+                "[VMX control] ENABLE_VM_FUNCTIONS=1, VM_FUNCTION_CONTROLS={:#x}, SEC_CTRL={:#x}",
+                vmfunc_ctrl, sec_ctrl
+            );
+        }
+
+        // Write the (potentially unchanged) value back. Since we removed all
+        // force-clearing of mandatory1 bits, this is normally a no-op.
+        // Kept for diagnostic consistency: re-read to confirm the actual VMCS value.
+        VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.write(sec_ctrl)?;
+        let actual = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+        info!(
+            "[VMX control] Final SEC_CTRL={:#x} (wrote {:#x})",
+            actual, sec_ctrl
+        );
+
+        // SDM 26.2.1.1: If VMCS_SHADOWING is 1, LINK_PTR must point to a valid shadow VMCS.
+        // Re-read shadowing_set after possible modification.
+        let shadowing_set = actual & CpuCtrl2::VMCS_SHADOWING.bits() != 0;
+        if shadowing_set {
+            info!(
+                "[VMX control] VMCS_SHADOWING=1, LINK_PTR={:#x}",
+                VmcsGuest64::LINK_PTR.read().unwrap_or(0)
+            );
+        } else {
+            VmcsGuest64::LINK_PTR.write(0xFFFF_FFFF_FFFF_FFFF)?;
+            info!("[VMX control] VMCS_SHADOWING=0, set LINK_PTR=0xFFFFFFFF_FFFFFFFF");
+        }
+
+        VmcsControl16::VPID.write(1)?;
+
+        VmcsControl64::VMREAD_BITMAP_ADDR
+            .write(self.vmread_bitmap.start_paddr().as_usize() as u64)?;
+        VmcsControl64::VMWRITE_BITMAP_ADDR
+            .write(self.vmwrite_bitmap.start_paddr().as_usize() as u64)?;
+        VmcsControl64::PML_ADDR.write(self.pml_page.start_paddr().as_usize() as u64)?;
+        VmcsControl64::XSS_EXITING_BITMAP.write(self.xss_bitmap.start_paddr().as_usize() as u64)?;
+        // SDM 26.2.1.1: If "enable VM functions" is 1, VM-function controls must be non-zero.
+        // The MSR forces ENABLE_VM_FUNCTIONS as mandatory1 on this hardware.
+        // Enable EPTP switching (bit 0) to satisfy the check, and provide a valid
+        // EPTP-list page (even though the guest won't use VMFUNC).
+        let vmfunc_ctrl: u64 = 1; // EPTP switching
+        VmcsControl64::VM_FUNCTION_CONTROLS.write(vmfunc_ctrl)?;
+        VmcsControl64::EPTP_LIST_ADDR
+            .write(self.eptp_list_page.start_paddr().as_usize() as u64)?;
+        info!(
+            "[VMX control] VM_FUNCTION_CONTROLS={:#x}, EPTP_LIST_ADDR={:#x}",
+            vmfunc_ctrl,
+            self.eptp_list_page.start_paddr().as_usize()
+        );
 
         // Switch to 64-bit host, acknowledge interrupt info, switch IA32_PAT/IA32_EFER on VM exit.
         use ExitControls as ExitCtrl;
         vmcs::set_control(
             VmcsControl32::VMEXIT_CONTROLS,
             Msr::IA32_VMX_TRUE_EXIT_CTLS,
-            Msr::IA32_VMX_EXIT_CTLS.read() as u32,
+            0,
             (ExitCtrl::HOST_ADDRESS_SPACE_SIZE
                 | ExitCtrl::ACK_INTERRUPT_ON_EXIT
                 | ExitCtrl::SAVE_IA32_PAT
@@ -760,22 +990,12 @@ impl VmxVcpu {
             0,
         )?;
 
-        let mut val = EntryCtrl::LOAD_IA32_PAT | EntryCtrl::LOAD_IA32_EFER;
-
-        if !is_guest {
-            // IA-32e mode guest
-            // On processors that support Intel 64 architecture, this control determines whether the logical processor is in IA-32e mode after VM entry.
-            // Its value is loaded into IA32_EFER.LMA as part of VM entry.
-            val |= EntryCtrl::IA32E_MODE_GUEST;
-        }
-
-        // Load guest IA32_PAT/IA32_EFER on VM entry.
         use EntryControls as EntryCtrl;
         vmcs::set_control(
             VmcsControl32::VMENTRY_CONTROLS,
             Msr::IA32_VMX_TRUE_ENTRY_CTLS,
-            Msr::IA32_VMX_ENTRY_CTLS.read() as u32,
-            val.bits(),
+            0,
+            (EntryCtrl::LOAD_IA32_PAT | EntryCtrl::LOAD_IA32_EFER).bits(),
             0,
         )?;
 
@@ -786,7 +1006,35 @@ impl VmxVcpu {
         VmcsControl32::VMEXIT_MSR_LOAD_COUNT.write(0)?;
         VmcsControl32::VMENTRY_MSR_LOAD_COUNT.write(0)?;
 
-        // VmcsControlNW::CR4_GUEST_HOST_MASK.write(0)?;
+        {
+            let cr0_fixed0 = Msr::IA32_VMX_CR0_FIXED0.read();
+            let cr0_fixed1 = Msr::IA32_VMX_CR0_FIXED1.read();
+            let cr0_flex = !cr0_fixed0 & cr0_fixed1;
+            let cr0_mask = cr0_flex | cr0_fixed0;
+            VmcsControlNW::CR0_GUEST_HOST_MASK.write(cr0_mask as usize)?;
+            VmcsControlNW::CR0_READ_SHADOW.write(VmcsGuestNW::CR0.read()?)?;
+            info!(
+                "[VMX control] CR0_MASK={:#x} (fixed0={:#x} fixed1={:#x} flex={:#x})",
+                cr0_mask, cr0_fixed0, cr0_fixed1, cr0_flex
+            );
+        }
+        {
+            let cr4_fixed0 = Msr::IA32_VMX_CR4_FIXED0.read();
+            let cr4_fixed1 = Msr::IA32_VMX_CR4_FIXED1.read();
+            let cr4_flex = !cr4_fixed0 & cr4_fixed1;
+            let cr4_mask = cr4_flex | cr4_fixed0;
+            VmcsControlNW::CR4_GUEST_HOST_MASK.write(cr4_mask as usize)?;
+            VmcsControlNW::CR4_READ_SHADOW.write(VmcsGuestNW::CR4.read()?)?;
+            info!(
+                "[VMX control] CR4_MASK={:#x} (fixed0={:#x} fixed1={:#x} flex={:#x})",
+                cr4_mask, cr4_fixed0, cr4_fixed1, cr4_flex
+            );
+        }
+        info!(
+            "[VMX control] CR0_READ_SHADOW={:#x} CR4_READ_SHADOW={:#x}",
+            VmcsControlNW::CR0_READ_SHADOW.read().unwrap_or(0),
+            VmcsControlNW::CR4_READ_SHADOW.read().unwrap_or(0),
+        );
         VmcsControl32::CR3_TARGET_COUNT.write(0)?;
 
         // Pass-through exceptions (except #UD(6)), don't use I/O bitmap, set MSR bitmaps.
@@ -799,9 +1047,63 @@ impl VmxVcpu {
         VmcsControl64::IO_BITMAP_B_ADDR.write(self.io_bitmap.phys_addr().1.as_usize() as _)?;
         VmcsControl64::MSR_BITMAPS_ADDR.write(self.msr_bitmap.phys_addr().as_usize() as _)?;
 
-        // VmcsControl64::APIC_ACCESS_ADDR.write(
-        //     EmulatedLocalApic::<H::MmHal, DummyHal>::virtual_apic_access_addr().as_usize() as _,
-        // )?;
+        VmcsControl64::VIRT_APIC_ADDR
+            .write(self.vlapic.virtual_apic_page_addr().as_usize() as u64)?;
+        VmcsControl64::APIC_ACCESS_ADDR
+            .write(self.apic_access_page.start_paddr().as_usize() as u64)?;
+        VmcsControl64::EOI_EXIT0.write(0)?;
+        VmcsControl64::EOI_EXIT1.write(0)?;
+        VmcsControl64::EOI_EXIT2.write(0)?;
+        VmcsControl64::EOI_EXIT3.write(0)?;
+        VmcsControl32::TPR_THRESHOLD.write(0)?;
+        // The MSR IA32_VMX_TRUE_PINBASED_CTLS forces "process posted interrupts" (bit6)
+        // via mandatory1. This requires the posted-interrupt notification vector and
+        // descriptor address to be properly configured.
+        // Use a non-zero notification vector (0xFC, outside typical interrupt range)
+        // and point the descriptor to a zeroed page.
+        const POSTED_INTR_VECTOR: u16 = 0xFC;
+        VmcsControl16::POSTED_INTERRUPT_NOTIFICATION_VECTOR.write(POSTED_INTR_VECTOR)?;
+        VmcsControl64::POSTED_INTERRUPT_DESC_ADDR
+            .write(self.posted_interrupt_desc.start_paddr().as_usize() as u64)?;
+        info!(
+            "[VMX control] Posted-interrupt: vector={:#x}, desc_addr={:#x}",
+            POSTED_INTR_VECTOR,
+            self.posted_interrupt_desc.start_paddr().as_usize()
+        );
+        Ok(())
+    }
+
+    /// After `setup_vmcs_control` has set VMENTRY_CONTROLS (which may include
+    /// IA32E_MODE_GUEST forced by MSR mandatory1), adjust guest CR0/EFER/CS to
+    /// satisfy the Intel SDM VM-entry checks for IA-32e mode:
+    ///   CR0.PG = 1, CR4.PAE = 1, EFER.LME = 1, CS.L = 1
+    fn fixup_ia32e_guest_cr_and_efer(&mut self) -> AxResult {
+        use super::vmcs::controls::*;
+        let entry_ctrl = VmcsControl32::VMENTRY_CONTROLS.read()?;
+        if entry_ctrl & EntryControls::IA32E_MODE_GUEST.bits() != 0 {
+            let mut cr0 = VmcsGuestNW::CR0.read()?;
+            cr0 |= (Cr0Flags::PROTECTED_MODE_ENABLE | Cr0Flags::PAGING).bits() as usize;
+            VmcsGuestNW::CR0.write(cr0)?;
+            let mut efer = VmcsGuest64::IA32_EFER.read()?;
+            efer |= EferFlags::LONG_MODE_ENABLE.bits();
+            efer |= MSR_IA32_EFER_LMA_BIT; // SDM: LMA must equal IA32E_MODE_GUEST
+            VmcsGuest64::IA32_EFER.write(efer)?;
+            let mut cs_ar = VmcsGuest32::CS_ACCESS_RIGHTS.read()?;
+            cs_ar |= 1 << 13; // L (long mode) bit
+            VmcsGuest32::CS_ACCESS_RIGHTS.write(cs_ar)?;
+            // IA32E_MODE_GUEST requires TR to be a busy TSS (SDM 26.3.1.2)
+            let tr_ar = VmcsGuest32::TR_ACCESS_RIGHTS.read()?;
+            if tr_ar & (1 << 16) != 0 {
+                VmcsGuest32::TR_ACCESS_RIGHTS.write(0x8b)?;
+                VmcsGuestNW::TR_BASE.write(0)?;
+                VmcsGuest32::TR_LIMIT.write(0x67)?;
+                info!("[VMX setup] IA32E_MODE_GUEST fixup: TR from unusable to busy TSS");
+            }
+            info!(
+                "[VMX setup] IA32E_MODE_GUEST fixup: CR0={:#x}, EFER={:#x}, CS_AR={:#x}",
+                cr0, efer, cs_ar
+            );
+        }
         Ok(())
     }
 
@@ -824,6 +1126,196 @@ impl VmxVcpu {
             }
         }
         level as usize
+    }
+
+    fn dump_vmcs_state(&self) {
+        let rip = VmcsGuestNW::RIP.read().unwrap_or(0);
+        let rsp = VmcsGuestNW::RSP.read().unwrap_or(0);
+        let rflags = VmcsGuestNW::RFLAGS.read().unwrap_or(0);
+        let cr0 = VmcsGuestNW::CR0.read().unwrap_or(0);
+        let cr3 = VmcsGuestNW::CR3.read().unwrap_or(0);
+        let cr4 = VmcsGuestNW::CR4.read().unwrap_or(0);
+        let dr7 = VmcsGuestNW::DR7.read().unwrap_or(0);
+        let efer = VmcsGuest64::IA32_EFER.read().unwrap_or(0);
+        let pat = VmcsGuest64::IA32_PAT.read().unwrap_or(0);
+        let sysenter_cs = VmcsGuest32::IA32_SYSENTER_CS.read().unwrap_or(0);
+        let sysenter_esp = VmcsGuestNW::IA32_SYSENTER_ESP.read().unwrap_or(0);
+        let sysenter_eip = VmcsGuestNW::IA32_SYSENTER_EIP.read().unwrap_or(0);
+        let int_state = VmcsGuest32::INTERRUPTIBILITY_STATE.read().unwrap_or(0);
+        let activity = VmcsGuest32::ACTIVITY_STATE.read().unwrap_or(0);
+        let link_ptr = VmcsGuest64::LINK_PTR.read().unwrap_or(0);
+        let gdtr_base = VmcsGuestNW::GDTR_BASE.read().unwrap_or(0);
+        let gdtr_limit = VmcsGuest32::GDTR_LIMIT.read().unwrap_or(0);
+        let idtr_base = VmcsGuestNW::IDTR_BASE.read().unwrap_or(0);
+        let idtr_limit = VmcsGuest32::IDTR_LIMIT.read().unwrap_or(0);
+
+        let cs_sel = VmcsGuest16::CS_SELECTOR.read().unwrap_or(0);
+        let cs_base = VmcsGuestNW::CS_BASE.read().unwrap_or(0);
+        let cs_limit = VmcsGuest32::CS_LIMIT.read().unwrap_or(0);
+        let cs_ar = VmcsGuest32::CS_ACCESS_RIGHTS.read().unwrap_or(0);
+
+        let ss_sel = VmcsGuest16::SS_SELECTOR.read().unwrap_or(0);
+        let ss_base = VmcsGuestNW::SS_BASE.read().unwrap_or(0);
+        let ss_limit = VmcsGuest32::SS_LIMIT.read().unwrap_or(0);
+        let ss_ar = VmcsGuest32::SS_ACCESS_RIGHTS.read().unwrap_or(0);
+
+        let ds_sel = VmcsGuest16::DS_SELECTOR.read().unwrap_or(0);
+        let ds_ar = VmcsGuest32::DS_ACCESS_RIGHTS.read().unwrap_or(0);
+
+        let es_sel = VmcsGuest16::ES_SELECTOR.read().unwrap_or(0);
+        let es_ar = VmcsGuest32::ES_ACCESS_RIGHTS.read().unwrap_or(0);
+
+        let fs_sel = VmcsGuest16::FS_SELECTOR.read().unwrap_or(0);
+        let fs_base = VmcsGuestNW::FS_BASE.read().unwrap_or(0);
+        let fs_ar = VmcsGuest32::FS_ACCESS_RIGHTS.read().unwrap_or(0);
+
+        let gs_sel = VmcsGuest16::GS_SELECTOR.read().unwrap_or(0);
+        let gs_base = VmcsGuestNW::GS_BASE.read().unwrap_or(0);
+        let gs_ar = VmcsGuest32::GS_ACCESS_RIGHTS.read().unwrap_or(0);
+
+        let tr_sel = VmcsGuest16::TR_SELECTOR.read().unwrap_or(0);
+        let tr_base = VmcsGuestNW::TR_BASE.read().unwrap_or(0);
+        let tr_limit = VmcsGuest32::TR_LIMIT.read().unwrap_or(0);
+        let tr_ar = VmcsGuest32::TR_ACCESS_RIGHTS.read().unwrap_or(0);
+
+        let ldtr_sel = VmcsGuest16::LDTR_SELECTOR.read().unwrap_or(0);
+        let ldtr_base = VmcsGuestNW::LDTR_BASE.read().unwrap_or(0);
+        let ldtr_ar = VmcsGuest32::LDTR_ACCESS_RIGHTS.read().unwrap_or(0);
+
+        let perf_global_ctrl = VmcsGuest64::IA32_PERF_GLOBAL_CTRL.read().unwrap_or(0);
+        let bndcfgs = VmcsGuest64::IA32_BNDCFGS.read().unwrap_or(0);
+
+        let exit_ctrl = VmcsControl32::VMEXIT_CONTROLS.read().unwrap_or(0);
+
+        let cr0_mask = VmcsControlNW::CR0_GUEST_HOST_MASK.read().unwrap_or(0);
+        let cr0_shadow = VmcsControlNW::CR0_READ_SHADOW.read().unwrap_or(0);
+        let cr4_mask = VmcsControlNW::CR4_GUEST_HOST_MASK.read().unwrap_or(0);
+        let cr4_shadow = VmcsControlNW::CR4_READ_SHADOW.read().unwrap_or(0);
+
+        let sec_ctrl = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS
+            .read()
+            .unwrap_or(0);
+        let entry_ctrl = VmcsControl32::VMENTRY_CONTROLS.read().unwrap_or(0);
+        let eptp = VmcsControl64::EPTP.read().unwrap_or(0);
+        let vmentry_intinfo = VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD
+            .read()
+            .unwrap_or(0);
+
+        info!(
+            "[VMCS-DUMP] RIP={:#x} RSP={:#x} RFLAGS={:#x}",
+            rip, rsp, rflags
+        );
+        info!(
+            "[VMCS-DUMP] CR0={:#x} CR3={:#x} CR4={:#x} DR7={:#x}",
+            cr0, cr3, cr4, dr7
+        );
+        info!("[VMCS-DUMP] EFER={:#x} PAT={:#x}", efer, pat);
+        info!(
+            "[VMCS-DUMP] SYSENTER: CS={:#x} ESP={:#x} EIP={:#x}",
+            sysenter_cs, sysenter_esp, sysenter_eip
+        );
+        info!(
+            "[VMCS-DUMP] INT_STATE={:#x} ACTIVITY={:#x} LINK_PTR={:#x}",
+            int_state, activity, link_ptr
+        );
+        info!(
+            "[VMCS-DUMP] GDTR={:#x}:{:#x} IDTR={:#x}:{:#x}",
+            gdtr_base, gdtr_limit, idtr_base, idtr_limit
+        );
+        info!(
+            "[VMCS-DUMP] CS: sel={:#x} base={:#x} limit={:#x} AR={:#x}",
+            cs_sel, cs_base, cs_limit, cs_ar
+        );
+        info!(
+            "[VMCS-DUMP] SS: sel={:#x} base={:#x} limit={:#x} AR={:#x}",
+            ss_sel, ss_base, ss_limit, ss_ar
+        );
+        info!(
+            "[VMCS-DUMP] DS: sel={:#x} AR={:#x}  ES: sel={:#x} AR={:#x}",
+            ds_sel, ds_ar, es_sel, es_ar
+        );
+        info!(
+            "[VMCS-DUMP] FS: sel={:#x} base={:#x} AR={:#x}",
+            fs_sel, fs_base, fs_ar
+        );
+        info!(
+            "[VMCS-DUMP] GS: sel={:#x} base={:#x} AR={:#x}",
+            gs_sel, gs_base, gs_ar
+        );
+        info!(
+            "[VMCS-DUMP] TR: sel={:#x} base={:#x} limit={:#x} AR={:#x}",
+            tr_sel, tr_base, tr_limit, tr_ar
+        );
+        info!(
+            "[VMCS-DUMP] LDTR: sel={:#x} base={:#x} AR={:#x}",
+            ldtr_sel, ldtr_base, ldtr_ar
+        );
+        info!(
+            "[VMCS-DUMP] CR0_MASK={:#x} CR0_SHADOW={:#x} CR4_MASK={:#x} CR4_SHADOW={:#x}",
+            cr0_mask, cr0_shadow, cr4_mask, cr4_shadow
+        );
+        info!(
+            "[VMCS-DUMP] SEC_CTRL={:#x} ENTRY_CTRL={:#x} EXIT_CTRL={:#x} EPTP={:#x} VPID={}",
+            sec_ctrl,
+            entry_ctrl,
+            exit_ctrl,
+            eptp,
+            VmcsControl16::VPID.read().unwrap_or(0),
+        );
+        info!(
+            "[VMCS-DUMP] PERF_GLOBAL_CTRL={:#x} BNDCFGS={:#x} VMENTRY_INFO={:#x}",
+            perf_global_ctrl, bndcfgs, vmentry_intinfo
+        );
+
+        let pin_ctrl = VmcsControl32::PINBASED_EXEC_CONTROLS.read().unwrap_or(0);
+        let prim_ctrl = VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS
+            .read()
+            .unwrap_or(0);
+        info!(
+            "[VMCS-DUMP] PIN_CTRL={:#x} PRIM_CTRL={:#x}",
+            pin_ctrl, prim_ctrl
+        );
+
+        let host_cr0 = VmcsHostNW::CR0.read().unwrap_or(0);
+        let host_cr3 = VmcsHostNW::CR3.read().unwrap_or(0);
+        let host_cr4 = VmcsHostNW::CR4.read().unwrap_or(0);
+        let host_rip = VmcsHostNW::RIP.read().unwrap_or(0);
+        let host_rsp = VmcsHostNW::RSP.read().unwrap_or(0);
+        let host_efer = VmcsHost64::IA32_EFER.read().unwrap_or(0);
+        info!(
+            "[VMCS-DUMP-HOST] CR0={:#x} CR3={:#x} CR4={:#x} RIP={:#x} RSP={:#x} EFER={:#x}",
+            host_cr0, host_cr3, host_cr4, host_rip, host_rsp, host_efer
+        );
+
+        let host_cs = VmcsHost16::CS_SELECTOR.read().unwrap_or(0);
+        let host_ss = VmcsHost16::SS_SELECTOR.read().unwrap_or(0);
+        let host_ds = VmcsHost16::DS_SELECTOR.read().unwrap_or(0);
+        let host_es = VmcsHost16::ES_SELECTOR.read().unwrap_or(0);
+        let host_fs = VmcsHost16::FS_SELECTOR.read().unwrap_or(0);
+        let host_gs = VmcsHost16::GS_SELECTOR.read().unwrap_or(0);
+        let host_tr = VmcsHost16::TR_SELECTOR.read().unwrap_or(0);
+        info!(
+            "[VMCS-DUMP-HOST] CS={:#x} SS={:#x} DS={:#x} ES={:#x} FS={:#x} GS={:#x} TR={:#x}",
+            host_cs, host_ss, host_ds, host_es, host_fs, host_gs, host_tr
+        );
+
+        let host_fs_base = VmcsHostNW::FS_BASE.read().unwrap_or(0);
+        let host_gs_base = VmcsHostNW::GS_BASE.read().unwrap_or(0);
+        let host_tr_base = VmcsHostNW::TR_BASE.read().unwrap_or(0);
+        let host_gdtr = VmcsHostNW::GDTR_BASE.read().unwrap_or(0);
+        let host_idtr = VmcsHostNW::IDTR_BASE.read().unwrap_or(0);
+        info!(
+            "[VMCS-DUMP-HOST] FS_BASE={:#x} GS_BASE={:#x} TR_BASE={:#x} GDTR={:#x} IDTR={:#x}",
+            host_fs_base, host_gs_base, host_tr_base, host_gdtr, host_idtr
+        );
+
+        let io_a = VmcsControl64::IO_BITMAP_A_ADDR.read().unwrap_or(0);
+        let io_b = VmcsControl64::IO_BITMAP_B_ADDR.read().unwrap_or(0);
+        let msr_bmp = VmcsControl64::MSR_BITMAPS_ADDR.read().unwrap_or(0);
+        info!(
+            "[VMCS-DUMP-HOST] IO_A={:#x} IO_B={:#x} MSR_BMP={:#x}",
+            io_a, io_b, msr_bmp
+        );
     }
 }
 
@@ -946,7 +1438,61 @@ impl VmxVcpu {
     }
 
     fn vmx_entry_failed() -> ! {
-        panic!("{}", vmcs::instruction_error().as_str())
+        let instr_err = vmcs::instruction_error();
+        let exit_reason = VmcsReadOnly32::EXIT_REASON.read().unwrap_or(0);
+        let exit_qual = VmcsReadOnlyNW::EXIT_QUALIFICATION.read().unwrap_or(0);
+        let idt_vec = VmcsReadOnly32::IDT_VECTORING_INFO.read().unwrap_or(0);
+        let idt_err = VmcsReadOnly32::IDT_VECTORING_ERR_CODE.read().unwrap_or(0);
+        let instr_len = VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
+        let pin_ctrl = VmcsControl32::PINBASED_EXEC_CONTROLS.read().unwrap_or(0);
+        let prim_ctrl = VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS
+            .read()
+            .unwrap_or(0);
+        let sec_ctrl = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS
+            .read()
+            .unwrap_or(0);
+        let entry_ctrl = VmcsControl32::VMENTRY_CONTROLS.read().unwrap_or(0);
+        let exit_ctrl = VmcsControl32::VMEXIT_CONTROLS.read().unwrap_or(0);
+        let eptp = VmcsControl64::EPTP.read().unwrap_or(0);
+        let guest_efer = VmcsGuest64::IA32_EFER.read().unwrap_or(0);
+        let guest_cr0 = VmcsGuestNW::CR0.read().unwrap_or(0);
+        let guest_cr4 = VmcsGuestNW::CR4.read().unwrap_or(0);
+        let guest_rip = VmcsGuestNW::RIP.read().unwrap_or(0);
+        let guest_cs = VmcsGuest16::CS_SELECTOR.read().unwrap_or(0);
+        let guest_cs_base = VmcsGuestNW::CS_BASE.read().unwrap_or(0);
+        let guest_cs_ar = VmcsGuest32::CS_ACCESS_RIGHTS.read().unwrap_or(0);
+        let host_cr0 = VmcsHostNW::CR0.read().unwrap_or(0);
+        let host_cr4 = VmcsHostNW::CR4.read().unwrap_or(0);
+        let host_efer = VmcsHost64::IA32_EFER.read().unwrap_or(0);
+        panic!(
+            "{}: exit_reason=0x{:x} exit_qual=0x{:x} idt_vec=0x{:x} idt_err=0x{:x} \
+             instr_len={}\nPIN_CTRL=0x{:x} PRIM_CTRL=0x{:x} SEC_CTRL=0x{:x}\nENTRY_CTRL=0x{:x} \
+             EXIT_CTRL=0x{:x} EPTP=0x{:x}\nG_CR0=0x{:x} G_CR4=0x{:x} G_RIP=0x{:x} \
+             G_EFER=0x{:x}\nG_CS=0x{:x} G_CS_BASE=0x{:x} G_CS_AR=0x{:x}\nH_CR0=0x{:x} \
+             H_CR4=0x{:x} H_EFER=0x{:x}",
+            instr_err.as_str(),
+            exit_reason,
+            exit_qual,
+            idt_vec,
+            idt_err,
+            instr_len,
+            pin_ctrl,
+            prim_ctrl,
+            sec_ctrl,
+            entry_ctrl,
+            exit_ctrl,
+            eptp,
+            guest_cr0,
+            guest_cr4,
+            guest_rip,
+            guest_efer,
+            guest_cs,
+            guest_cs_base,
+            guest_cs_ar,
+            host_cr0,
+            host_cr4,
+            host_efer,
+        )
     }
 
     /// Whether the guest interrupts are blocked. (SDM Vol. 3C, Section 24.4.2, Table 24-3)
@@ -1051,6 +1597,8 @@ impl VmxVcpu {
                     }
                     if (0xFEE0_0000..0xFEE0_1000).contains(&gpa) {
                         Some(self.handle_apic_mmio_ept_violation())
+                    } else if (0x8000_0000..0xC000_0000).contains(&gpa) {
+                        Some(self.handle_pci_mmio_ept_violation())
                     } else {
                         None
                     }
@@ -1251,6 +1799,42 @@ impl VmxVcpu {
 
         self.advance_rip(instr_len)?;
 
+        Ok(())
+    }
+
+    fn handle_pci_mmio_ept_violation(&mut self) -> AxResult {
+        let info = self.nested_page_fault_info()?;
+        let gpa = info.fault_guest_paddr.as_usize();
+        let is_write = info.access_flags.contains(axaddrspace::MappingFlags::WRITE);
+
+        let instr_len = VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
+        let instr_len: u8 = if instr_len == 0 {
+            if let Some((bytes, actual_len)) = self.read_guest_instr_bytes(15) {
+                let decoded = Self::decode_x86_instruction_length(&bytes[..actual_len]);
+                if decoded > 0 { decoded } else { 2 }
+            } else {
+                2
+            }
+        } else {
+            instr_len as u8
+        };
+
+        if is_write {
+            debug!(
+                "[PCI-MMIO] write ignored: GPA={:#x}, RIP={:#x}",
+                gpa,
+                self.rip()
+            );
+        } else {
+            self.regs_mut().rax = 0xFFFF_FFFF;
+            debug!(
+                "[PCI-MMIO] read returning 0xFFFFFFFF: GPA={:#x}, RIP={:#x}",
+                gpa,
+                self.rip()
+            );
+        }
+
+        self.advance_rip(instr_len)?;
         Ok(())
     }
 
@@ -1466,7 +2050,8 @@ impl VmxVcpu {
 
     #[allow(clippy::single_match)]
     fn handle_cr(&mut self) -> AxResult {
-        const VM_EXIT_INSTR_LEN_MV_TO_CR: u8 = 3;
+        let instr_len = VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(3) as u8;
+        let instr_len = if instr_len == 0 { 3 } else { instr_len };
 
         let cr_access_info = vmcs::cr_access_info()?;
 
@@ -1482,12 +2067,45 @@ impl VmxVcpu {
                     self.guest_regs.get_reg_of_index(reg)
                 };
                 if cr == 0 || cr == 4 {
-                    self.advance_rip(VM_EXIT_INSTR_LEN_MV_TO_CR)?;
+                    let rip_before = self.rip();
+                    info!(
+                        "[CR{}] write val={:#x}, RIP before={:#x}, instr_len={}",
+                        cr, val, rip_before, instr_len
+                    );
+                    self.advance_rip(instr_len)?;
+                    let rip_after = self.rip();
                     // TODO: check for #GP reasons
                     self.set_cr(cr as usize, val);
+                    let cr0_host_mask = VmcsControlNW::CR0_GUEST_HOST_MASK.read().unwrap_or(0);
+                    let cr4_host_mask = VmcsControlNW::CR4_GUEST_HOST_MASK.read().unwrap_or(0);
+                    info!(
+                        "[CR{}] after advance RIP={:#x}, CR0_HOST_MASK={:#x}, CR4_HOST_MASK={:#x}",
+                        cr, rip_after, cr0_host_mask, cr4_host_mask
+                    );
 
-                    if cr == 0 && Cr0Flags::from_bits_truncate(val).contains(Cr0Flags::PAGING) {
-                        vmcs::update_efer()?;
+                    if cr == 0 {
+                        let cr0_flags = Cr0Flags::from_bits_truncate(val);
+                        if cr0_flags.contains(Cr0Flags::PROTECTED_MODE_ENABLE) {
+                            let gdtr_base = VmcsGuestNW::GDTR_BASE.read().unwrap_or(0);
+                            let gdtr_limit = VmcsGuest32::GDTR_LIMIT.read().unwrap_or(0);
+                            let cs_ar = VmcsGuest32::CS_ACCESS_RIGHTS.read().unwrap_or(0);
+                            info!(
+                                "[CR0] PE set, value={:#x}, GDTR={:#x}:{:#x}, CS_AR={:#x}",
+                                val, gdtr_base, gdtr_limit, cs_ar
+                            );
+                        }
+                        if cr0_flags.contains(Cr0Flags::PAGING) {
+                            vmcs::update_efer()?;
+                        }
+                    }
+                    if cr == 4 {
+                        info!("[CR4] set to {:#x}, RIP={:#x}", val, self.rip());
+                        let cs_ar = VmcsGuest32::CS_ACCESS_RIGHTS.read().unwrap_or(0);
+                        let cs_ar_fixed = cs_ar | 0x4000;
+                        if cs_ar_fixed != cs_ar {
+                            VmcsGuest32::CS_ACCESS_RIGHTS.write(cs_ar_fixed)?;
+                            info!("[CR4] Fixed CS D/B bit: {:#x} -> {:#x}", cs_ar, cs_ar_fixed);
+                        }
                     }
                     return Ok(());
                 }
@@ -1808,7 +2426,7 @@ impl AxArchVCpu for VmxVcpu {
     }
 
     fn run(&mut self) -> AxResult<AxVCpuExitReason> {
-        match self.inner_run() {
+        let result = match self.inner_run() {
             Some(exit_info) => Ok(if exit_info.entry_failure {
                 let exit_reason_raw = exit_info.exit_reason as u64;
                 AxVCpuExitReason::FailEntry {
@@ -1989,10 +2607,27 @@ impl AxArchVCpu for VmxVcpu {
                             VmxInterruptionType::HardException
                             | VmxInterruptionType::SoftException
                             | VmxInterruptionType::PrivSoftException => {
+                                let rip = self.rip();
+                                let cs_base = VmcsGuestNW::CS_BASE.read().unwrap_or(0);
+                                let cs_selector = VmcsGuest16::CS_SELECTOR.read().unwrap_or(0);
+                                let cs_ar = VmcsGuest32::CS_ACCESS_RIGHTS.read().unwrap_or(0);
+                                let cr0 = VmcsGuestNW::CR0.read().unwrap_or(0);
+                                let linear = cs_base + rip;
+                                let idt_vec = vmcs::idt_vectoring_info().ok().flatten();
                                 info!(
                                     "VMX EXCEPTION_NMI: inject exception vector={}, type={:?}, \
-                                     err={:?}",
-                                    vector, int_type, int_info.err_code
+                                     err={:?}, RIP={:#x}, CS={:#x} BASE={:#x} AR={:#x}, \
+                                     CR0={:#x}, linear={:#x}, IDT-vec={:?}",
+                                    vector,
+                                    int_type,
+                                    int_info.err_code,
+                                    rip,
+                                    cs_selector,
+                                    cs_base,
+                                    cs_ar,
+                                    cr0,
+                                    linear,
+                                    idt_vec
                                 );
                                 self.queue_event(vector, int_info.err_code);
                                 AxVCpuExitReason::Nothing
@@ -2012,6 +2647,8 @@ impl AxArchVCpu for VmxVcpu {
                         if exit_info.exit_reason == VmxExitReason::TRIPLE_FAULT {
                             let idtr_base = VmcsGuestNW::IDTR_BASE.read().unwrap_or(0);
                             let idtr_limit = VmcsGuest32::IDTR_LIMIT.read().unwrap_or(0);
+                            let gdtr_base = VmcsGuestNW::GDTR_BASE.read().unwrap_or(0);
+                            let gdtr_limit = VmcsGuest32::GDTR_LIMIT.read().unwrap_or(0);
                             let rsp = VmcsGuestNW::RSP.read().unwrap_or(0);
                             let rflags = VmcsGuestNW::RFLAGS.read().unwrap_or(0);
                             let cr0 = VmcsGuestNW::CR0.read().unwrap_or(0);
@@ -2019,23 +2656,27 @@ impl AxArchVCpu for VmxVcpu {
                             let cr4 = VmcsGuestNW::CR4.read().unwrap_or(0);
                             let cs = VmcsGuest16::CS_SELECTOR.read().unwrap_or(0);
                             let cs_base = VmcsGuestNW::CS_BASE.read().unwrap_or(0);
+                            let cs_ar = VmcsGuest32::CS_ACCESS_RIGHTS.read().unwrap_or(0);
                             let interruptibility =
                                 VmcsGuest32::INTERRUPTIBILITY_STATE.read().unwrap_or(0);
                             let idt_vec = vmcs::idt_vectoring_info().ok().flatten();
                             error!(
                                 "[TRIPLE_FAULT] RIP={:#x}, RSP={:#x}, RFLAGS={:#x}, \
-                                 IDTR={:#x}:{:#x}, CR0={:#x}, CR3={:#x}, CR4={:#x}, \
-                                 CS={:#x}:{:#x}, INTBL={:#x}, IDT-vec={:?}",
+                                 IDTR={:#x}:{:#x}, GDTR={:#x}:{:#x}, CR0={:#x}, CR3={:#x}, \
+                                 CR4={:#x}, CS={:#x}:{:#x} AR={:#x}, INTBL={:#x}, IDT-vec={:?}",
                                 self.rip(),
                                 rsp,
                                 rflags,
                                 idtr_base,
                                 idtr_limit,
+                                gdtr_base,
+                                gdtr_limit,
                                 cr0,
                                 cr3,
                                 cr4,
                                 cs,
                                 cs_base,
+                                cs_ar,
                                 interruptibility,
                                 idt_vec
                             );
@@ -2058,7 +2699,26 @@ impl AxArchVCpu for VmxVcpu {
                 }
             }),
             None => Ok(AxVCpuExitReason::Nothing),
+        };
+
+        if let Some(sipi) = self.vlapic.take_pending_init_sipi() {
+            info!(
+                "[SMP] INIT/SIPI: target_cpu={}, mode={:?}, vector={:#x}",
+                sipi.target_cpu, sipi.mode, sipi.vector
+            );
+            let entry_point = if sipi.vector != 0 {
+                GuestPhysAddr::from((sipi.vector as usize) << 12)
+            } else {
+                GuestPhysAddr::from(0x0)
+            };
+            return Ok(AxVCpuExitReason::CpuUp {
+                target_cpu: sipi.target_cpu as u64,
+                entry_point,
+                arg: 0,
+            });
         }
+
+        result
     }
 
     fn bind(&mut self) -> AxResult {

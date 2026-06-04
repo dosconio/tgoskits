@@ -357,7 +357,8 @@ impl AcpiTableBuilder {
             builder.append_u8(0); // Type: Processor Local APIC
             builder.append_u8(lapic_entry_size as u8); // Length
             builder.append_u8(cpu_id as u8); // ACPI Processor UID
-            builder.append_u8((cpu_id as u8) << 1 | 1); // APIC ID (even) + Enabled flag
+            builder.append_u8(cpu_id as u8); // APIC ID
+            builder.append_u32(1); // Flags: Enabled
         }
 
         // Interrupt Source Override (Type = 2)
