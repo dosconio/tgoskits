@@ -239,38 +239,22 @@ impl VirtualApicRegs {
 
         let (idx, bitpos) = extract_index_and_bitpos_u32(vector);
 
-        // Upon receiving an EOI, the APIC clears the highest priority bit in the ISR
-        // and dispatches the next highest priority interrupt to the processor.
-
-        // VISR[Vector] := 0; (see Section 30.1.1 for definition of VISR)
         let mut isr = self.regs().ISR[idx].get();
         isr &= !(1 << bitpos);
         self.regs().ISR[idx].set(isr);
 
-        // IF any bits set in VISR
-        // THEN SVI := highest index of bit set in VISR
-        // ELSE SVI := 0;
         self.isrv = self.find_isrv();
 
-        // perform PPR virtualiation (see Section 30.1.3);
         self.update_ppr();
 
-        // The trigger mode register (TMR) indicates the trigger mode of the interrupt (see Figure 11-20).
-        // Upon acceptance of an interrupt into the IRR, the corresponding TMR bit is cleared for edge-triggered interrupts and set for leveltriggered interrupts.
-        // If a TMR bit is set when an EOI cycle for its corresponding interrupt vector is generated, an EOI message is sent to all I/O APICs.
-        // (see 11.8.4 Interrupt Acceptance for Fixed Interrupts)
-        if (self.regs().TMR[idx].get() as u32).bit(bitpos) {
-            // Send EOI to all I/O APICs
-            // Per Intel SDM 10.8.5, Software can inhibit the broadcast of
-            // EOI by setting bit 12 of the Spurious Interrupt Vector
-            // Register of the LAPIC.
-            // TODO: Check if the bit 12 "Suppress EOI Broadcasts" is set.
-            unimplemented!("vioapic_broadcast_eoi(vlapic2vcpu(vlapic)->vm, vector);")
+        if (self.regs().TMR[idx].get() as u32).bit(bitpos)
+            && let Some(vioapic) = x86_vioapic::GLOBAL_VIOAPIC.get()
+        {
+            vioapic.eoi(vector as u8);
+            debug!("[VLAPIC] EOI broadcast to IOAPIC, vector={:#x}", vector);
         }
 
         debug!("Gratuitous EOI vector: {vector:#010X}");
-
-        unimplemented!("vcpu_make_request(vlapic2vcpu(vlapic), ACRN_REQUEST_EVENT);")
     }
 
     /// Post an interrupt to the vcpu running on 'hostcpu'.

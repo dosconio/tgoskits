@@ -438,18 +438,11 @@ test-simple = { version = "0.3.4", path = "components/crate_interface/test_crate
 test-weak = { version = "0.3.4", path = "components/crate_interface/test_crates/test-weak" }
 test-weak-partial = { version = "0.3.4", path = "components/crate_interface/test_crates/test-weak-partial" }
 tg-xtask = { version = "0.5.11", path = "xtask" }
-<<<<<<< HEAD
 x86_vcpu = { version = "0.5.8", path = "components/x86_vcpu", default-features = false }
 x86_vlapic = { version = "0.4.9", path = "components/x86_vlapic" }
+x86_vioapic = { version = "0.1.0", path = "components/x86_vioapic" }
 page-table-generic = { version = "0.7.2", path = "components/page-table-generic" }
 someboot = { version = "0.1.15", path = "components/someboot" }
-=======
-x86_vcpu = { version = "0.5.6", path = "components/x86_vcpu", default-features = false }
-x86_vlapic = { version = "0.4.7", path = "components/x86_vlapic" }
-x86_vioapic = { version = "0.1.0", path = "components/x86_vioapic" }
-page-table-generic = { version = "0.7", path = "components/page-table-generic" }
-someboot = { version = "0.1", path = "components/someboot" }
->>>>>>> fcbf268c7 (stage4)
 some-serial = { version = "0.4.1", path = "drivers/serial/some-serial" }
 kernutil = { path = "components/kernutil", version = "0.2.2" }
 ranges-ext = { version = "0.6.4", path = "components/ranges-ext" }

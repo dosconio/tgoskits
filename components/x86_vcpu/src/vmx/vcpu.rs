@@ -60,13 +60,11 @@ struct PendingEvent {
 }
 use crate::{
     boot_mode::{X86BootMode, X86VCpuSetupConfig},
-    
     ept::GuestPageWalkInfo,
     msr::Msr,
     regs::GeneralRegisters,
     restore_host_interrupt_flag,
     xstate::XState,
-,
 };
 
 const VMX_PREEMPTION_TIMER_SET_VALUE: u32 = 1_000_000;
@@ -759,7 +757,8 @@ impl VmxVcpu {
 
         // Diagnostic: dump all VMX capability MSRs
         info!(
-            "[VMX MSR] TRUE_PINBASED={:#018x} TRUE_PROCBASED={:#018x} PROCBASED2={:#018x} TRUE_PROCBASED2={:#018x}",
+            "[VMX MSR] TRUE_PINBASED={:#018x} TRUE_PROCBASED={:#018x} PROCBASED2={:#018x} \
+             TRUE_PROCBASED2={:#018x}",
             Msr::IA32_VMX_TRUE_PINBASED_CTLS.read(),
             Msr::IA32_VMX_TRUE_PROCBASED_CTLS.read(),
             Msr::IA32_VMX_PROCBASED_CTLS2.read(),
@@ -814,7 +813,8 @@ impl VmxVcpu {
             VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.write(fixed)?;
             let actual = VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
             info!(
-                "[VMX control] Force-cleared UNCOND_IO_EXITING: {:#x} -> wrote {:#x}, read back {:#x}",
+                "[VMX control] Force-cleared UNCOND_IO_EXITING: {:#x} -> wrote {:#x}, read back \
+                 {:#x}",
                 prim_ctrl, fixed, actual
             );
         }
@@ -883,8 +883,8 @@ impl VmxVcpu {
                 }
             } else {
                 info!(
-                    "[VMX control] VMCS_SHADOWING is mandatory1 (allowed0={:#x}), \
-                     keeping it enabled, SEC_CTRL={:#x}",
+                    "[VMX control] VMCS_SHADOWING is mandatory1 (allowed0={:#x}), keeping it \
+                     enabled, SEC_CTRL={:#x}",
                     allowed0, sec_ctrl
                 );
             }
@@ -900,9 +900,16 @@ impl VmxVcpu {
         let vid_set = sec_ctrl & CpuCtrl2::VIRTUAL_INTERRUPT_DELIVERY.bits() != 0;
         let vmfunc_set = sec_ctrl & CpuCtrl2::ENABLE_VM_FUNCTIONS.bits() != 0;
         info!(
-            "[VMX control] SEC_CTRL={:#x}: APIC={}, x2APIC={}, APIC_REG={}, VID={}, \
-             PML={}, SHADOWING={}, VMFUNC={}",
-            sec_ctrl, apic_set, x2apic_set, apic_reg_set, vid_set, pml_set, shadowing_set, vmfunc_set
+            "[VMX control] SEC_CTRL={:#x}: APIC={}, x2APIC={}, APIC_REG={}, VID={}, PML={}, \
+             SHADOWING={}, VMFUNC={}",
+            sec_ctrl,
+            apic_set,
+            x2apic_set,
+            apic_reg_set,
+            vid_set,
+            pml_set,
+            shadowing_set,
+            vmfunc_set
         );
 
         // SDM 26.2.1.1: If "virtualize x2APIC mode" is 1, "virtualize APIC accesses" must be 1.
@@ -913,7 +920,8 @@ impl VmxVcpu {
             VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.write(fixed)?;
             let actual = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
             info!(
-                "[VMX control] Force-set VIRTUALIZE_APIC: SEC_CTRL {:#x} -> wrote {:#x}, read back {:#x}",
+                "[VMX control] Force-set VIRTUALIZE_APIC: SEC_CTRL {:#x} -> wrote {:#x}, read \
+                 back {:#x}",
                 sec_ctrl, fixed, actual
             );
         }
@@ -966,8 +974,7 @@ impl VmxVcpu {
         // EPTP-list page (even though the guest won't use VMFUNC).
         let vmfunc_ctrl: u64 = 1; // EPTP switching
         VmcsControl64::VM_FUNCTION_CONTROLS.write(vmfunc_ctrl)?;
-        VmcsControl64::EPTP_LIST_ADDR
-            .write(self.eptp_list_page.start_paddr().as_usize() as u64)?;
+        VmcsControl64::EPTP_LIST_ADDR.write(self.eptp_list_page.start_paddr().as_usize() as u64)?;
         info!(
             "[VMX control] VM_FUNCTION_CONTROLS={:#x}, EPTP_LIST_ADDR={:#x}",
             vmfunc_ctrl,
@@ -2145,14 +2152,23 @@ impl VmxVcpu {
                 const FEATURE_MCE: u32 = 1 << 7;
                 const FEATURE_TSC_DEADLINE: u32 = 1 << 24;
                 const FEATURE_MONITOR: u32 = 1 << 3;
-                let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
-                res.ecx &= !FEATURE_VMX;
-                res.ecx &= !FEATURE_TSC_DEADLINE;
-                res.ecx &= !FEATURE_MONITOR;
-                res.ecx |= FEATURE_HYPERVISOR;
-                res.edx &= !FEATURE_MCE;
-                res.ebx = 0x0001_0800; // BrandIndex=0, CLFLUSH=64B, MaxLogicalProc=1, APIC ID=0
-                res
+                if regs_clone.rcx > 0 {
+                    CpuIdResult {
+                        eax: 0,
+                        ebx: 0,
+                        ecx: 0,
+                        edx: 0,
+                    }
+                } else {
+                    let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
+                    res.ecx &= !FEATURE_VMX;
+                    res.ecx &= !FEATURE_TSC_DEADLINE;
+                    res.ecx &= !FEATURE_MONITOR;
+                    res.ecx |= FEATURE_HYPERVISOR;
+                    res.edx &= !FEATURE_MCE;
+                    res.ebx = 0x0001_0800; // BrandIndex=0, CLFLUSH=64B, MaxLogicalProc=1, APIC ID=0
+                    res
+                }
             }
             LEAF_CACHE_PARAMETERS => {
                 let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);

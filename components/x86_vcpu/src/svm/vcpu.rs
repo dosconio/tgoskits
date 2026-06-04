@@ -22,7 +22,10 @@ use super::{
     structs::{IOPm, MSRPm, VmcbFrame},
     vmcb::{InterceptCrRw, InterceptExceptions, NestedCtl, VmcbTlbControl, set_vmcb_segment},
 };
-use crate::{boot_mode::X86VCpuSetupConfig, msr::Msr, regs::GeneralRegisters, restore_host_interrupt_flag, xstate::XState};
+use crate::{
+    boot_mode::X86VCpuSetupConfig, msr::Msr, regs::GeneralRegisters, restore_host_interrupt_flag,
+    xstate::XState,
+};
 
 const QEMU_EXIT_PORT: u16 = 0x604;
 const QEMU_EXIT_MAGIC: u64 = 0x2000;

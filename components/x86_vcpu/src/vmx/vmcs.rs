@@ -661,6 +661,7 @@ pub struct ApicAccessExitInfo {
 }
 
 pub mod controls {
+    #[allow(unused_imports)]
     pub use x86::vmx::vmcs::control::{
         EntryControls, ExitControls, PinbasedControls, PrimaryControls, SecondaryControls,
     };
@@ -677,9 +678,7 @@ pub fn set_control(
     let allowed0 = cap as u32;
     let allowed1 = (cap >> 32) as u32;
     assert_eq!(allowed0 & allowed1, allowed0);
-    info!(
-        "set {control:?}: {old_value:#x} (+{set:#x}, -{clear:#x}) MSR=0x{cap:016x}"
-    );
+    info!("set {control:?}: {old_value:#x} (+{set:#x}, -{clear:#x}) MSR=0x{cap:016x}");
     if (set & clear) != 0 {
         return ax_err!(
             InvalidInput,

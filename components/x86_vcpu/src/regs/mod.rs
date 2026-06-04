@@ -78,6 +78,7 @@ impl GeneralRegisters {
 }
 
 #[cfg(feature = "vmx")]
+#[allow(unused_macros)]
 macro_rules! save_regs_to_stack {
     () => {
         "
@@ -101,6 +102,7 @@ macro_rules! save_regs_to_stack {
 }
 
 #[cfg(feature = "vmx")]
+#[allow(unused_macros)]
 macro_rules! restore_regs_from_stack {
     () => {
         "
