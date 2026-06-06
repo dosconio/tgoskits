@@ -11,7 +11,8 @@ lto = true
 rustflags = [
     "-Clink-args=-no-pie",
     "-Clink-args=-znostart-stop-gc",
-    "-Clink-args=-Tlink.x",
+    "-Clink-args=-znorelro",
+    "-Clink-args=-Tlinker.x",
 ]
 
 # Comment out because it's specified by runner in tgoskits

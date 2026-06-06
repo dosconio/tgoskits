@@ -370,6 +370,7 @@ impl BuildInfo {
             rustflags.push("-Clink-arg=-Tlinker.x".to_string());
             rustflags.push("-Clink-arg=-no-pie".to_string());
             rustflags.push("-Clink-arg=-znostart-stop-gc".to_string());
+            rustflags.push("-Clink-arg=-znorelro".to_string());
         }
 
         let mut rendered = format!("target.{target}.rustflags=[");

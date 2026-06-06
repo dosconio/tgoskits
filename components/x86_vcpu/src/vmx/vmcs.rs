@@ -697,7 +697,14 @@ pub fn set_control(
             format_args!("can not clear bits {:#x} in {:?}", clear, control)
         );
     }
-    let mandatory1 = !allowed0 & allowed1;
+    // mandatory1 = bits that must be 1 in the control field.
+    // Intel SDM Vol 3, Section 26.2.1:
+    // - Bits that are 1 in allowed0 are mandatory-1 (must be 1).
+    // - Bits that are 0 in allowed1 are mandatory-0 (must be 0).
+    // - Bits that are 1 in allowed1 but 0 in allowed0 are flexible (can be 0 or 1).
+    // Only allowed0 bits are truly mandatory-1. Flexible bits should be set
+    // explicitly via the `set` parameter, not implicitly via mandatory1.
+    let mandatory1 = allowed0;
     // Preserve bits from old_value that are not being explicitly set or cleared.
     // mandatory1 bits are always forced to 1, so they don't need preservation.
     let preserve_mask = !(set | clear | mandatory1);

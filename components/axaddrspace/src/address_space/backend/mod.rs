@@ -38,7 +38,7 @@ pub enum Backend<H: PagingHandler> {
     /// address `vaddr` is mapped to the physical address `vaddr - pa_va_offset`.
     Linear {
         /// `vaddr - paddr`.
-        pa_va_offset: usize,
+        pa_va_offset: isize,
     },
     /// Allocation mapping backend.
     ///

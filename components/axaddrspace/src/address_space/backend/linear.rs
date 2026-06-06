@@ -20,7 +20,7 @@ use crate::{GuestPhysAddr, npt::NestedPageTable as PageTable};
 
 impl<H: PagingHandler> Backend<H> {
     /// Creates a new linear mapping backend.
-    pub const fn new_linear(pa_va_offset: usize) -> Self {
+    pub const fn new_linear(pa_va_offset: isize) -> Self {
         Self::Linear { pa_va_offset }
     }
 
@@ -30,9 +30,9 @@ impl<H: PagingHandler> Backend<H> {
         size: usize,
         flags: MappingFlags,
         pt: &mut PageTable<H>,
-        pa_va_offset: usize,
+        pa_va_offset: isize,
     ) -> bool {
-        let pa_start = PhysAddr::from(start.as_usize() - pa_va_offset);
+        let pa_start = PhysAddr::from(start.as_usize().wrapping_add_signed(-pa_va_offset));
         debug!(
             "map_linear: [{:#x}, {:#x}) -> [{:#x}, {:#x}) {:?}",
             start,
@@ -43,7 +43,7 @@ impl<H: PagingHandler> Backend<H> {
         );
         pt.map_region(
             start,
-            |va| PhysAddr::from(va.as_usize() - pa_va_offset),
+            |va| PhysAddr::from(va.as_usize().wrapping_add_signed(-pa_va_offset)),
             size,
             flags,
             true,
@@ -56,7 +56,7 @@ impl<H: PagingHandler> Backend<H> {
         start: GuestPhysAddr,
         size: usize,
         pt: &mut PageTable<H>,
-        _pa_va_offset: usize,
+        _pa_va_offset: isize,
     ) -> bool {
         debug!("unmap_linear: [{:#x}, {:#x})", start, start + size);
         pt.unmap_region(start, size).is_ok()

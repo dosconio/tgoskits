@@ -277,8 +277,9 @@ impl VmxVcpu {
                     .write(&self.host_stack_top as *const _ as usize)
                     .unwrap();
 
-                let rip_val = self.entry.unwrap().as_usize();
-                VmcsGuestNW::RIP.write(rip_val).unwrap();
+                // RIP was already set correctly in setup_vmcs_guest().
+                // For UEFI mode, RIP must be 0xFFF0 (the IP offset within CS),
+                // not the linear address 0xFFFFFFF0.  Do not overwrite it here.
 
                 self.dump_vmcs_state();
 
@@ -512,6 +513,18 @@ impl VmxVcpu {
         Ok(())
     }
 
+    /// Handle NMI window VM-exit.
+    /// KVM nested virt sets NMI_WINDOW_EXITING when it has a pending virtual NMI
+    /// to inject and is waiting for the NMI window to open. When this exit fires,
+    /// the NMI window IS open, so KVM should deliver the NMI on the next VM-entry.
+    /// We simply resume execution — do NOT try to clear NMI_WINDOW_EXITING or
+    /// inject an NMI ourselves, as that conflicts with KVM's own NMI injection
+    /// and causes an infinite loop.
+    fn handle_nmi_window(&mut self) -> AxResult {
+        // No action needed. KVM will inject the pending NMI on the next VM-entry.
+        Ok(())
+    }
+
     /// Set I/O intercept by modifying I/O bitmap.
     pub fn set_io_intercept_of_range(&mut self, port_base: u32, count: u32, intercept: bool) {
         self.io_bitmap
@@ -667,7 +680,7 @@ impl VmxVcpu {
         set_guest_segment!(DS, 0x93);
         set_guest_segment!(FS, 0x93);
         set_guest_segment!(GS, 0x93);
-        set_guest_segment!(TR, 0x1008b); // unusable
+        set_guest_segment!(TR, 0x8b); // busy 32-bit TSS, present, usable
         set_guest_segment!(LDTR, 0x10082); // unusable
 
         // In UEFI mode, the OVMF firmware starts from the reset vector (0xFFFFFFF0).
@@ -691,14 +704,41 @@ impl VmxVcpu {
         VmcsGuestNW::RSP.write(0)?;
 
         {
-            let cr0_must0 = Msr::IA32_VMX_CR0_FIXED1.read()
+            let cr0_fixed0 = Msr::IA32_VMX_CR0_FIXED0.read();
+            let cr0_fixed1 = Msr::IA32_VMX_CR0_FIXED1.read();
+            let cr0_must0 = cr0_fixed1
                 & !(Cr0Flags::NOT_WRITE_THROUGH | Cr0Flags::CACHE_DISABLE).bits();
-            let cr0_must1 = Msr::IA32_VMX_CR0_FIXED0.read()
-                & !(Cr0Flags::PAGING | Cr0Flags::PROTECTED_MODE_ENABLE).bits();
-            VmcsGuestNW::CR0.write(cr0_must1 as usize)?;
+            // When UNRESTRICTED_GUEST is set, CR0.PE and CR0.PG may be 0
+            // regardless of CR0_FIXED0 (Intel SDM Vol 3, Section 26.3.1.1).
+            // For UEFI boot, we want the guest to start in real mode (PE=0, PG=0)
+            // so OVMF can handle mode transitions itself.
+            // NOTE: We read the MSR directly instead of VMCS SEC_CTRL because
+            // setup_vmcs_control() hasn't been called yet, so the VMCS field is 0.
+            let sec2_cap = Msr::IA32_VMX_PROCBASED_CTLS2.read();
+            // allowed1 is in the high 32 bits; bit 7 = UNRESTRICTED_GUEST
+            let unrestricted_guest = ((sec2_cap >> 32) >> 7) & 1 != 0;
+            let cr0_must1 = if unrestricted_guest {
+                // UNRESTRICTED_GUEST is set: PE and PG can be 0
+                cr0_fixed0 as usize
+                    & !(Cr0Flags::PAGING | Cr0Flags::PROTECTED_MODE_ENABLE
+                        | Cr0Flags::NOT_WRITE_THROUGH
+                        | Cr0Flags::CACHE_DISABLE)
+                        .bits() as usize
+            } else if (cr0_fixed0
+                & (Cr0Flags::PROTECTED_MODE_ENABLE | Cr0Flags::PAGING).bits())
+                == (Cr0Flags::PROTECTED_MODE_ENABLE | Cr0Flags::PAGING).bits()
+            {
+                // CR0_FIXED0 forces PE+PG and no UNRESTRICTED_GUEST: include them
+                cr0_fixed0 as usize
+                    & !(Cr0Flags::NOT_WRITE_THROUGH | Cr0Flags::CACHE_DISABLE).bits() as usize
+            } else {
+                cr0_fixed0 as usize
+                    & !(Cr0Flags::PAGING | Cr0Flags::PROTECTED_MODE_ENABLE).bits() as usize
+            };
+            VmcsGuestNW::CR0.write(cr0_must1)?;
             info!(
-                "[VMX setup] GUEST_CR0={:#x} (must0={:#x}, must1={:#x})",
-                cr0_must1, cr0_must0, cr0_must1
+                "[VMX setup] GUEST_CR0={:#x} (must0={:#x}, must1={:#x}, fixed0={:#x}, unrestricted_guest={})",
+                cr0_must1, cr0_must0, cr0_must1, cr0_fixed0, unrestricted_guest
             );
         }
 
@@ -714,11 +754,11 @@ impl VmxVcpu {
             );
         }
         // In UEFI mode, the guest starts in real mode at the reset vector.
-        // RIP is set to the reset vector address (0xFFFFFFF0).
-        // In real mode, only the lower 16 bits (IP=0xFFF0) are used;
-        // the physical address is CS.base(0xFFFF0000) + IP(0xFFF0) = 0xFFFFFFF0.
+        // In VMX, RIP stores the offset within the code segment; the linear
+        // address is CS.base + RIP.  The x86 reset state has CS.base=0xFFFF0000
+        // and IP=0xFFF0, so linear address = 0xFFFF0000 + 0xFFF0 = 0xFFFFFFF0.
         let rip_val = if boot_mode == X86BootMode::Uefi {
-            0xFFFFFFF0usize
+            0xFFF0usize
         } else {
             entry.as_usize()
         };
@@ -770,8 +810,12 @@ impl VmxVcpu {
             Msr::IA32_VMX_TRUE_ENTRY_CTLS.read(),
         );
         info!(
-            "[VMX MSR] PROCBASED={:#018x} (non-TRUE for comparison)",
+            "[VMX MSR] PROCBASED={:#018x} PINBASED={:#018x} EXIT={:#018x} ENTRY={:#018x} \
+             (non-TRUE)",
             Msr::IA32_VMX_PROCBASED_CTLS.read(),
+            Msr::IA32_VMX_PINBASED_CTLS.read(),
+            Msr::IA32_VMX_EXIT_CTLS.read(),
+            Msr::IA32_VMX_ENTRY_CTLS.read(),
         );
 
         vmcs::set_control(
@@ -781,41 +825,96 @@ impl VmxVcpu {
             (PinCtrl::NMI_EXITING | PinCtrl::EXTERNAL_INTERRUPT_EXITING).bits(),
             0,
         )?;
+        let pin_ctrl = VmcsControl32::PINBASED_EXEC_CONTROLS.read()?;
+        info!("[VMX control] PIN_CTRL={:#x}", pin_ctrl);
 
         // Intercept all I/O instructions, use MSR bitmaps, activate secondary controls,
-        // disable CR3 load/store interception, intercept HLT for UEFI wait loops.
+        // intercept HLT for UEFI wait loops.
+        // KVM nested virtualization forces both UNCOND_IO_EXITING (bit 24) and
+        // USE_IO_BITMAPS (bit 25) as mandatory1, but the SDM mutual-exclusion rule
+        // (SDM 26.2.1.1) prohibits both being 1 together. We clear USE_IO_BITMAPS
+        // and keep UNCOND_IO_EXITING since unconditional I/O exiting makes the I/O
+        // bitmap irrelevant anyway.
         use PrimaryControls as CpuCtrl;
-        vmcs::set_control(
-            VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS,
-            Msr::IA32_VMX_TRUE_PROCBASED_CTLS,
-            VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?,
-            (CpuCtrl::USE_IO_BITMAPS
+        const USE_IO_BITMAPS_BIT: u32 = 1 << 25;
+        const UNCOND_IO_EXITING_BIT: u32 = 1 << 24;
+        {
+            let cap = Msr::IA32_VMX_PROCBASED_CTLS.read();
+            let allowed0 = cap as u32;
+            let allowed1 = (cap >> 32) as u32;
+            let mandatory1 = allowed0;
+            let set_bits = (CpuCtrl::UNCOND_IO_EXITING
                 | CpuCtrl::USE_MSR_BITMAPS
                 | CpuCtrl::SECONDARY_CONTROLS
                 | CpuCtrl::HLT_EXITING)
-                .bits(),
-            0,
-        )?;
-
-        // SDM 26.2.1.1: If "use I/O bitmaps" is 1, "unconditional I/O exiting" must be 0.
-        // Both are mandatory1 per MSR, but they are mutually exclusive.
-        // Force-clear UNCOND_IO_EXITING by directly writing the VMCS field,
-        // bypassing set_control to resolve the cross-dependency conflict.
-        let prim_ctrl = VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
-        let io_bitmaps = prim_ctrl & CpuCtrl::USE_IO_BITMAPS.bits() != 0;
-        let uncond_io = prim_ctrl & CpuCtrl::UNCOND_IO_EXITING.bits() != 0;
-        info!(
-            "[VMX control] PRIM_CTRL={:#x}: IO_BITMAPS={}, UNCOND_IO={}",
-            prim_ctrl, io_bitmaps, uncond_io
-        );
-        if io_bitmaps && uncond_io {
-            let fixed = prim_ctrl & !CpuCtrl::UNCOND_IO_EXITING.bits();
-            VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.write(fixed)?;
-            let actual = VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
+                .bits();
+            let old_prim =
+                VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
+            let new_prim = old_prim | mandatory1 | set_bits;
+            // Resolve USE_IO_BITMAPS vs UNCOND_IO_EXITING conflict (SDM 26.2.1.1).
+            // SDM: If USE_IO_BITMAPS=1, UNCOND_IO_EXITING must be 0.
+            // KVM nested virt may force both as mandatory1 via MSR, but the
+            // hardware VM-entry check enforces the SDM mutual-exclusion rule.
+            // We try to clear USE_IO_BITMAPS first (UNCOND_IO_EXITING already
+            // covers all I/O), then UNCOND_IO_EXITING as fallback.
+            let mut prim_to_write = new_prim;
+            if (prim_to_write & USE_IO_BITMAPS_BIT) != 0
+                && (prim_to_write & UNCOND_IO_EXITING_BIT) != 0
+            {
+                info!(
+                    "[VMX control] USE_IO_BITMAPS and UNCOND_IO_EXITING conflict (SDM 26.2.1.1)"
+                );
+                // Try clearing USE_IO_BITMAPS first (UNCOND_IO_EXITING covers all I/O).
+                let try_prim = prim_to_write & !USE_IO_BITMAPS_BIT;
+                VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.write(try_prim)?;
+                let actual =
+                    VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
+                if actual & USE_IO_BITMAPS_BIT == 0 {
+                    prim_to_write = actual;
+                    info!(
+                        "[VMX control] Cleared USE_IO_BITMAPS, PRIM_CTRL={:#x}",
+                        actual
+                    );
+                } else {
+                    // USE_IO_BITMAPS is truly mandatory1, try clearing UNCOND_IO_EXITING.
+                    info!(
+                        "[VMX control] USE_IO_BITMAPS is mandatory1 (read back={:#x}), \
+                         trying to clear UNCOND_IO_EXITING",
+                        actual
+                    );
+                    let try_prim = prim_to_write & !UNCOND_IO_EXITING_BIT;
+                    VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.write(try_prim)?;
+                    let actual =
+                        VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
+                    if actual & UNCOND_IO_EXITING_BIT == 0 {
+                        prim_to_write = actual;
+                        info!(
+                            "[VMX control] Cleared UNCOND_IO_EXITING, PRIM_CTRL={:#x}",
+                            actual
+                        );
+                    } else {
+                        // Both are truly mandatory1. This is a KVM nesting bug.
+                        // Write the original value and hope for the best.
+                        prim_to_write = new_prim;
+                        info!(
+                            "[VMX control] Both USE_IO_BITMAPS and UNCOND_IO_EXITING are \
+                             truly mandatory1 (KVM nesting limitation), PRIM_CTRL={:#x}",
+                            actual
+                        );
+                    }
+                }
+            }
             info!(
-                "[VMX control] Force-cleared UNCOND_IO_EXITING: {:#x} -> wrote {:#x}, read back \
-                 {:#x}",
-                prim_ctrl, fixed, actual
+                "[VMX control] Direct PRIM_CTRL write: allowed0={:#x}, allowed1={:#x}, \
+                 mandatory1={:#x}, old={:#x}, set={:#x}, final={:#x}",
+                allowed0, allowed1, mandatory1, old_prim, set_bits, prim_to_write
+            );
+            VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.write(prim_to_write)?;
+            let actual =
+                VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
+            info!(
+                "[VMX control] Direct PRIM_CTRL read back: {:#x} (wrote {:#x})",
+                actual, prim_to_write
             );
         }
 
@@ -842,17 +941,34 @@ impl VmxVcpu {
         {
             set_bits |= CpuCtrl2::ENABLE_XSAVES_XRSTORS.bits();
         }
+        // Use the non-TRUE PROCBASED2 MSR (IA32_VMX_PROCBASED_CTLS2) because
+        // KVM nested virtualization reports unreliable TRUE_PROCBASED2 values.
+        // Do NOT apply MSR-reported mandatory1 to the direct write. The MSR
+        // may report conflicting bits as mandatory1 (e.g., both APIC_REGISTER
+        // and x2APIC forced to 1, which violates SDM 26.2.1.1). The hardware
+        // silently enforces the true must-be-1/must-be-0 bits regardless of
+        // what we write, so we write only our desired bits and let the hardware
+        // resolve the actual mandatory bits.
+        let cap = Msr::IA32_VMX_PROCBASED_CTLS2.read();
+        let allowed0 = cap as u32;
+        let allowed1 = (cap >> 32) as u32;
+        let msr_mandatory1 = !allowed0 & allowed1;
         let old_sec = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+        // Write only our desired bits; hardware will set/clear its own mandatory bits.
         let new_sec = old_sec | set_bits;
         info!(
-            "[VMX control] Direct SEC_CTRL write: old={:#x}, set={:#x}, new={:#x}",
-            old_sec, set_bits, new_sec
+            "[VMX control] Direct SEC_CTRL write: allowed0={:#x}, allowed1={:#x}, \
+             msr_mandatory1={:#x}, old={:#x}, set={:#x}, new={:#x}",
+            allowed0, allowed1, msr_mandatory1, old_sec, set_bits, new_sec
         );
         VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.write(new_sec)?;
         let actual = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+        let hw_mandatory1 = actual & !new_sec;
+        let hw_mandatory0 = new_sec & !actual;
         info!(
-            "[VMX control] Direct SEC_CTRL read back: {:#x} (wrote {:#x})",
-            actual, new_sec
+            "[VMX control] Direct SEC_CTRL read back: {:#x} (wrote {:#x}) \
+             hw_forced1={:#x} hw_forced0={:#x}",
+            actual, new_sec, hw_mandatory1, hw_mandatory0
         );
 
         // VMCS_SHADOWING (bit 14) requires LINK_PTR to point to a valid shadow
@@ -913,17 +1029,57 @@ impl VmxVcpu {
         );
 
         // SDM 26.2.1.1: If "virtualize x2APIC mode" is 1, "virtualize APIC accesses" must be 1.
-        // force-set VIRTUALIZE_APIC to satisfy the cross-dependency.
+        // On KVM nested virtualization, both APIC and x2APIC may be forced as mandatory1.
+        // Try to set VIRTUALIZE_APIC to satisfy the SDM dependency. If KVM rejects it,
+        // the VM-entry will fail with a more specific error.
         if x2apic_set && !apic_set {
-            let sec_ctrl = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
-            let fixed = sec_ctrl | CpuCtrl2::VIRTUALIZE_APIC.bits();
-            VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.write(fixed)?;
+            info!(
+                "[VMX control] x2APIC set but APIC not set - attempting to force-set APIC, \
+                 SEC_CTRL={:#x}",
+                sec_ctrl
+            );
+            let new_sec = sec_ctrl | CpuCtrl2::VIRTUALIZE_APIC.bits();
+            VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.write(new_sec)?;
             let actual = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
             info!(
-                "[VMX control] Force-set VIRTUALIZE_APIC: SEC_CTRL {:#x} -> wrote {:#x}, read \
-                 back {:#x}",
-                sec_ctrl, fixed, actual
+                "[VMX control] After force-setting APIC: wrote={:#x}, read={:#x}",
+                new_sec, actual
             );
+        }
+
+        // SDM 26.2.1.1: If "APIC-register virtualization" is 1, "virtualize x2APIC mode"
+        // must be 0. KVM nested virtualization forces both as mandatory1, creating a
+        // conflict. Try to clear x2APIC first, then APIC-register virtualization.
+        let sec_ctrl = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+        let x2apic_set = sec_ctrl & CpuCtrl2::VIRTUALIZE_X2APIC.bits() != 0;
+        let apic_reg_set = sec_ctrl & CpuCtrl2::VIRTUALIZE_APIC_REGISTER.bits() != 0;
+        if x2apic_set && apic_reg_set {
+            info!(
+                "[VMX control] APIC_REG=1 and x2APIC=1 conflict (SDM 26.2.1.1) - attempting to \
+                 clear x2APIC, SEC_CTRL={:#x}",
+                sec_ctrl
+            );
+            let new_sec = sec_ctrl & !CpuCtrl2::VIRTUALIZE_X2APIC.bits();
+            VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.write(new_sec)?;
+            let actual = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+            let x2apic_cleared = actual & CpuCtrl2::VIRTUALIZE_X2APIC.bits() == 0;
+            info!(
+                "[VMX control] After clearing x2APIC: wrote={:#x}, read={:#x}, cleared={}",
+                new_sec, actual, x2apic_cleared
+            );
+            if !x2apic_cleared {
+                info!(
+                    "[VMX control] x2APIC could not be cleared - trying to clear \
+                     APIC-register virtualization instead"
+                );
+                let new_sec = sec_ctrl & !CpuCtrl2::VIRTUALIZE_APIC_REGISTER.bits();
+                VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.write(new_sec)?;
+                let actual = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+                info!(
+                    "[VMX control] After clearing APIC_REG: wrote={:#x}, read={:#x}",
+                    new_sec, actual
+                );
+            }
         }
 
         // SDM 26.2.1.1: If "enable VM functions" is 1, VM-function controls must be non-zero.
@@ -937,14 +1093,12 @@ impl VmxVcpu {
             );
         }
 
-        // Write the (potentially unchanged) value back. Since we removed all
-        // force-clearing of mandatory1 bits, this is normally a no-op.
-        // Kept for diagnostic consistency: re-read to confirm the actual VMCS value.
-        VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.write(sec_ctrl)?;
-        let actual = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+        // Re-read SEC_CTRL after all fixups to get the final hardware-accepted value.
+        let sec_ctrl = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+        let actual = sec_ctrl;
         info!(
-            "[VMX control] Final SEC_CTRL={:#x} (wrote {:#x})",
-            actual, sec_ctrl
+            "[VMX control] Final SEC_CTRL={:#x}",
+            actual
         );
 
         // SDM 26.2.1.1: If VMCS_SHADOWING is 1, LINK_PTR must point to a valid shadow VMCS.
@@ -982,11 +1136,12 @@ impl VmxVcpu {
         );
 
         // Switch to 64-bit host, acknowledge interrupt info, switch IA32_PAT/IA32_EFER on VM exit.
+        // Use TRUE MSR to avoid conditional mandatory-1 bits.
         use ExitControls as ExitCtrl;
         vmcs::set_control(
             VmcsControl32::VMEXIT_CONTROLS,
             Msr::IA32_VMX_TRUE_EXIT_CTLS,
-            0,
+            VmcsControl32::VMEXIT_CONTROLS.read()?,
             (ExitCtrl::HOST_ADDRESS_SPACE_SIZE
                 | ExitCtrl::ACK_INTERRUPT_ON_EXIT
                 | ExitCtrl::SAVE_IA32_PAT
@@ -998,13 +1153,41 @@ impl VmxVcpu {
         )?;
 
         use EntryControls as EntryCtrl;
-        vmcs::set_control(
-            VmcsControl32::VMENTRY_CONTROLS,
-            Msr::IA32_VMX_TRUE_ENTRY_CTLS,
-            0,
-            (EntryCtrl::LOAD_IA32_PAT | EntryCtrl::LOAD_IA32_EFER).bits(),
-            0,
-        )?;
+        // Use direct write for VMENTRY_CONTROLS.
+        // Use the TRUE MSR to avoid conditional mandatory-1 bits.
+        // When UNRESTRICTED_GUEST is set, clear IA32E_MODE_GUEST so the guest
+        // can start in real mode and OVMF handles mode transitions itself.
+        {
+            let entry_cap = Msr::IA32_VMX_TRUE_ENTRY_CTLS.read();
+            let entry_allowed0 = entry_cap as u32;
+            let entry_allowed1 = (entry_cap >> 32) as u32;
+            let entry_mandatory1 = entry_allowed0;
+            let old_entry = VmcsControl32::VMENTRY_CONTROLS.read()?;
+            let desired_entry_bits =
+                (EntryCtrl::LOAD_IA32_PAT | EntryCtrl::LOAD_IA32_EFER).bits();
+            let sec_ctrl = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+            let unrestricted_guest = (sec_ctrl >> 7) & 1 != 0;
+            // Clear IA32E_MODE_GUEST if UNRESTRICTED_GUEST is set
+            let ia32e_bit = EntryCtrl::IA32E_MODE_GUEST.bits();
+            let clear_mask = if unrestricted_guest { ia32e_bit } else { 0 };
+            let new_entry = (old_entry | entry_mandatory1 | desired_entry_bits) & !clear_mask;
+            info!(
+                "[VMX control] Direct ENTRY_CTRL write: allowed0={:#x}, allowed1={:#x}, \
+                 mandatory1={:#x}, old={:#x}, set={:#x}, new={:#x}",
+                entry_allowed0, entry_allowed1, entry_mandatory1,
+                old_entry, desired_entry_bits, new_entry
+            );
+            VmcsControl32::VMENTRY_CONTROLS.write(new_entry)?;
+            let actual_entry = VmcsControl32::VMENTRY_CONTROLS.read()?;
+            let entry_hw_forced1 = actual_entry & !new_entry;
+            let entry_hw_forced0 = new_entry & !actual_entry;
+            let ia32e_forced = actual_entry & EntryCtrl::IA32E_MODE_GUEST.bits() != 0;
+            info!(
+                "[VMX control] Direct ENTRY_CTRL read back: {:#x} (wrote {:#x}) \
+                 hw_forced1={:#x} hw_forced0={:#x} IA32E_MODE_GUEST={}",
+                actual_entry, new_entry, entry_hw_forced1, entry_hw_forced0, ia32e_forced
+            );
+        }
 
         vmcs::set_ept_pointer(ept_root)?;
 
@@ -1017,12 +1200,22 @@ impl VmxVcpu {
             let cr0_fixed0 = Msr::IA32_VMX_CR0_FIXED0.read();
             let cr0_fixed1 = Msr::IA32_VMX_CR0_FIXED1.read();
             let cr0_flex = !cr0_fixed0 & cr0_fixed1;
-            let cr0_mask = cr0_flex | cr0_fixed0;
+            let mut cr0_mask = cr0_flex | cr0_fixed0;
+            // When UNRESTRICTED_GUEST is set, PE and PG are not forced by
+            // CR0_FIXED0 (Intel SDM Vol 3, Section 26.3.1.1). Exclude them
+            // from the CR0 guest/host mask so the guest can modify these bits
+            // without causing VM-exits, and the reconciliation code won't
+            // force them to match the host.
+            let sec_ctrl = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+            let unrestricted_guest = (sec_ctrl >> 7) & 1 != 0;
+            if unrestricted_guest {
+                cr0_mask &= !(Cr0Flags::PAGING | Cr0Flags::PROTECTED_MODE_ENABLE).bits();
+            }
             VmcsControlNW::CR0_GUEST_HOST_MASK.write(cr0_mask as usize)?;
             VmcsControlNW::CR0_READ_SHADOW.write(VmcsGuestNW::CR0.read()?)?;
             info!(
-                "[VMX control] CR0_MASK={:#x} (fixed0={:#x} fixed1={:#x} flex={:#x})",
-                cr0_mask, cr0_fixed0, cr0_fixed1, cr0_flex
+                "[VMX control] CR0_MASK={:#x} (fixed0={:#x} fixed1={:#x} flex={:#x} unrestricted_guest={})",
+                cr0_mask, cr0_fixed0, cr0_fixed1, cr0_flex, unrestricted_guest
             );
         }
         {
@@ -1037,10 +1230,40 @@ impl VmxVcpu {
                 cr4_mask, cr4_fixed0, cr4_fixed1, cr4_flex
             );
         }
+        // KVM nested virtualization may force CR0/CR4 mask bits that require
+        // guest and host CR0/CR4 to match. Read back the actual mask values
+        // written by hardware and reconcile guest CR0/CR4 with host.
+        let cr0_mask_actual = VmcsControlNW::CR0_GUEST_HOST_MASK.read()?;
+        let cr4_mask_actual = VmcsControlNW::CR4_GUEST_HOST_MASK.read()?;
+        let host_cr0 = VmcsHostNW::CR0.read()?;
+        let host_cr4 = VmcsHostNW::CR4.read()?;
+        let mut guest_cr0 = VmcsGuestNW::CR0.read()?;
+        let mut guest_cr4 = VmcsGuestNW::CR4.read()?;
+        let cr0_changed = (guest_cr0 & cr0_mask_actual) != (host_cr0 & cr0_mask_actual);
+        let cr4_changed = (guest_cr4 & cr4_mask_actual) != (host_cr4 & cr4_mask_actual);
+        if cr0_changed {
+            guest_cr0 =
+                (host_cr0 & cr0_mask_actual) | (guest_cr0 & !cr0_mask_actual);
+            VmcsGuestNW::CR0.write(guest_cr0)?;
+            VmcsControlNW::CR0_READ_SHADOW.write(guest_cr0)?;
+        }
+        if cr4_changed {
+            guest_cr4 =
+                (host_cr4 & cr4_mask_actual) | (guest_cr4 & !cr4_mask_actual);
+            VmcsGuestNW::CR4.write(guest_cr4)?;
+            VmcsControlNW::CR4_READ_SHADOW.write(guest_cr4)?;
+        }
         info!(
-            "[VMX control] CR0_READ_SHADOW={:#x} CR4_READ_SHADOW={:#x}",
-            VmcsControlNW::CR0_READ_SHADOW.read().unwrap_or(0),
-            VmcsControlNW::CR4_READ_SHADOW.read().unwrap_or(0),
+            "[VMX control] CR0_MASK_actual={:#x} CR4_MASK_actual={:#x} \
+             CR0 guest{}/host{} CR4 guest{}/host{} reconcile_cr0={} reconcile_cr4={}",
+            cr0_mask_actual,
+            cr4_mask_actual,
+            VmcsGuestNW::CR0.read().unwrap_or(0),
+            host_cr0,
+            VmcsGuestNW::CR4.read().unwrap_or(0),
+            host_cr4,
+            cr0_changed,
+            cr4_changed,
         );
         VmcsControl32::CR3_TARGET_COUNT.write(0)?;
 
@@ -1080,14 +1303,58 @@ impl VmxVcpu {
         Ok(())
     }
 
-    /// After `setup_vmcs_control` has set VMENTRY_CONTROLS (which may include
-    /// IA32E_MODE_GUEST forced by MSR mandatory1), adjust guest CR0/EFER/CS to
-    /// satisfy the Intel SDM VM-entry checks for IA-32e mode:
-    ///   CR0.PG = 1, CR4.PAE = 1, EFER.LME = 1, CS.L = 1
+    /// After `setup_vmcs_control` has set VMENTRY_CONTROLS, adjust guest
+    /// CR0/EFER/CS to satisfy VM-entry checks.
+    ///
+    /// If IA32E_MODE_GUEST is already set in VMENTRY_CONTROLS, ensure the
+    /// guest state matches (CR0.PG=1, CR4.PAE=1, EFER.LME=1, CS.L=1).
+    ///
+    /// If CR0_FIXED0 forces PE+PG (common under KVM nested virtualization)
+    /// and UNRESTRICTED_GUEST is NOT set, the guest cannot start in real mode.
+    /// In that case, force IA32E_MODE_GUEST=1 and set up long-mode guest state.
+    ///
+    /// If UNRESTRICTED_GUEST is set, CR0.PE and CR0.PG may be 0 regardless
+    /// of CR0_FIXED0 (Intel SDM Vol 3, Section 26.3.1.1), so the guest can
+    /// start in real mode and OVMF handles mode transitions itself.
     fn fixup_ia32e_guest_cr_and_efer(&mut self) -> AxResult {
         use super::vmcs::controls::*;
         let entry_ctrl = VmcsControl32::VMENTRY_CONTROLS.read()?;
-        if entry_ctrl & EntryControls::IA32E_MODE_GUEST.bits() != 0 {
+        let mut need_ia32e = entry_ctrl & EntryControls::IA32E_MODE_GUEST.bits() != 0;
+
+        // Check if UNRESTRICTED_GUEST is set - if so, guest can run with PE=0/PG=0
+        let sec_ctrl = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+        let unrestricted_guest = (sec_ctrl >> 7) & 1 != 0;
+
+        // Check if CR0_FIXED0 forces PE+PG, which prevents real-mode guest.
+        let cr0_fixed0 = Msr::IA32_VMX_CR0_FIXED0.read();
+        let cr0_fixed0_forces_pe_pg = (cr0_fixed0
+            & (Cr0Flags::PROTECTED_MODE_ENABLE | Cr0Flags::PAGING).bits())
+            == (Cr0Flags::PROTECTED_MODE_ENABLE | Cr0Flags::PAGING).bits();
+
+        if cr0_fixed0_forces_pe_pg && !need_ia32e && !unrestricted_guest {
+            // CR0_FIXED0 forces PE+PG: guest must be in paged protected mode.
+            // With PG=1 and CR4.PAE=1, Intel SDM requires EFER.LME=1 if
+            // IA32E_MODE_GUEST=1, or 32-bit PAE paging if IA32E_MODE_GUEST=0.
+            // However, KVM nested virt may reject 32-bit PAE paging guests.
+            // Force IA32E_MODE_GUEST=1 for maximum compatibility.
+            let new_entry = entry_ctrl | EntryControls::IA32E_MODE_GUEST.bits();
+            VmcsControl32::VMENTRY_CONTROLS.write(new_entry)?;
+            let actual_entry = VmcsControl32::VMENTRY_CONTROLS.read()?;
+            if actual_entry & EntryControls::IA32E_MODE_GUEST.bits() != 0 {
+                need_ia32e = true;
+                info!(
+                    "[VMX setup] CR0_FIXED0 forces PE+PG, forced IA32E_MODE_GUEST: entry {:#x} -> {:#x}",
+                    entry_ctrl, actual_entry
+                );
+            } else {
+                warn!(
+                    "[VMX setup] CR0_FIXED0 forces PE+PG but IA32E_MODE_GUEST write rejected: {:#x}",
+                    actual_entry
+                );
+            }
+        }
+
+        if need_ia32e {
             let mut cr0 = VmcsGuestNW::CR0.read()?;
             cr0 |= (Cr0Flags::PROTECTED_MODE_ENABLE | Cr0Flags::PAGING).bits() as usize;
             VmcsGuestNW::CR0.write(cr0)?;
@@ -1095,9 +1362,15 @@ impl VmxVcpu {
             efer |= EferFlags::LONG_MODE_ENABLE.bits();
             efer |= MSR_IA32_EFER_LMA_BIT; // SDM: LMA must equal IA32E_MODE_GUEST
             VmcsGuest64::IA32_EFER.write(efer)?;
-            let mut cs_ar = VmcsGuest32::CS_ACCESS_RIGHTS.read()?;
-            cs_ar |= 1 << 13; // L (long mode) bit
+            // Set CS to 64-bit code segment: L=1, D=0
+            // VMCS access rights: bit13=L, bit14=D, bits 11:8 must be 0
+            let cs_ar = 0x209b; // L=1(bit13), D=0, present, code, exec/read, accessed
             VmcsGuest32::CS_ACCESS_RIGHTS.write(cs_ar)?;
+            // In IA-32e mode, CS base must be 0 to avoid non-canonical linear addresses.
+            // The original CS_BASE=0xFFFF0000 would cause RIP+CS_BASE to overflow
+            // into non-canonical address space (e.g., 0xFFFFFFF0 + 0xFFFF0000 = 0x1FFFEFFFF0).
+            VmcsGuestNW::CS_BASE.write(0)?;
+            VmcsGuest32::CS_LIMIT.write(0xffffffff)?;
             // IA32E_MODE_GUEST requires TR to be a busy TSS (SDM 26.3.1.2)
             let tr_ar = VmcsGuest32::TR_ACCESS_RIGHTS.read()?;
             if tr_ar & (1 << 16) != 0 {
@@ -1556,6 +1829,7 @@ impl VmxVcpu {
         // - cr access: just panic;
         match exit_info.exit_reason {
             VmxExitReason::INTERRUPT_WINDOW => Some(self.set_interrupt_window(false)),
+            VmxExitReason::NMI_WINDOW => Some(self.handle_nmi_window()),
             VmxExitReason::PREEMPTION_TIMER => Some(self.handle_vmx_preemption_timer()),
             VmxExitReason::XSETBV => Some(self.handle_xsetbv()),
             VmxExitReason::CR_ACCESS => Some(self.handle_cr()),
@@ -1604,7 +1878,11 @@ impl VmxVcpu {
                     }
                     if (0xFEE0_0000..0xFEE0_1000).contains(&gpa) {
                         Some(self.handle_apic_mmio_ept_violation())
-                    } else if (0x8000_0000..0xC000_0000).contains(&gpa) {
+                    // PCI MMIO window: 0x8000_0000..0xFEC0_0000 covers the full 32-bit
+                    // addressable PCI BAR space.  OVMF allocates BARs above 0xC000_0000,
+                    // so the range must extend past 0xC000_0000 up to the APIC/IOAPIC
+                    // region at 0xFEC0_0000.
+                    } else if (0x8000_0000..0xFEC0_0000).contains(&gpa) {
                         Some(self.handle_pci_mmio_ept_violation())
                     } else {
                         None
@@ -2073,7 +2351,7 @@ impl VmxVcpu {
                 } else {
                     self.guest_regs.get_reg_of_index(reg)
                 };
-                if cr == 0 || cr == 4 {
+                if cr == 0 || cr == 4 || cr == 3 {
                     let rip_before = self.rip();
                     info!(
                         "[CR{}] write val={:#x}, RIP before={:#x}, instr_len={}",
@@ -2117,6 +2395,13 @@ impl VmxVcpu {
                     return Ok(());
                 }
             }
+            // move from cr
+            1 => {
+                let val = self.cr(cr as usize) as u64;
+                self.guest_regs.set_reg_of_index(reg, val);
+                self.advance_rip(instr_len)?;
+                return Ok(());
+            }
             _ => {}
         };
 
@@ -2152,23 +2437,15 @@ impl VmxVcpu {
                 const FEATURE_MCE: u32 = 1 << 7;
                 const FEATURE_TSC_DEADLINE: u32 = 1 << 24;
                 const FEATURE_MONITOR: u32 = 1 << 3;
-                if regs_clone.rcx > 0 {
-                    CpuIdResult {
-                        eax: 0,
-                        ebx: 0,
-                        ecx: 0,
-                        edx: 0,
-                    }
-                } else {
-                    let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
-                    res.ecx &= !FEATURE_VMX;
-                    res.ecx &= !FEATURE_TSC_DEADLINE;
-                    res.ecx &= !FEATURE_MONITOR;
-                    res.ecx |= FEATURE_HYPERVISOR;
-                    res.edx &= !FEATURE_MCE;
-                    res.ebx = 0x0001_0800; // BrandIndex=0, CLFLUSH=64B, MaxLogicalProc=1, APIC ID=0
-                    res
-                }
+                // Leaf 0x1 does not use sub-leaves; ignore ECX input.
+                let mut res = cpuid!(regs_clone.rax, 0);
+                res.ecx &= !FEATURE_VMX;
+                res.ecx &= !FEATURE_TSC_DEADLINE;
+                res.ecx &= !FEATURE_MONITOR;
+                res.ecx |= FEATURE_HYPERVISOR;
+                res.edx &= !FEATURE_MCE;
+                res.ebx = 0x0001_0800; // BrandIndex=0, CLFLUSH=64B, MaxLogicalProc=1, APIC ID=0
+                res
             }
             LEAF_CACHE_PARAMETERS => {
                 let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
