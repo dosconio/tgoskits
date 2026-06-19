@@ -121,18 +121,33 @@ impl GlobalAllocator {
                 self.usages.lock().alloc(UsageKind::RustHeap, layout.size());
                 return Ok(ptr);
             } else {
-                let old_size = balloc.total_bytes();
-                let expand_size = old_size
-                    .max(layout.size())
-                    .next_power_of_two()
-                    .max(PAGE_SIZE);
+                // Account for alignment overhead: the byte allocator may need up to
+                // (align - 1) extra bytes to satisfy the alignment requirement within
+                // the newly added pool.
+                let align_overhead = layout.align().saturating_sub(PAGE_SIZE);
+                // TLSF metadata overhead per pool: block headers, sentinel block,
+                // alignment padding, and block splitting. TLSF's segregated list
+                // structure also rounds up the search size, so the actual required
+                // pool can be significantly larger than the allocation size.
+                // Use a generous overhead to avoid repeated failed expansions.
+                const BYTE_ALLOC_OVERHEAD: usize = PAGE_SIZE;
+                let needed = layout.size() + align_overhead + BYTE_ALLOC_OVERHEAD;
+
+                // Use power-of-two rounding because TLSF's segregated list
+                // structure rounds up the search size, making exact-size pools
+                // too small for the requested allocation.
+                let expand_size = needed.next_power_of_two().max(PAGE_SIZE);
+
+                // Use the layout's alignment when allocating pages so that the
+                // byte allocator can find a properly aligned block within the pool.
+                let page_align = layout.align().max(PAGE_SIZE);
 
                 let mut try_size = expand_size;
-                let min_size = PAGE_SIZE.max(layout.size());
+                let min_size = needed.div_ceil(PAGE_SIZE) * PAGE_SIZE;
                 loop {
                     let heap_ptr = match self.alloc_pages(
                         try_size / PAGE_SIZE,
-                        PAGE_SIZE,
+                        page_align,
                         UsageKind::RustHeap,
                     ) {
                         Ok(ptr) => ptr,

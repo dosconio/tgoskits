@@ -815,6 +815,7 @@ dependencies = [
  "ax-driver-vsock",
  "ax-errno",
  "ax-hal",
+ "ax-mm",
  "axplat-dyn",
  "cfg-if",
  "log",
@@ -1942,9 +1943,11 @@ dependencies = [
  "fdt-parser",
  "fw_cfg",
  "hashbrown 0.14.5",
+ "i8254_pit",
  "i8259_pic",
  "lazy_static",
  "log",
+ "mc146818_cmos",
  "pci_host",
  "pm_timer",
  "prettyplease",
@@ -4351,6 +4354,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "i8254_pit"
+version = "0.1.0"
+dependencies = [
+ "ax-errno",
+ "axaddrspace",
+ "axdevice_base",
+ "axvisor_api",
+ "log",
+ "spin 0.10.0",
+]
+
+[[package]]
 name = "i8259_pic"
 version = "0.1.0"
 dependencies = [
@@ -4358,6 +4373,7 @@ dependencies = [
  "axaddrspace",
  "axdevice_base",
  "log",
+ "spin 0.10.0",
 ]
 
 [[package]]
@@ -5185,6 +5201,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9257ea6fe9726d1f1a67fddbda4c06cc97b4fb18716b78ec03ba05e29d625e28"
 
 [[package]]
+name = "mc146818_cmos"
+version = "0.1.0"
+dependencies = [
+ "ax-errno",
+ "axaddrspace",
+ "axdevice_base",
+ "log",
+]
+
+[[package]]
 name = "md5"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5902,6 +5928,7 @@ dependencies = [
  "ax-errno",
  "axaddrspace",
  "axdevice_base",
+ "axvisor_api",
  "log",
 ]
 
@@ -9951,6 +9978,7 @@ dependencies = [
  "bit_field",
  "bitflags 2.12.1",
  "cfg-if",
+ "i8259_pic",
  "log",
  "memoffset",
  "numeric-enum-macro",

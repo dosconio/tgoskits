@@ -17,7 +17,7 @@ use core::{alloc::Layout, fmt};
 
 use ax_cpumask::CpuMask;
 use ax_errno::{AxError, AxResult, ax_err, ax_err_type};
-use ax_memory_addr::{align_down_4k, align_up_4k};
+use ax_memory_addr::{PhysAddr, align_down_4k, align_up_4k};
 use axaddrspace::{
     AddrSpace, GuestPhysAddr, HostPhysAddr, HostVirtAddr, MappingFlags, device::AccessWidth,
 };
@@ -472,10 +472,19 @@ impl AxVM {
         image_size: usize,
     ) -> AxResult<Vec<&'static mut [u8]>> {
         let g = self.inner_mut.lock();
-        let image_load_hva = g
+        let image_load_hva = match g
             .address_space
             .translated_byte_buffer(image_load_gpa, image_size)
-            .expect("Failed to translate kernel image load address");
+        {
+            Some(v) => v,
+            None => {
+                warn!(
+                    "[get_image_load_region] GPA {:#x} size {:#x} not translatable",
+                    image_load_gpa, image_size
+                );
+                return ax_err!(BadState, "guest address not in address space");
+            }
+        };
         debug!(
             "[get_image_load_region] GPA {:#x} -> {} regions, first HVA {:#x}",
             image_load_gpa,
@@ -561,9 +570,10 @@ impl AxVM {
 
         vcpu.bind()?;
 
-        let mut diag_io_count: u64 = 0;
         let mut diag_ept_count: u64 = 0;
         let mut diag_mmio_count: u64 = 0;
+        // diag_io_count disabled together with DIAG IO read/write logging.
+        // let mut diag_io_count: u64 = 0;
 
         let exit_reason = loop {
             let exit_reason = vcpu.run()?;
@@ -577,7 +587,7 @@ impl AxVM {
                     signed_ext: _,
                 } => {
                     diag_mmio_count += 1;
-                    if diag_mmio_count <= 20 || diag_mmio_count.is_multiple_of(10000) {
+                    if diag_mmio_count <= 10 || diag_mmio_count.is_multiple_of(100000) {
                         info!("[DIAG] MMIO read: addr={:#x}, width={:?}", addr, width);
                     }
                     let val = self.get_devices().lock().handle_mmio_read(*addr, *width)?;
@@ -586,7 +596,7 @@ impl AxVM {
                 }
                 AxVCpuExitReason::MmioWrite { addr, width, data } => {
                     diag_mmio_count += 1;
-                    if diag_mmio_count <= 20 || diag_mmio_count.is_multiple_of(10000) {
+                    if diag_mmio_count <= 10 || diag_mmio_count.is_multiple_of(100000) {
                         info!(
                             "[DIAG] MMIO write: addr={:#x}, width={:?}, data={:#x}",
                             addr, width, data
@@ -598,14 +608,16 @@ impl AxVM {
                     true
                 }
                 AxVCpuExitReason::IoRead { port, width } => {
-                    diag_io_count += 1;
+                    // diag_io_count += 1;  // disabled with DIAG IO logging
                     let val = self.get_devices().lock().handle_port_read(*port, *width)?;
-                    if diag_io_count <= 200 || diag_io_count.is_multiple_of(10000) {
-                        info!(
-                            "[DIAG] IO read #{diag_io_count}: port={:#x}, width={:?}, val={:#x}",
-                            port.0, width, val
-                        );
-                    }
+                    // Disabled verbose IO read logging — OVMF polls some ports
+                    // (e.g. port 0x6) in tight loops, producing excessive output.
+                    // if diag_io_count <= 200 || diag_io_count.is_multiple_of(10000) {
+                    //     info!(
+                    //         "[DIAG] IO read #{diag_io_count}: port={:#x}, width={:?}, val={:#x}",
+                    //         port.0, width, val
+                    //     );
+                    // }
                     #[cfg(not(target_arch = "riscv64"))]
                     vcpu.set_gpr(0, val);
 
@@ -615,13 +627,14 @@ impl AxVM {
                     true
                 }
                 AxVCpuExitReason::IoWrite { port, width, data } => {
-                    diag_io_count += 1;
-                    if diag_io_count <= 200 || diag_io_count.is_multiple_of(10000) {
-                        info!(
-                            "[DIAG] IO write #{diag_io_count}: port={:#x}, width={:?}, data={:#x}",
-                            port.0, width, data
-                        );
-                    }
+                    // diag_io_count += 1;  // disabled with DIAG IO logging
+                    // Disabled verbose IO write logging — see IoRead comment above.
+                    // if diag_io_count <= 200 || diag_io_count.is_multiple_of(10000) {
+                    //     info!(
+                    //         "[DIAG] IO write #{diag_io_count}: port={:#x}, width={:?}, data={:#x}",
+                    //         port.0, width, data
+                    //     );
+                    // }
                     self.get_devices()
                         .lock()
                         .handle_port_write(*port, *width, *data as usize)?;
@@ -680,9 +693,17 @@ impl AxVM {
                         vcpu.set_gpr(7, new_addr as usize); // RDI
                         vcpu.set_gpr(1, 0); // RCX = 0 (all done)
                     } else {
-                        // Failed to translate, skip but still update registers
-                        vcpu.set_gpr(7, *guest_addr as usize);
-                        vcpu.set_gpr(1, *count as usize);
+                        // Failed to translate guest address (e.g. beyond RAM during
+                        // memory probing): skip the I/O and advance registers as if
+                        // all count was processed so the guest doesn't loop forever.
+                        let new_addr = *guest_addr as i64
+                            + if *dir_down {
+                                -(*count as i64 * width_bytes as i64)
+                            } else {
+                                *count as i64 * width_bytes as i64
+                            };
+                        vcpu.set_gpr(7, new_addr as usize); // RDI
+                        vcpu.set_gpr(1, 0); // RCX = 0 (all done)
                     }
                     true
                 }
@@ -742,8 +763,15 @@ impl AxVM {
                         vcpu.set_gpr(6, new_addr as usize); // RSI
                         vcpu.set_gpr(1, 0); // RCX = 0 (all done)
                     } else {
-                        vcpu.set_gpr(6, *guest_addr as usize);
-                        vcpu.set_gpr(1, *count as usize);
+                        // Failed to translate guest address: skip and advance registers.
+                        let new_addr = *guest_addr as i64
+                            + if *dir_down {
+                                -(*count as i64 * width_bytes as i64)
+                            } else {
+                                *count as i64 * width_bytes as i64
+                            };
+                        vcpu.set_gpr(6, new_addr as usize); // RSI
+                        vcpu.set_gpr(1, 0); // RCX = 0 (all done)
                     }
                     true
                 }
@@ -857,6 +885,17 @@ impl AxVM {
     pub fn unmap_region(&self, gpa: GuestPhysAddr, size: usize) -> AxResult {
         self.inner_mut.lock().address_space.unmap(gpa, size)?;
         Ok(())
+    }
+
+    /// Translate a guest physical address to a host physical address using only
+    /// the EPT page table, without requiring the address to be tracked in `areas`.
+    ///
+    /// This is useful for accessing guest memory that was mapped by EPT violation
+    /// handlers (e.g., dummy_ff_page for PCI MMIO probing) which update the EPT
+    /// hardware page table but not the software-level `areas` tracking.
+    pub fn translate_gpa_pt_only(&self, gpa: GuestPhysAddr) -> Option<PhysAddr> {
+        let g = self.inner_mut.lock();
+        g.address_space.translate_pt_only(gpa)
     }
 
     /// Reads an object of type `T` from the guest physical address.
@@ -986,7 +1025,58 @@ impl AxVM {
             gpa,
             hva,
             layout,
-            needs_dealloc: true, // This region was allocated and needs to be freed
+            needs_dealloc: true,
+        });
+
+        Ok(s)
+    }
+
+    /// Registers a pre-allocated memory region for the VM.
+    ///
+    /// Unlike [`alloc_memory_region`], this method does not allocate memory.
+    /// The caller provides a pointer to already-allocated memory (e.g., from
+    /// the page allocator) and is responsible for ensuring the memory remains
+    /// valid for the VM's lifetime.
+    ///
+    /// When `needs_dealloc` is `false`, the region will NOT be freed by
+    /// [`cleanup_resources`]. The caller must handle deallocation externally
+    /// (e.g., via `dealloc_pages`).
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `hva` points to a valid, sufficiently
+    /// sized, and properly aligned memory region that remains valid for the
+    /// VM's lifetime.
+    pub unsafe fn register_memory_region(
+        &self,
+        hva: *mut u8,
+        layout: Layout,
+        gpa: Option<GuestPhysAddr>,
+        needs_dealloc: bool,
+    ) -> AxResult<&[u8]> {
+        assert!(
+            layout.size() > 0,
+            "Cannot register zero-sized memory region"
+        );
+        assert!(!hva.is_null(), "Cannot register null memory region");
+
+        let s = unsafe { core::slice::from_raw_parts_mut(hva, layout.size()) };
+        let hva = HostVirtAddr::from_mut_ptr_of(hva);
+        let hpa = axvisor_api::memory::virt_to_phys(hva);
+        let gpa = gpa.unwrap_or_else(|| hpa.as_usize().into());
+
+        let mut g = self.inner_mut.lock();
+        g.address_space.map_linear(
+            gpa,
+            hpa,
+            layout.size(),
+            MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE | MappingFlags::USER,
+        )?;
+        g.memory_regions.push(VMMemoryRegion {
+            gpa,
+            hva,
+            layout,
+            needs_dealloc,
         });
 
         Ok(s)

@@ -27,9 +27,12 @@ extern crate alloc;
 use alloc::sync::Arc;
 
 use ax_errno::AxResult;
-use axaddrspace::device::{AccessWidth, Port, PortRange};
+use axaddrspace::{
+    GuestPhysAddr, GuestPhysAddrRange,
+    device::{AccessWidth, Port, PortRange},
+};
 use axdevice_base::{BaseDeviceOps, EmuDeviceType};
-use log::{trace, warn};
+use log::{debug, info, warn};
 use spin::Mutex;
 
 mod config_space;
@@ -40,6 +43,12 @@ pub use consts::*;
 
 const CONFIG_ADDR_RANGE_END: u16 = PCI_CONFIG_ADDRESS + 3;
 const CONFIG_DATA_RANGE_END: u16 = PCI_CONFIG_DATA + 3;
+
+/// ECAM (Enhanced Configuration Access Mechanism) base address.
+/// QEMU Q35 uses 0xB000_0000 for the MCFG ACPI table.
+pub const ECAM_BASE: u64 = 0xB000_0000;
+/// ECAM size: 256 buses × 1MB per bus = 256 MB.
+pub const ECAM_SIZE: u64 = 0x1000_0000;
 
 type PciDeviceMap = alloc::collections::BTreeMap<(u8, u8, u8), Arc<dyn PciDevice>>;
 
@@ -71,7 +80,7 @@ impl PciHostBridge {
     pub fn add_device(&self, device: Arc<dyn PciDevice>) {
         let bdf = device.bdf();
         self.devices.lock().insert(bdf, device);
-        trace!(
+        debug!(
             "PCI: Added device at Bus={}, Dev={}, Func={}",
             bdf.0, bdf.1, bdf.2
         );
@@ -95,28 +104,49 @@ impl PciHostBridge {
             return Ok(0xFFFF_FFFF_usize);
         };
 
-        trace!(
-            "PCI config read: Bus={} Dev={} Func={} Reg={:#x} offset={:#x} width={}",
-            bus,
-            dev,
-            func,
-            reg,
-            port_offset,
-            width.size()
-        );
-
         let full_reg = reg;
         if bus == 0 && dev == 0 && func == 0 {
             let full_val = self.host_bridge_config.read(full_reg, AccessWidth::Dword);
             let val = Self::extract_bytes(full_val, port_offset, width);
-            trace!("PCI host bridge read: reg={:#x} val={:#x}", full_reg, val);
+            debug!(
+                "PCI host bridge read: reg={:#x} val={:#x} (bus={} dev={} func={} offset={} \
+                 width={})",
+                full_reg,
+                val,
+                bus,
+                dev,
+                func,
+                port_offset,
+                width.size()
+            );
             return Ok(val);
         }
 
         if bus == 0 && dev == 31 && func == 0 {
             let full_val = self.lpc_bridge_config.read(full_reg, AccessWidth::Dword);
             let val = Self::extract_bytes(full_val, port_offset, width);
-            trace!("PCI LPC bridge read: reg={:#x} val={:#x}", full_reg, val);
+            // Log PM base (offset 0x40) and ACPI control (offset 0x44) reads at info level
+            if full_reg == 0x40 || full_reg == 0x44 {
+                info!(
+                    "[LPC-READ] reg={:#x} full_val={:#x} val={:#x} offset={} width={}",
+                    full_reg,
+                    full_val,
+                    val,
+                    port_offset,
+                    width.size()
+                );
+            }
+            debug!(
+                "PCI LPC bridge read: reg={:#x} val={:#x} (bus={} dev={} func={} offset={} \
+                 width={})",
+                full_reg,
+                val,
+                bus,
+                dev,
+                func,
+                port_offset,
+                width.size()
+            );
             return Ok(val);
         }
 
@@ -124,13 +154,13 @@ impl PciHostBridge {
         if let Some(device) = devices.get(&(bus, dev, func)) {
             let full_val = device.config_space().read(full_reg, AccessWidth::Dword);
             let val = Self::extract_bytes(full_val, port_offset, width);
-            trace!(
+            debug!(
                 "PCI device ({},{},{}) read: reg={:#x} val={:#x}",
                 bus, dev, func, full_reg, val
             );
             Ok(val)
         } else {
-            trace!("PCI no device at Bus={} Dev={} Func={}", bus, dev, func);
+            debug!("PCI no device at Bus={} Dev={} Func={}", bus, dev, func);
             Ok(0xFFFF_FFFF_usize)
         }
     }
@@ -153,18 +183,21 @@ impl PciHostBridge {
             return Ok(());
         };
 
-        trace!(
-            "PCI config write: Bus={} Dev={} Func={} Reg={:#x} offset={:#x} width={} val={:#x}",
-            bus,
-            dev,
-            func,
-            reg,
-            port_offset,
-            width.size(),
-            val
-        );
-
         let full_reg = reg;
+
+        // Log all writes to host bridge and LPC bridge at debug level
+        if bus == 0 && (dev == 0 || dev == 31) && func == 0 {
+            debug!(
+                "PCI config write: Bus={} Dev={} Func={} Reg={:#x} offset={:#x} width={} val={:#x}",
+                bus,
+                dev,
+                func,
+                full_reg,
+                port_offset,
+                width.size(),
+                val
+            );
+        }
         if bus == 0 && dev == 0 && func == 0 {
             let old_val = self.host_bridge_config.read(full_reg, AccessWidth::Dword);
             let shift = port_offset * 8;
@@ -177,7 +210,7 @@ impl PciHostBridge {
             let new_val = (old_val & !(mask << shift)) | ((val & mask) << shift);
             self.host_bridge_config
                 .write(full_reg, AccessWidth::Dword, new_val);
-            trace!(
+            debug!(
                 "PCI host bridge write: reg={:#x} old={:#x} new={:#x}",
                 full_reg, old_val, new_val
             );
@@ -196,7 +229,7 @@ impl PciHostBridge {
             let new_val = (old_val & !(mask << shift)) | ((val & mask) << shift);
             self.lpc_bridge_config
                 .write(full_reg, AccessWidth::Dword, new_val);
-            trace!(
+            debug!(
                 "PCI LPC bridge write: reg={:#x} old={:#x} new={:#x}",
                 full_reg, old_val, new_val
             );
@@ -219,14 +252,14 @@ impl PciHostBridge {
                 .write(full_reg, AccessWidth::Dword, new_val);
 
             if let Some(bar_idx) = Self::bar_index_from_reg(full_reg) {
-                trace!(
+                debug!(
                     "PCI BAR{} write for device ({},{},{}): val={:#x}",
                     bar_idx, bus, dev, func, new_val
                 );
                 device.on_bar_write(bar_idx);
             }
         } else {
-            trace!(
+            debug!(
                 "PCI no device at Bus={} Dev={} Func={}, write ignored",
                 bus, dev, func
             );
@@ -241,6 +274,153 @@ impl PciHostBridge {
         } else {
             None
         }
+    }
+
+    /// Decode an ECAM MMIO address into (bus, dev, func, dword_reg, byte_offset).
+    fn decode_ecam_addr(addr: GuestPhysAddr) -> (u8, u8, u8, u8, u8) {
+        let offset = addr.as_usize() - ECAM_BASE as usize;
+        let bus = ((offset >> 20) & 0xFF) as u8;
+        let dev = ((offset >> 15) & 0x1F) as u8;
+        let func = ((offset >> 12) & 0x7) as u8;
+        let reg = (offset & 0xFFF) as u8;
+        let dword_reg = reg & 0xFC;
+        let byte_offset = reg & 0x3;
+        (bus, dev, func, dword_reg, byte_offset)
+    }
+
+    /// Handle ECAM MMIO read: route to PCI config space using bus/dev/func/reg
+    /// extracted from the GPA.
+    fn handle_ecam_read(&self, addr: GuestPhysAddr, width: AccessWidth) -> AxResult<usize> {
+        let (bus, dev, func, reg, byte_offset) = Self::decode_ecam_addr(addr);
+
+        if bus == 0 && dev == 0 && func == 0 {
+            let full_val = self.host_bridge_config.read(reg, AccessWidth::Dword);
+            let val = Self::extract_bytes(full_val, byte_offset, width);
+            debug!(
+                "[ECAM] host bridge read: bus={} dev={} func={} reg={:#x} val={:#x} offset={} \
+                 width={}",
+                bus,
+                dev,
+                func,
+                reg,
+                val,
+                byte_offset,
+                width.size()
+            );
+            return Ok(val);
+        }
+
+        if bus == 0 && dev == 31 && func == 0 {
+            let full_val = self.lpc_bridge_config.read(reg, AccessWidth::Dword);
+            let val = Self::extract_bytes(full_val, byte_offset, width);
+            if reg == 0x40 || reg == 0x44 {
+                info!(
+                    "[ECAM-LPC-READ] reg={:#x} full_val={:#x} val={:#x} offset={} width={}",
+                    reg,
+                    full_val,
+                    val,
+                    byte_offset,
+                    width.size()
+                );
+            }
+            return Ok(val);
+        }
+
+        let devices = self.devices.lock();
+        if let Some(device) = devices.get(&(bus, dev, func)) {
+            let full_val = device.config_space().read(reg, AccessWidth::Dword);
+            let val = Self::extract_bytes(full_val, byte_offset, width);
+            debug!(
+                "[ECAM] device ({},{},{}) read: reg={:#x} val={:#x}",
+                bus, dev, func, reg, val
+            );
+            Ok(val)
+        } else {
+            debug!(
+                "[ECAM] no device at bus={} dev={} func={} reg={:#x}, returning 0xFFFFFFFF",
+                bus, dev, func, reg
+            );
+            Ok(0xFFFF_FFFF_usize)
+        }
+    }
+
+    /// Handle ECAM MMIO write: route to PCI config space using bus/dev/func/reg
+    /// extracted from the GPA.
+    fn handle_ecam_write(&self, addr: GuestPhysAddr, width: AccessWidth, val: usize) -> AxResult {
+        let (bus, dev, func, reg, byte_offset) = Self::decode_ecam_addr(addr);
+
+        if bus == 0 && (dev == 0 || dev == 31) && func == 0 {
+            debug!(
+                "[ECAM] config write: bus={} dev={} func={} reg={:#x} offset={} width={} val={:#x}",
+                bus,
+                dev,
+                func,
+                reg,
+                byte_offset,
+                width.size(),
+                val
+            );
+        }
+
+        if bus == 0 && dev == 0 && func == 0 {
+            let old_val = self.host_bridge_config.read(reg, AccessWidth::Dword);
+            let shift = byte_offset * 8;
+            let mask = match width {
+                AccessWidth::Byte => 0xFF,
+                AccessWidth::Word => 0xFFFF,
+                AccessWidth::Dword => 0xFFFF_FFFF,
+                AccessWidth::Qword => 0xFFFF_FFFF_FFFF_FFFF,
+            };
+            let new_val = (old_val & !(mask << shift)) | ((val & mask) << shift);
+            self.host_bridge_config
+                .write(reg, AccessWidth::Dword, new_val);
+            return Ok(());
+        }
+
+        if bus == 0 && dev == 31 && func == 0 {
+            let old_val = self.lpc_bridge_config.read(reg, AccessWidth::Dword);
+            let shift = byte_offset * 8;
+            let mask = match width {
+                AccessWidth::Byte => 0xFF,
+                AccessWidth::Word => 0xFFFF,
+                AccessWidth::Dword => 0xFFFF_FFFF,
+                AccessWidth::Qword => 0xFFFF_FFFF_FFFF_FFFF,
+            };
+            let new_val = (old_val & !(mask << shift)) | ((val & mask) << shift);
+            self.lpc_bridge_config
+                .write(reg, AccessWidth::Dword, new_val);
+            return Ok(());
+        }
+
+        let devices = self.devices.lock();
+        if let Some(device) = devices.get(&(bus, dev, func)) {
+            let old_val = device.config_space().read(reg, AccessWidth::Dword);
+            let shift = byte_offset * 8;
+            let mask = match width {
+                AccessWidth::Byte => 0xFF,
+                AccessWidth::Word => 0xFFFF,
+                AccessWidth::Dword => 0xFFFF_FFFF,
+                AccessWidth::Qword => 0xFFFF_FFFF_FFFF_FFFF,
+            };
+            let new_val = (old_val & !(mask << shift)) | ((val & mask) << shift);
+            device
+                .config_space()
+                .write(reg, AccessWidth::Dword, new_val);
+
+            if let Some(bar_idx) = Self::bar_index_from_reg(reg) {
+                debug!(
+                    "[ECAM] BAR{} write for device ({},{},{}): val={:#x}",
+                    bar_idx, bus, dev, func, new_val
+                );
+                device.on_bar_write(bar_idx);
+            }
+        } else {
+            debug!(
+                "[ECAM] no device at bus={} dev={} func={} reg={:#x}, write ignored",
+                bus, dev, func, reg
+            );
+        }
+        Ok(())
     }
 }
 
@@ -279,7 +459,21 @@ impl BaseDeviceOps<PortRange> for PciHostBridge {
     fn handle_write(&self, addr: Port, width: AccessWidth, val: usize) -> AxResult {
         match addr.0 {
             PCI_CONFIG_ADDRESS..=CONFIG_ADDR_RANGE_END => {
-                *self.config_address.lock() = val as u32;
+                let old = *self.config_address.lock();
+                let new = val as u32;
+                if old != new {
+                    debug!(
+                        "[PCI-CF8] Config address write: {:#010x} -> {:#010x} (bus={} dev={} \
+                         func={} reg={:#x})",
+                        old,
+                        new,
+                        (new >> 16) & 0xFF,
+                        (new >> 11) & 0x1F,
+                        (new >> 8) & 0x7,
+                        new & 0xFC
+                    );
+                    *self.config_address.lock() = new;
+                }
             }
             PCI_CONFIG_DATA..=CONFIG_DATA_RANGE_END => {
                 let port_offset = (addr.0 - PCI_CONFIG_DATA) as u8;
@@ -290,5 +484,29 @@ impl BaseDeviceOps<PortRange> for PciHostBridge {
             }
         }
         Ok(())
+    }
+}
+
+/// MMIO interface for ECAM (Enhanced Configuration Access Mechanism).
+/// This allows OVMF to access PCI config space via MMIO at 0xB000_0000,
+/// which is required for UEFI firmware that uses MCFG ACPI table.
+impl BaseDeviceOps<GuestPhysAddrRange> for PciHostBridge {
+    fn emu_type(&self) -> EmuDeviceType {
+        EmuDeviceType::Dummy
+    }
+
+    fn address_range(&self) -> GuestPhysAddrRange {
+        GuestPhysAddrRange::from_start_size(
+            GuestPhysAddr::from(ECAM_BASE as usize),
+            ECAM_SIZE as usize,
+        )
+    }
+
+    fn handle_read(&self, addr: GuestPhysAddr, width: AccessWidth) -> AxResult<usize> {
+        self.handle_ecam_read(addr, width)
+    }
+
+    fn handle_write(&self, addr: GuestPhysAddr, width: AccessWidth, val: usize) -> AxResult {
+        self.handle_ecam_write(addr, width, val)
     }
 }

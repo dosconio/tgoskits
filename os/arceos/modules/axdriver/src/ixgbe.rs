@@ -25,8 +25,9 @@ unsafe impl IxgbeHal for IxgbeHalImpl {
         0
     }
 
-    unsafe fn mmio_phys_to_virt(paddr: IxgbePhysAddr, _size: usize) -> NonNull<u8> {
-        NonNull::new(phys_to_virt(paddr.into()).as_mut_ptr()).unwrap()
+    unsafe fn mmio_phys_to_virt(paddr: IxgbePhysAddr, size: usize) -> NonNull<u8> {
+        let vaddr = ax_mm::iomap(paddr.into(), size).expect("failed to map ixgbe MMIO region");
+        NonNull::new(vaddr.as_mut_ptr()).unwrap()
     }
 
     unsafe fn mmio_virt_to_phys(vaddr: NonNull<u8>, _size: usize) -> IxgbePhysAddr {

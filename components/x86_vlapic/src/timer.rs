@@ -122,6 +122,12 @@ impl ApicTimer {
             .read_as_enum(LVT_TIMER::TimerMode)
             .unwrap_or(TimerMode::OneShot);
 
+        info!(
+            "[TIMER-DEBUG] write_lvt: value={value:#010x}, old_mode={old_mode:?}, \
+             new_mode={new_mode:?}, is_tsc_deadline={}",
+            new_mode == TimerMode::TSCDeadline
+        );
+
         self.lvt_timer_register.set(value);
 
         // Per Intel SDM Vol. 3A Section 10.5.4:
@@ -159,6 +165,11 @@ impl ApicTimer {
     }
 
     pub fn write_icr(&mut self, value: u32) -> AxResult {
+        // In TSC-Deadline mode, writing ICR is ignored per SDM
+        if self.timer_mode() == TimerMode::TSCDeadline {
+            trace!("vlapic write_icr ignored: in TSC-Deadline mode");
+            return Ok(());
+        }
         // stop the timer no matter whether it is started, and no matter the value
         self.stop_timer()?;
         self.initial_count_register = value;
@@ -206,9 +217,30 @@ impl ApicTimer {
             return 0;
         }
         let current_ticks = current_ticks();
-        let deadline_ticks = self.last_start_ticks
-            + ((self.initial_count_register as u64) << self.start_divide_shift);
+        let period_ticks = (self.initial_count_register as u64) << self.start_divide_shift;
+        let deadline_ticks = self.last_start_ticks + period_ticks;
+
+        // Rate-limited diagnostic logging for CCR reads
+        static CCR_LOG_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let log_count = CCR_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if log_count < 5 || log_count == 100 || log_count == 1000 {
+            info!(
+                "[CCR] #{log_count}: current={current_ticks:#x}, last_start={:#x}, ICR={:#x}, \
+                 divide_shift={}, period={period_ticks:#x}, deadline={deadline_ticks:#x}",
+                self.last_start_ticks, self.initial_count_register, self.start_divide_shift
+            );
+        }
+
         if current_ticks >= deadline_ticks {
+            if self.is_periodic() && period_ticks > 0 {
+                // In periodic mode, CCR wraps around: compute remaining
+                // ticks in the current period.
+                let elapsed = current_ticks - self.last_start_ticks;
+                let remaining = period_ticks - (elapsed % period_ticks);
+                let ccr = (remaining >> self.start_divide_shift) as u32;
+                trace!("read_ccr: periodic wrap, ccr={ccr:#x}");
+                return ccr;
+            }
             trace!("read_ccr: timer expired, returning 0");
             return 0;
         }
@@ -241,8 +273,7 @@ impl ApicTimer {
 
     /// Check whether the timer is started.
     pub fn is_started(&self) -> bool {
-        // these two conditions are equivalent actually, we check both for clarity and robustness
-        self.initial_count_register > 0 && self.cancel_token.is_some()
+        self.cancel_token.is_some()
     }
 
     /// Restart the timer. Will not start the timer if it is not started.
@@ -261,6 +292,13 @@ impl ApicTimer {
             return ax_err!(BadState, "Timer already started");
         }
 
+        // In TSC-Deadline mode, timer is armed by writing IA32_TSC_DEADLINE MSR,
+        // not by writing to the Initial Count Register.
+        if self.timer_mode() == TimerMode::TSCDeadline {
+            trace!("vlapic timer not started: in TSC-Deadline mode");
+            return Ok(());
+        }
+
         let vector = self.vector();
         if vector == 0 {
             trace!("vlapic timer not started: vector is 0");
@@ -275,22 +313,22 @@ impl ApicTimer {
         let is_periodic = self.is_periodic();
         let is_masked = self.is_masked();
 
+        let deadline_ns = ticks_to_nanos(deadline_ticks);
         info!(
-            "vlapic @ (vm {vm_id}, vcpu {vcpu_id}) starts timer @ tick {current_ticks:?}, \
-             deadline tick {deadline_ticks:?}, vector {vector}, masked={is_masked}, \
-             periodic={is_periodic}"
+            "[VLAPIC-TIMER] start_timer: tick={current_ticks:#x}, \
+             deadline_tick={deadline_ticks:#x}, deadline_ns={deadline_ns:#x}, vector={vector}, \
+             masked={is_masked}, periodic={is_periodic}, icr={:#x}, divide_shift={}",
+            self.initial_count_register, self.divide_shift
         );
 
         self.last_start_ticks = current_ticks;
         self.start_divide_shift = self.divide_shift;
-        self.deadline_ns = ticks_to_nanos(deadline_ticks);
+        self.deadline_ns = deadline_ns;
 
         self.cancel_token = Some(register_timer(
             ticks_to_time(deadline_ticks),
             Box::new(move |_| {
-                info!(
-                    "vlapic @ (vm {vm_id}, vcpu {vcpu_id}) timer callback fired, vector {vector}"
-                );
+                info!("[VLAPIC-TIMER] callback fired: vm={vm_id}, vcpu={vcpu_id}, vector={vector}");
                 notify_vcpu_timer_expired(vm_id, vcpu_id);
             }),
         ));
@@ -327,6 +365,59 @@ impl ApicTimer {
     /// Whether the timer mode is periodic.
     pub fn is_periodic(&self) -> bool {
         self.timer_mode() == TimerMode::Periodic
+    }
+
+    /// Start a TSC-Deadline timer.
+    ///
+    /// In TSC-Deadline mode, the timer is armed by writing to IA32_TSC_DEADLINE
+    /// MSR (0x6E0), not by writing to the Initial Count Register. This method
+    /// converts the absolute TSC deadline value to platform ticks and registers
+    /// a timer callback.
+    pub fn start_tsc_deadline_timer(&mut self, tsc_deadline: u64) -> AxResult {
+        let vector = self.vector();
+        if vector == 0 {
+            trace!("vlapic tsc-deadline timer not started: vector is 0");
+            return Ok(());
+        }
+
+        let current_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+        let current_ticks = current_ticks();
+
+        // current_ticks = current_tsc - INIT_TICK (TSC-based platform ticks)
+        // deadline_ticks = tsc_deadline - INIT_TICK
+        //                = current_ticks + (tsc_deadline - current_tsc)
+        let deadline_ticks = if tsc_deadline > current_tsc {
+            current_ticks + (tsc_deadline - current_tsc)
+        } else {
+            // Deadline already passed, fire as soon as possible
+            current_ticks + 1
+        };
+
+        let (vm_id, vcpu_id) = self.where_am_i;
+        let is_masked = self.is_masked();
+
+        info!(
+            "vlapic @ (vm {vm_id}, vcpu {vcpu_id}) starts TSC deadline timer @ tick \
+             {current_ticks:?}, deadline tick {deadline_ticks:?}, vector {vector}, \
+             masked={is_masked}, tsc_deadline={tsc_deadline:#x}"
+        );
+
+        self.tsc_deadline = tsc_deadline;
+        self.last_start_ticks = current_ticks;
+        self.deadline_ns = ticks_to_nanos(deadline_ticks);
+
+        self.cancel_token = Some(register_timer(
+            ticks_to_time(deadline_ticks),
+            Box::new(move |_| {
+                info!(
+                    "vlapic @ (vm {vm_id}, vcpu {vcpu_id}) TSC deadline timer callback fired, \
+                     vector {vector}"
+                );
+                notify_vcpu_timer_expired(vm_id, vcpu_id);
+            }),
+        ));
+
+        Ok(())
     }
 
     // /// Set LVT Timer Register.

@@ -48,10 +48,19 @@ const REG_REDTBL_BASE: u32 = 0x10;
 const IOAPIC_VERSION: u32 = 0x11;
 const MAX_REDIRECTION_ENTRIES: u32 = 23;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct RedirectionTableEntry {
     lo: u32,
     hi: u32,
+}
+
+impl Default for RedirectionTableEntry {
+    fn default() -> Self {
+        // Real IOAPIC hardware defaults: masked, vector 0.
+        // Bit 16 (mask) set prevents spurious interrupts with vector 0
+        // before the guest configures the RTE.
+        Self { lo: 1 << 16, hi: 0 }
+    }
 }
 
 impl RedirectionTableEntry {
@@ -163,6 +172,13 @@ impl IoApic {
             return;
         }
         let vector = rte.vector();
+        if vector == 0 {
+            debug!(
+                "[IOAPIC] IRQ {}: RTE not configured (vector=0), ignoring",
+                gsi
+            );
+            return;
+        }
         let dest = rte.destination();
         debug!(
             "[IOAPIC] IRQ {}: vector={}, dest={}, delivery_mode={}",
@@ -240,18 +256,37 @@ impl IoApic {
                 warn!("[IOAPIC] attempt to write IOAPICVER (read-only), ignoring");
             }
             idx @ REG_REDTBL_BASE..=0x3F => {
-                let pin = (idx - REG_REDTBL_BASE) as usize;
-                if pin >= IOAPIC_NUM_PINS {
-                    warn!("[IOAPIC] write invalid RTE index {}", idx);
+                let reg_idx = (idx - REG_REDTBL_BASE) as usize;
+                // Each RTE occupies 2 registers (lo at even, hi at odd).
+                // Total registers = 2 * IOAPIC_NUM_PINS = 48 (0x10..0x3F).
+                if reg_idx >= 2 * IOAPIC_NUM_PINS {
+                    warn!("[IOAPIC] write invalid RTE register index {}", idx);
                     return;
                 }
-                let mut rte = self.rtels[pin / 2].lock();
-                if pin.is_multiple_of(2) {
+                let rte_idx = reg_idx / 2;
+                let mut rte = self.rtels[rte_idx].lock();
+                if reg_idx.is_multiple_of(2) {
                     rte.lo = val & 0xFFFE_FFFF;
                     rte.lo &= !(1 << 12);
                 } else {
                     rte.hi = val & 0xFF00_0000;
                 }
+                debug!(
+                    "[IOAPIC] RTE[{}] {} write: {:#x} → lo={:#x} hi={:#x} (vector={} masked={} \
+                     dest={})",
+                    rte_idx,
+                    if reg_idx.is_multiple_of(2) {
+                        "lo"
+                    } else {
+                        "hi"
+                    },
+                    val,
+                    rte.lo,
+                    rte.hi,
+                    rte.vector(),
+                    rte.is_masked(),
+                    rte.destination()
+                );
             }
             _ => {
                 warn!("[IOAPIC] write unknown register {} = {:#x}", index, val);

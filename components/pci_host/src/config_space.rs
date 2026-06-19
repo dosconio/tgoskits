@@ -125,9 +125,19 @@ impl PciConfigSpace {
             ]);
             data[PCI_HEADER_TYPE as usize] = PCI_HEADER_TYPE_NORMAL;
 
+            // ICH9 LPC bridge Power Management registers:
+            // Offset 0x40 (ICH9_PMBASE): PM Base Address = 0x0600
+            //   Bits [15:7] = PMBA, Bit 0 = RTE (Reserved, must be 0)
+            //   OVMF expects ICH9_PMBASE_VALUE = 0x0600
             data[0x40..0x44].copy_from_slice(&0x0600u32.to_le_bytes());
-            data[0x44] = 0x01;
+            // Offset 0x44 (ICH9_ACPI_CNTL): ACPI Control
+            //   Bit 7 = ACPI_EN (ACPI I/O space enable)
+            //   Set ACPI_EN=1 so OVMF's AcpiTimerLib constructor sees it enabled
+            data[0x44] = 0x80; // ACPI_EN = BIT7
+            // Offset 0x48 (ICH9_GPIO_BASE): GPIO Base Address = 0x0500
             data[0x48..0x4C].copy_from_slice(&0x0500u32.to_le_bytes());
+            // Offset 0x4C (ICH9_GPIO_CNTL): GPIO Control
+            //   Bit 0 = GPIO_EN (GPIO I/O space enable)
             data[0x4C] = 0x01;
         }
         config

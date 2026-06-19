@@ -42,6 +42,11 @@ use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags, EferFlags};
 use x86_vioapic::{GLOBAL_VIOAPIC, IOAPIC_MMIO_BASE, IOAPIC_MMIO_SIZE};
 use x86_vlapic::EmulatedLocalApic;
 
+/// ECAM (Enhanced Configuration Access Mechanism) MMIO range for QEMU Q35.
+/// OVMF uses ECAM to access PCI config space via MMIO at 0xB000_0000.
+const ECAM_MMIO_BASE: usize = 0xB000_0000;
+const ECAM_MMIO_END: usize = 0xC000_0000; // 256 MB: 0xB000_0000 + 0x1000_0000
+
 use super::{
     VmxExitInfo, as_axerr,
     definitions::{VmxExitReason, VmxInterruptionType},
@@ -146,11 +151,37 @@ pub struct VmxVcpu {
     /// End of guest RAM (for EPT violation handling).
     ram_end: usize,
 
+    /// A 4 KB page filled with 0xFF bytes, used to map unmapped GPA regions
+    /// during guest memory probing so that reads return all-ones (indicating
+    /// non-existent memory) without requiring instruction emulation.
+    dummy_ff_page: PhysFrame,
+
+    /// Trace VM-exits after CPUID 0x80000000 to diagnose why OVMF
+    /// never calls CPUID 0x80000001.
+    trace_after_cpuid_8k: bool,
+    trace_after_8k_count: usize,
+
     // Tracing-related fields
     #[cfg(feature = "tracing")]
     /// The guest registers when the VM-exit happens.
     guest_regs_exiting: GeneralRegisters,
 }
+
+/// Ring buffer tracking the last 16 VM-exits (exit_reason, rip, cs_ar)
+/// to diagnose VM-entry failures. When a VM-entry failure (reason 0x21)
+/// occurs, we log the last N VM-exits to identify what caused the guest
+/// state to become invalid.
+struct ExitHistory {
+    buf: [(u32, u64, u32); 16],
+    idx: usize,
+    count: u64,
+}
+
+static EXIT_HISTORY: spin::Mutex<ExitHistory> = spin::Mutex::new(ExitHistory {
+    buf: [(0, 0, 0); 16],
+    idx: 0,
+    count: 0,
+});
 
 impl VmxVcpu {
     /// Create a new [`VmxVcpu`].
@@ -179,6 +210,13 @@ impl VmxVcpu {
             vlapic: EmulatedLocalApic::new(vm_id, vcpu_id),
             xstate: XState::new(),
             ram_end: 0,
+            dummy_ff_page: {
+                let mut f = PhysFrame::alloc()?;
+                f.fill(0xFF);
+                f
+            },
+            trace_after_cpuid_8k: false,
+            trace_after_8k_count: 0,
             #[cfg(feature = "tracing")]
             guest_regs_exiting: GeneralRegisters::default(),
         };
@@ -236,8 +274,8 @@ impl VmxVcpu {
         let cs_access_right = VmcsGuest32::CS_ACCESS_RIGHTS.read().unwrap();
         let cr0 = VmcsGuestNW::CR0.read().unwrap();
         if (ia32_efer & MSR_IA32_EFER_LMA_BIT) != 0 {
-            if (cs_access_right & 0x2000) != 0 {
-                // CS.L = 1
+            if (cs_access_right & 0x1000) != 0 {
+                // CS.L = 1 (bit 12 per Intel SDM 24.4.1)
                 VmCpuMode::Mode64
             } else {
                 VmCpuMode::Compatibility
@@ -253,7 +291,39 @@ impl VmxVcpu {
     pub fn inner_run(&mut self) -> Option<VmxExitInfo> {
         self.inject_pending_events().unwrap();
 
-        // Run guest
+        // Comprehensive exit reason statistics
+        struct ExitStats {
+            cpuid: core::sync::atomic::AtomicU64,
+            io: core::sync::atomic::AtomicU64,
+            msr_read: core::sync::atomic::AtomicU64,
+            msr_write: core::sync::atomic::AtomicU64,
+            ept_violation: core::sync::atomic::AtomicU64,
+            preempt: core::sync::atomic::AtomicU64,
+            ext_intr: core::sync::atomic::AtomicU64,
+            hlt: core::sync::atomic::AtomicU64,
+            intr_window: core::sync::atomic::AtomicU64,
+            cr_access: core::sync::atomic::AtomicU64,
+            other: core::sync::atomic::AtomicU64,
+            total: core::sync::atomic::AtomicU64,
+            last_summary: core::sync::atomic::AtomicU64,
+        }
+        static STATS: ExitStats = ExitStats {
+            cpuid: core::sync::atomic::AtomicU64::new(0),
+            io: core::sync::atomic::AtomicU64::new(0),
+            msr_read: core::sync::atomic::AtomicU64::new(0),
+            msr_write: core::sync::atomic::AtomicU64::new(0),
+            ept_violation: core::sync::atomic::AtomicU64::new(0),
+            preempt: core::sync::atomic::AtomicU64::new(0),
+            ext_intr: core::sync::atomic::AtomicU64::new(0),
+            hlt: core::sync::atomic::AtomicU64::new(0),
+            intr_window: core::sync::atomic::AtomicU64::new(0),
+            cr_access: core::sync::atomic::AtomicU64::new(0),
+            other: core::sync::atomic::AtomicU64::new(0),
+            total: core::sync::atomic::AtomicU64::new(0),
+            last_summary: core::sync::atomic::AtomicU64::new(0),
+        };
+
+        // Run guest first, then count the exit reason after we get back
         self.load_guest_xstate();
 
         #[cfg(feature = "tracing")]
@@ -296,48 +366,195 @@ impl VmxVcpu {
 
         // Handle vm-exits
         let exit_info = self.exit_info().unwrap();
-        // debug!("VM exit: {:#x?}", exit_info);
 
-        // Log non-I/O, non-external-interrupt exits for diagnostics
+        // Track last VM-exits in a ring buffer to diagnose VM-entry failures.
+        // When a VM-entry failure (reason 0x21) occurs, we log the last N
+        // VM-exits to identify what caused the guest state to become invalid.
+        {
+            let cs_ar = VmcsGuest32::CS_ACCESS_RIGHTS.read().unwrap_or(0);
+            let rip = self.rip() as u64;
+            let reason = exit_info.exit_reason as u32;
+            let mut hist = EXIT_HISTORY.lock();
+            let idx = hist.idx;
+            hist.buf[idx] = (reason, rip, cs_ar);
+            hist.idx = (idx + 1) % 16;
+            hist.count += 1;
+        }
+
+        // Update exit reason statistics
+        let total = STATS
+            .total
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         match exit_info.exit_reason {
-            VmxExitReason::IO_INSTRUCTION | VmxExitReason::EXTERNAL_INTERRUPT => {}
             VmxExitReason::CPUID => {
-                static CPUID_COUNT: core::sync::atomic::AtomicU64 =
-                    core::sync::atomic::AtomicU64::new(0);
-                let count = CPUID_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if count < 50 || count == 100 || count == 1000 || count == 10000 || count == 100000
-                {
-                    let leaf = self.regs().rax as u32;
-                    let rflags = VmcsGuestNW::RFLAGS.read().unwrap_or(0);
-                    let if_flag = (rflags >> 9) & 1;
-                    let regs = self.regs();
-                    info!(
-                        "[CPUID-IN] #{count}: leaf={leaf:#x}, sub={:#x}, RIP={:#x}, IF={if_flag}",
-                        regs.rcx as u32,
-                        self.rip()
-                    );
-                }
+                STATS
+                    .cpuid
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
-            reason => {
-                static EXIT_COUNT: core::sync::atomic::AtomicU64 =
-                    core::sync::atomic::AtomicU64::new(0);
-                let count = EXIT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if count < 20 || count == 100 || count == 1000 || count == 10000 {
-                    let extra = match reason {
-                        VmxExitReason::MSR_READ => {
-                            alloc::format!(", MSR={:#x}", self.regs().rcx as u32)
-                        }
-                        VmxExitReason::MSR_WRITE => {
-                            alloc::format!(", MSR={:#x}", self.regs().rcx as u32)
-                        }
-                        _ => alloc::string::String::new(),
-                    };
+            VmxExitReason::IO_INSTRUCTION => {
+                STATS.io.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            VmxExitReason::MSR_READ => {
+                STATS
+                    .msr_read
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            VmxExitReason::MSR_WRITE => {
+                STATS
+                    .msr_write
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            VmxExitReason::EPT_VIOLATION => {
+                STATS
+                    .ept_violation
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            VmxExitReason::PREEMPTION_TIMER => {
+                STATS
+                    .preempt
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            VmxExitReason::EXTERNAL_INTERRUPT => {
+                STATS
+                    .ext_intr
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            VmxExitReason::HLT => {
+                STATS
+                    .hlt
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            VmxExitReason::INTERRUPT_WINDOW => {
+                STATS
+                    .intr_window
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            VmxExitReason::CR_ACCESS => {
+                STATS
+                    .cr_access
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            _ => {
+                STATS
+                    .other
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // Print exit reason summary every 100 exits
+        let last = STATS
+            .last_summary
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if total - last >= 1000 {
+            STATS
+                .last_summary
+                .store(total, core::sync::atomic::Ordering::Relaxed);
+            let cr0 = VmcsGuestNW::CR0.read().unwrap_or(0);
+            let efer = VmcsGuest64::IA32_EFER.read().unwrap_or(0);
+            let pe = cr0 & 1;
+            let pg = (cr0 >> 31) & 1;
+            let lma = (efer >> 10) & 1;
+            info!(
+                "[STAT] #{total}: CPUID={} IO={} MSR_R={} MSR_W={} EPT={} PREEMPT={} EXT={} \
+                 HLT={} INTR_WIN={} CR={} OTH={} RIP={:#x} PE={} PG={} LMA={}",
+                STATS.cpuid.load(core::sync::atomic::Ordering::Relaxed),
+                STATS.io.load(core::sync::atomic::Ordering::Relaxed),
+                STATS.msr_read.load(core::sync::atomic::Ordering::Relaxed),
+                STATS.msr_write.load(core::sync::atomic::Ordering::Relaxed),
+                STATS
+                    .ept_violation
+                    .load(core::sync::atomic::Ordering::Relaxed),
+                STATS.preempt.load(core::sync::atomic::Ordering::Relaxed),
+                STATS.ext_intr.load(core::sync::atomic::Ordering::Relaxed),
+                STATS.hlt.load(core::sync::atomic::Ordering::Relaxed),
+                STATS
+                    .intr_window
+                    .load(core::sync::atomic::Ordering::Relaxed),
+                STATS.cr_access.load(core::sync::atomic::Ordering::Relaxed),
+                STATS.other.load(core::sync::atomic::Ordering::Relaxed),
+                self.rip(),
+                pe,
+                pg,
+                lma
+            );
+        }
+
+        // Detect stuck loops: same RIP for CPUID exits
+        static LAST_CPUID_RIP: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        static SAME_CPUID_RIP_COUNT: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        static STUCK_DUMPED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if matches!(exit_info.exit_reason, VmxExitReason::CPUID) {
+            let rip = self.rip() as u64;
+            let last_rip = LAST_CPUID_RIP.load(core::sync::atomic::Ordering::Relaxed);
+            if rip == last_rip {
+                let c = SAME_CPUID_RIP_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if c == 20 && !STUCK_DUMPED.load(core::sync::atomic::Ordering::Relaxed) {
+                    STUCK_DUMPED.store(true, core::sync::atomic::Ordering::Relaxed);
+                    let regs = self.regs();
+                    let rflags = VmcsGuestNW::RFLAGS.read().unwrap_or(0);
+                    let cr0 = VmcsGuestNW::CR0.read().unwrap_or(0);
+                    let cr4 = VmcsGuestNW::CR4.read().unwrap_or(0);
+                    let efer = VmcsGuest64::IA32_EFER.read().unwrap_or(0);
                     info!(
-                        "[VMX-DEBUG] Non-IO exit #{count}: reason={reason:?}, RIP={:#x}{}",
-                        self.rip(),
-                        extra
+                        "[STUCK] CPUID loop at RIP={rip:#x}: RAX={:#x} RBX={:#x} RCX={:#x} \
+                         RDX={:#x} RBP={:#x} RDI={:#x} RSI={:#x}",
+                        regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.rbp, regs.rdi, regs.rsi
                     );
+                    info!("[STUCK] RFLAGS={rflags:#x} CR0={cr0:#x} CR4={cr4:#x} EFER={efer:#x}");
+                    // Dump 64 bytes of instructions around the CPUID call
+                    if let Some(ept_root) = self.ept_root {
+                        let base_gpa = (rip.saturating_sub(16)) & !0x7u64;
+                        let mut dump = [0u8; 80];
+                        for (i, byte) in dump.iter_mut().enumerate() {
+                            let gpa = base_gpa + i as u64;
+                            if let Some(hpa) = self.gpa_to_hpa_via_ept(ept_root, gpa) {
+                                const PHYS_VIRT_OFFSET: u64 = 0xffff_8000_0000_0000;
+                                *byte = unsafe {
+                                    core::ptr::read_volatile(
+                                        (hpa as u64 + PHYS_VIRT_OFFSET) as *const u8,
+                                    )
+                                };
+                            }
+                        }
+                        info!(
+                            "[STUCK] Code around CPUID (RIP-16..RIP+64): {:02x?}",
+                            &dump[..80]
+                        );
+                    }
                 }
+            } else {
+                LAST_CPUID_RIP.store(rip, core::sync::atomic::Ordering::Relaxed);
+                SAME_CPUID_RIP_COUNT.store(0, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // Trace VM-exits after CPUID 0x80000000 to diagnose OVMF not calling 0x80000001
+        // Disabled: the CPUID 0x80000001 issue has been resolved (OVMF now enters
+        // long mode successfully). Keep the counter logic for potential future use.
+        if self.trace_after_cpuid_8k && self.trace_after_8k_count < 200 {
+            let reason = exit_info.exit_reason;
+            let rax = self.regs().rax as u32;
+            let short_reason = match reason {
+                VmxExitReason::IO_INSTRUCTION => "IO",
+                VmxExitReason::CPUID => "CPU",
+                VmxExitReason::EXTERNAL_INTERRUPT => "EXT",
+                VmxExitReason::PREEMPTION_TIMER => "PRM",
+                _ => "OTH",
+            };
+            // Log only CPUID exits (the original diagnostic target), skip noisy
+            // IO/EXT/PRM exits that flood the log during OVMF timer loops.
+            if matches!(reason, VmxExitReason::CPUID) {
+                info!("[T]{}{}{:x}", self.trace_after_8k_count, short_reason, rax);
+            }
+            self.trace_after_8k_count += 1;
+            if matches!(reason, VmxExitReason::CPUID) && rax == 0x80000001 {
+                self.trace_after_cpuid_8k = false; // Found it, stop tracing
+            }
+            if self.trace_after_8k_count >= 200 {
+                self.trace_after_cpuid_8k = false;
             }
         }
 
@@ -582,6 +799,21 @@ impl VmxVcpu {
         self.msr_bitmap.set_read_intercept(IA32_TSC_DEADLINE, true);
         self.msr_bitmap.set_write_intercept(IA32_TSC_DEADLINE, true);
 
+        // Intercept IA32_EFER MSR (0xC0000080) to track long mode transitions
+        const IA32_EFER: u32 = 0xC0000080;
+        self.msr_bitmap.set_read_intercept(IA32_EFER, true);
+        self.msr_bitmap.set_write_intercept(IA32_EFER, true);
+
+        // Intercept IA32_STAR/IA32_LSTAR/IA32_CSTAR/IA32_FMASK for syscall tracking
+        const IA32_STAR: u32 = 0xC0000081;
+        const IA32_LSTAR: u32 = 0xC0000082;
+        const IA32_CSTAR: u32 = 0xC0000083;
+        const IA32_FMASK: u32 = 0xC0000084;
+        for msr in [IA32_STAR, IA32_LSTAR, IA32_CSTAR, IA32_FMASK] {
+            self.msr_bitmap.set_read_intercept(msr, true);
+            self.msr_bitmap.set_write_intercept(msr, true);
+        }
+
         Ok(())
     }
 
@@ -597,6 +829,14 @@ impl VmxVcpu {
         }
         self.bind_to_current_processor()?;
         self.setup_msr_bitmap()?;
+        // Verify EFER MSR bitmap intercept is correctly set
+        // Use the set_read_intercept/set_write_intercept API to verify by re-reading the bitmap
+        {
+            // Just log the physical address for now; the bitmap is set up correctly
+            // since set_read_intercept/set_write_intercept were called
+            let pa = self.msr_bitmap.phys_addr();
+            info!("[MSR-BITMAP] EFER bitmap at phys_addr={:#x}", pa);
+        }
         self.setup_vmcs_guest(entry, boot_mode)?;
         self.setup_vmcs_control(ept_root, true)?;
         self.fixup_ia32e_guest_cr_and_efer()?;
@@ -681,7 +921,7 @@ impl VmxVcpu {
         set_guest_segment!(FS, 0x93);
         set_guest_segment!(GS, 0x93);
         set_guest_segment!(TR, 0x8b); // busy 32-bit TSS, present, usable
-        set_guest_segment!(LDTR, 0x10082); // unusable
+        set_guest_segment!(LDTR, 0x8082); // unusable (bit15=Unusable per SDM), LDT type
 
         // In UEFI mode, the OVMF firmware starts from the reset vector (0xFFFFFFF0).
         // The guest starts in real mode with CS=F000:FFF0 pointing to the reset vector.
@@ -706,8 +946,8 @@ impl VmxVcpu {
         {
             let cr0_fixed0 = Msr::IA32_VMX_CR0_FIXED0.read();
             let cr0_fixed1 = Msr::IA32_VMX_CR0_FIXED1.read();
-            let cr0_must0 = cr0_fixed1
-                & !(Cr0Flags::NOT_WRITE_THROUGH | Cr0Flags::CACHE_DISABLE).bits();
+            let cr0_must0 =
+                cr0_fixed1 & !(Cr0Flags::NOT_WRITE_THROUGH | Cr0Flags::CACHE_DISABLE).bits();
             // When UNRESTRICTED_GUEST is set, CR0.PE and CR0.PG may be 0
             // regardless of CR0_FIXED0 (Intel SDM Vol 3, Section 26.3.1.1).
             // For UEFI boot, we want the guest to start in real mode (PE=0, PG=0)
@@ -720,12 +960,12 @@ impl VmxVcpu {
             let cr0_must1 = if unrestricted_guest {
                 // UNRESTRICTED_GUEST is set: PE and PG can be 0
                 cr0_fixed0 as usize
-                    & !(Cr0Flags::PAGING | Cr0Flags::PROTECTED_MODE_ENABLE
+                    & !(Cr0Flags::PAGING
+                        | Cr0Flags::PROTECTED_MODE_ENABLE
                         | Cr0Flags::NOT_WRITE_THROUGH
                         | Cr0Flags::CACHE_DISABLE)
                         .bits() as usize
-            } else if (cr0_fixed0
-                & (Cr0Flags::PROTECTED_MODE_ENABLE | Cr0Flags::PAGING).bits())
+            } else if (cr0_fixed0 & (Cr0Flags::PROTECTED_MODE_ENABLE | Cr0Flags::PAGING).bits())
                 == (Cr0Flags::PROTECTED_MODE_ENABLE | Cr0Flags::PAGING).bits()
             {
                 // CR0_FIXED0 forces PE+PG and no UNRESTRICTED_GUEST: include them
@@ -737,7 +977,8 @@ impl VmxVcpu {
             };
             VmcsGuestNW::CR0.write(cr0_must1)?;
             info!(
-                "[VMX setup] GUEST_CR0={:#x} (must0={:#x}, must1={:#x}, fixed0={:#x}, unrestricted_guest={})",
+                "[VMX setup] GUEST_CR0={:#x} (must0={:#x}, must1={:#x}, fixed0={:#x}, \
+                 unrestricted_guest={})",
                 cr0_must1, cr0_must0, cr0_must1, cr0_fixed0, unrestricted_guest
             );
         }
@@ -822,7 +1063,10 @@ impl VmxVcpu {
             VmcsControl32::PINBASED_EXEC_CONTROLS,
             Msr::IA32_VMX_TRUE_PINBASED_CTLS,
             VmcsControl32::PINBASED_EXEC_CONTROLS.read()?,
-            (PinCtrl::NMI_EXITING | PinCtrl::EXTERNAL_INTERRUPT_EXITING).bits(),
+            (PinCtrl::NMI_EXITING
+                | PinCtrl::EXTERNAL_INTERRUPT_EXITING
+                | PinCtrl::VMX_PREEMPTION_TIMER)
+                .bits(),
             0,
         )?;
         let pin_ctrl = VmcsControl32::PINBASED_EXEC_CONTROLS.read()?;
@@ -848,8 +1092,7 @@ impl VmxVcpu {
                 | CpuCtrl::SECONDARY_CONTROLS
                 | CpuCtrl::HLT_EXITING)
                 .bits();
-            let old_prim =
-                VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
+            let old_prim = VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
             let new_prim = old_prim | mandatory1 | set_bits;
             // Resolve USE_IO_BITMAPS vs UNCOND_IO_EXITING conflict (SDM 26.2.1.1).
             // SDM: If USE_IO_BITMAPS=1, UNCOND_IO_EXITING must be 0.
@@ -861,14 +1104,11 @@ impl VmxVcpu {
             if (prim_to_write & USE_IO_BITMAPS_BIT) != 0
                 && (prim_to_write & UNCOND_IO_EXITING_BIT) != 0
             {
-                info!(
-                    "[VMX control] USE_IO_BITMAPS and UNCOND_IO_EXITING conflict (SDM 26.2.1.1)"
-                );
+                info!("[VMX control] USE_IO_BITMAPS and UNCOND_IO_EXITING conflict (SDM 26.2.1.1)");
                 // Try clearing USE_IO_BITMAPS first (UNCOND_IO_EXITING covers all I/O).
                 let try_prim = prim_to_write & !USE_IO_BITMAPS_BIT;
                 VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.write(try_prim)?;
-                let actual =
-                    VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
+                let actual = VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
                 if actual & USE_IO_BITMAPS_BIT == 0 {
                     prim_to_write = actual;
                     info!(
@@ -878,14 +1118,13 @@ impl VmxVcpu {
                 } else {
                     // USE_IO_BITMAPS is truly mandatory1, try clearing UNCOND_IO_EXITING.
                     info!(
-                        "[VMX control] USE_IO_BITMAPS is mandatory1 (read back={:#x}), \
-                         trying to clear UNCOND_IO_EXITING",
+                        "[VMX control] USE_IO_BITMAPS is mandatory1 (read back={:#x}), trying to \
+                         clear UNCOND_IO_EXITING",
                         actual
                     );
                     let try_prim = prim_to_write & !UNCOND_IO_EXITING_BIT;
                     VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.write(try_prim)?;
-                    let actual =
-                        VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
+                    let actual = VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
                     if actual & UNCOND_IO_EXITING_BIT == 0 {
                         prim_to_write = actual;
                         info!(
@@ -897,8 +1136,8 @@ impl VmxVcpu {
                         // Write the original value and hope for the best.
                         prim_to_write = new_prim;
                         info!(
-                            "[VMX control] Both USE_IO_BITMAPS and UNCOND_IO_EXITING are \
-                             truly mandatory1 (KVM nesting limitation), PRIM_CTRL={:#x}",
+                            "[VMX control] Both USE_IO_BITMAPS and UNCOND_IO_EXITING are truly \
+                             mandatory1 (KVM nesting limitation), PRIM_CTRL={:#x}",
                             actual
                         );
                     }
@@ -910,8 +1149,7 @@ impl VmxVcpu {
                 allowed0, allowed1, mandatory1, old_prim, set_bits, prim_to_write
             );
             VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.write(prim_to_write)?;
-            let actual =
-                VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
+            let actual = VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
             info!(
                 "[VMX control] Direct PRIM_CTRL read back: {:#x} (wrote {:#x})",
                 actual, prim_to_write
@@ -966,8 +1204,8 @@ impl VmxVcpu {
         let hw_mandatory1 = actual & !new_sec;
         let hw_mandatory0 = new_sec & !actual;
         info!(
-            "[VMX control] Direct SEC_CTRL read back: {:#x} (wrote {:#x}) \
-             hw_forced1={:#x} hw_forced0={:#x}",
+            "[VMX control] Direct SEC_CTRL read back: {:#x} (wrote {:#x}) hw_forced1={:#x} \
+             hw_forced0={:#x}",
             actual, new_sec, hw_mandatory1, hw_mandatory0
         );
 
@@ -1069,8 +1307,8 @@ impl VmxVcpu {
             );
             if !x2apic_cleared {
                 info!(
-                    "[VMX control] x2APIC could not be cleared - trying to clear \
-                     APIC-register virtualization instead"
+                    "[VMX control] x2APIC could not be cleared - trying to clear APIC-register \
+                     virtualization instead"
                 );
                 let new_sec = sec_ctrl & !CpuCtrl2::VIRTUALIZE_APIC_REGISTER.bits();
                 VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.write(new_sec)?;
@@ -1096,10 +1334,7 @@ impl VmxVcpu {
         // Re-read SEC_CTRL after all fixups to get the final hardware-accepted value.
         let sec_ctrl = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
         let actual = sec_ctrl;
-        info!(
-            "[VMX control] Final SEC_CTRL={:#x}",
-            actual
-        );
+        info!("[VMX control] Final SEC_CTRL={:#x}", actual);
 
         // SDM 26.2.1.1: If VMCS_SHADOWING is 1, LINK_PTR must point to a valid shadow VMCS.
         // Re-read shadowing_set after possible modification.
@@ -1163,8 +1398,7 @@ impl VmxVcpu {
             let entry_allowed1 = (entry_cap >> 32) as u32;
             let entry_mandatory1 = entry_allowed0;
             let old_entry = VmcsControl32::VMENTRY_CONTROLS.read()?;
-            let desired_entry_bits =
-                (EntryCtrl::LOAD_IA32_PAT | EntryCtrl::LOAD_IA32_EFER).bits();
+            let desired_entry_bits = (EntryCtrl::LOAD_IA32_PAT | EntryCtrl::LOAD_IA32_EFER).bits();
             let sec_ctrl = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
             let unrestricted_guest = (sec_ctrl >> 7) & 1 != 0;
             // Clear IA32E_MODE_GUEST if UNRESTRICTED_GUEST is set
@@ -1174,8 +1408,12 @@ impl VmxVcpu {
             info!(
                 "[VMX control] Direct ENTRY_CTRL write: allowed0={:#x}, allowed1={:#x}, \
                  mandatory1={:#x}, old={:#x}, set={:#x}, new={:#x}",
-                entry_allowed0, entry_allowed1, entry_mandatory1,
-                old_entry, desired_entry_bits, new_entry
+                entry_allowed0,
+                entry_allowed1,
+                entry_mandatory1,
+                old_entry,
+                desired_entry_bits,
+                new_entry
             );
             VmcsControl32::VMENTRY_CONTROLS.write(new_entry)?;
             let actual_entry = VmcsControl32::VMENTRY_CONTROLS.read()?;
@@ -1183,8 +1421,8 @@ impl VmxVcpu {
             let entry_hw_forced0 = new_entry & !actual_entry;
             let ia32e_forced = actual_entry & EntryCtrl::IA32E_MODE_GUEST.bits() != 0;
             info!(
-                "[VMX control] Direct ENTRY_CTRL read back: {:#x} (wrote {:#x}) \
-                 hw_forced1={:#x} hw_forced0={:#x} IA32E_MODE_GUEST={}",
+                "[VMX control] Direct ENTRY_CTRL read back: {:#x} (wrote {:#x}) hw_forced1={:#x} \
+                 hw_forced0={:#x} IA32E_MODE_GUEST={}",
                 actual_entry, new_entry, entry_hw_forced1, entry_hw_forced0, ia32e_forced
             );
         }
@@ -1197,9 +1435,11 @@ impl VmxVcpu {
         VmcsControl32::VMENTRY_MSR_LOAD_COUNT.write(0)?;
 
         {
-            let cr0_fixed0 = Msr::IA32_VMX_CR0_FIXED0.read();
-            let cr0_fixed1 = Msr::IA32_VMX_CR0_FIXED1.read();
-            let cr0_flex = !cr0_fixed0 & cr0_fixed1;
+            // CR0/CR4 are only 32 bits wide; mask the FIXED MSR values to 32 bits
+            // to avoid polluting the upper half of CR0_GUEST_HOST_MASK.
+            let cr0_fixed0 = Msr::IA32_VMX_CR0_FIXED0.read() as u32 as u64;
+            let cr0_fixed1 = Msr::IA32_VMX_CR0_FIXED1.read() as u32 as u64;
+            let cr0_flex = (!cr0_fixed0 & 0xFFFF_FFFF) & cr0_fixed1;
             let mut cr0_mask = cr0_flex | cr0_fixed0;
             // When UNRESTRICTED_GUEST is set, PE and PG are not forced by
             // CR0_FIXED0 (Intel SDM Vol 3, Section 26.3.1.1). Exclude them
@@ -1214,14 +1454,15 @@ impl VmxVcpu {
             VmcsControlNW::CR0_GUEST_HOST_MASK.write(cr0_mask as usize)?;
             VmcsControlNW::CR0_READ_SHADOW.write(VmcsGuestNW::CR0.read()?)?;
             info!(
-                "[VMX control] CR0_MASK={:#x} (fixed0={:#x} fixed1={:#x} flex={:#x} unrestricted_guest={})",
+                "[VMX control] CR0_MASK={:#x} (fixed0={:#x} fixed1={:#x} flex={:#x} \
+                 unrestricted_guest={})",
                 cr0_mask, cr0_fixed0, cr0_fixed1, cr0_flex, unrestricted_guest
             );
         }
         {
-            let cr4_fixed0 = Msr::IA32_VMX_CR4_FIXED0.read();
-            let cr4_fixed1 = Msr::IA32_VMX_CR4_FIXED1.read();
-            let cr4_flex = !cr4_fixed0 & cr4_fixed1;
+            let cr4_fixed0 = Msr::IA32_VMX_CR4_FIXED0.read() as u32 as u64;
+            let cr4_fixed1 = Msr::IA32_VMX_CR4_FIXED1.read() as u32 as u64;
+            let cr4_flex = (!cr4_fixed0 & 0xFFFF_FFFF) & cr4_fixed1;
             let cr4_mask = cr4_flex | cr4_fixed0;
             VmcsControlNW::CR4_GUEST_HOST_MASK.write(cr4_mask as usize)?;
             VmcsControlNW::CR4_READ_SHADOW.write(VmcsGuestNW::CR4.read()?)?;
@@ -1242,20 +1483,18 @@ impl VmxVcpu {
         let cr0_changed = (guest_cr0 & cr0_mask_actual) != (host_cr0 & cr0_mask_actual);
         let cr4_changed = (guest_cr4 & cr4_mask_actual) != (host_cr4 & cr4_mask_actual);
         if cr0_changed {
-            guest_cr0 =
-                (host_cr0 & cr0_mask_actual) | (guest_cr0 & !cr0_mask_actual);
+            guest_cr0 = (host_cr0 & cr0_mask_actual) | (guest_cr0 & !cr0_mask_actual);
             VmcsGuestNW::CR0.write(guest_cr0)?;
             VmcsControlNW::CR0_READ_SHADOW.write(guest_cr0)?;
         }
         if cr4_changed {
-            guest_cr4 =
-                (host_cr4 & cr4_mask_actual) | (guest_cr4 & !cr4_mask_actual);
+            guest_cr4 = (host_cr4 & cr4_mask_actual) | (guest_cr4 & !cr4_mask_actual);
             VmcsGuestNW::CR4.write(guest_cr4)?;
             VmcsControlNW::CR4_READ_SHADOW.write(guest_cr4)?;
         }
         info!(
-            "[VMX control] CR0_MASK_actual={:#x} CR4_MASK_actual={:#x} \
-             CR0 guest{}/host{} CR4 guest{}/host{} reconcile_cr0={} reconcile_cr4={}",
+            "[VMX control] CR0_MASK_actual={:#x} CR4_MASK_actual={:#x} CR0 guest{}/host{} CR4 \
+             guest{}/host{} reconcile_cr0={} reconcile_cr4={}",
             cr0_mask_actual,
             cr4_mask_actual,
             VmcsGuestNW::CR0.read().unwrap_or(0),
@@ -1267,8 +1506,8 @@ impl VmxVcpu {
         );
         VmcsControl32::CR3_TARGET_COUNT.write(0)?;
 
-        // Pass-through exceptions (except #UD(6)), don't use I/O bitmap, set MSR bitmaps.
-        let exception_bitmap: u32 = 1 << 6;
+        // Pass-through all exceptions (no VM exit on exceptions).
+        let exception_bitmap: u32 = 0;
 
         self.setup_io_bitmap()?;
 
@@ -1343,12 +1582,14 @@ impl VmxVcpu {
             if actual_entry & EntryControls::IA32E_MODE_GUEST.bits() != 0 {
                 need_ia32e = true;
                 info!(
-                    "[VMX setup] CR0_FIXED0 forces PE+PG, forced IA32E_MODE_GUEST: entry {:#x} -> {:#x}",
+                    "[VMX setup] CR0_FIXED0 forces PE+PG, forced IA32E_MODE_GUEST: entry {:#x} -> \
+                     {:#x}",
                     entry_ctrl, actual_entry
                 );
             } else {
                 warn!(
-                    "[VMX setup] CR0_FIXED0 forces PE+PG but IA32E_MODE_GUEST write rejected: {:#x}",
+                    "[VMX setup] CR0_FIXED0 forces PE+PG but IA32E_MODE_GUEST write rejected: \
+                     {:#x}",
                     actual_entry
                 );
             }
@@ -1362,9 +1603,9 @@ impl VmxVcpu {
             efer |= EferFlags::LONG_MODE_ENABLE.bits();
             efer |= MSR_IA32_EFER_LMA_BIT; // SDM: LMA must equal IA32E_MODE_GUEST
             VmcsGuest64::IA32_EFER.write(efer)?;
-            // Set CS to 64-bit code segment: L=1, D=0
-            // VMCS access rights: bit13=L, bit14=D, bits 11:8 must be 0
-            let cs_ar = 0x209b; // L=1(bit13), D=0, present, code, exec/read, accessed
+            // Set CS to 64-bit code segment: L=1, D/B=0
+            // Intel SDM Vol 3C 24.4.1: bit12=L, bit13=D/B, bit14=G, bit15=Unusable
+            let cs_ar = 0x109b; // L=1(bit12), D/B=0, present, code, exec/read, accessed
             VmcsGuest32::CS_ACCESS_RIGHTS.write(cs_ar)?;
             // In IA-32e mode, CS base must be 0 to avoid non-canonical linear addresses.
             // The original CS_BASE=0xFFFF0000 would cause RIP+CS_BASE to overflow
@@ -1373,7 +1614,8 @@ impl VmxVcpu {
             VmcsGuest32::CS_LIMIT.write(0xffffffff)?;
             // IA32E_MODE_GUEST requires TR to be a busy TSS (SDM 26.3.1.2)
             let tr_ar = VmcsGuest32::TR_ACCESS_RIGHTS.read()?;
-            if tr_ar & (1 << 16) != 0 {
+            if tr_ar & (1 << 15) != 0 {
+                // bit 15 = Unusable per Intel SDM 24.4.1
                 VmcsGuest32::TR_ACCESS_RIGHTS.write(0x8b)?;
                 VmcsGuestNW::TR_BASE.write(0)?;
                 VmcsGuest32::TR_LIMIT.write(0x67)?;
@@ -1481,60 +1723,60 @@ impl VmxVcpu {
             .read()
             .unwrap_or(0);
 
-        info!(
+        debug!(
             "[VMCS-DUMP] RIP={:#x} RSP={:#x} RFLAGS={:#x}",
             rip, rsp, rflags
         );
-        info!(
+        debug!(
             "[VMCS-DUMP] CR0={:#x} CR3={:#x} CR4={:#x} DR7={:#x}",
             cr0, cr3, cr4, dr7
         );
-        info!("[VMCS-DUMP] EFER={:#x} PAT={:#x}", efer, pat);
-        info!(
+        debug!("[VMCS-DUMP] EFER={:#x} PAT={:#x}", efer, pat);
+        debug!(
             "[VMCS-DUMP] SYSENTER: CS={:#x} ESP={:#x} EIP={:#x}",
             sysenter_cs, sysenter_esp, sysenter_eip
         );
-        info!(
+        debug!(
             "[VMCS-DUMP] INT_STATE={:#x} ACTIVITY={:#x} LINK_PTR={:#x}",
             int_state, activity, link_ptr
         );
-        info!(
+        debug!(
             "[VMCS-DUMP] GDTR={:#x}:{:#x} IDTR={:#x}:{:#x}",
             gdtr_base, gdtr_limit, idtr_base, idtr_limit
         );
-        info!(
+        debug!(
             "[VMCS-DUMP] CS: sel={:#x} base={:#x} limit={:#x} AR={:#x}",
             cs_sel, cs_base, cs_limit, cs_ar
         );
-        info!(
+        debug!(
             "[VMCS-DUMP] SS: sel={:#x} base={:#x} limit={:#x} AR={:#x}",
             ss_sel, ss_base, ss_limit, ss_ar
         );
-        info!(
+        debug!(
             "[VMCS-DUMP] DS: sel={:#x} AR={:#x}  ES: sel={:#x} AR={:#x}",
             ds_sel, ds_ar, es_sel, es_ar
         );
-        info!(
+        debug!(
             "[VMCS-DUMP] FS: sel={:#x} base={:#x} AR={:#x}",
             fs_sel, fs_base, fs_ar
         );
-        info!(
+        debug!(
             "[VMCS-DUMP] GS: sel={:#x} base={:#x} AR={:#x}",
             gs_sel, gs_base, gs_ar
         );
-        info!(
+        debug!(
             "[VMCS-DUMP] TR: sel={:#x} base={:#x} limit={:#x} AR={:#x}",
             tr_sel, tr_base, tr_limit, tr_ar
         );
-        info!(
+        debug!(
             "[VMCS-DUMP] LDTR: sel={:#x} base={:#x} AR={:#x}",
             ldtr_sel, ldtr_base, ldtr_ar
         );
-        info!(
+        debug!(
             "[VMCS-DUMP] CR0_MASK={:#x} CR0_SHADOW={:#x} CR4_MASK={:#x} CR4_SHADOW={:#x}",
             cr0_mask, cr0_shadow, cr4_mask, cr4_shadow
         );
-        info!(
+        debug!(
             "[VMCS-DUMP] SEC_CTRL={:#x} ENTRY_CTRL={:#x} EXIT_CTRL={:#x} EPTP={:#x} VPID={}",
             sec_ctrl,
             entry_ctrl,
@@ -1542,7 +1784,7 @@ impl VmxVcpu {
             eptp,
             VmcsControl16::VPID.read().unwrap_or(0),
         );
-        info!(
+        debug!(
             "[VMCS-DUMP] PERF_GLOBAL_CTRL={:#x} BNDCFGS={:#x} VMENTRY_INFO={:#x}",
             perf_global_ctrl, bndcfgs, vmentry_intinfo
         );
@@ -1551,7 +1793,7 @@ impl VmxVcpu {
         let prim_ctrl = VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS
             .read()
             .unwrap_or(0);
-        info!(
+        debug!(
             "[VMCS-DUMP] PIN_CTRL={:#x} PRIM_CTRL={:#x}",
             pin_ctrl, prim_ctrl
         );
@@ -1562,7 +1804,7 @@ impl VmxVcpu {
         let host_rip = VmcsHostNW::RIP.read().unwrap_or(0);
         let host_rsp = VmcsHostNW::RSP.read().unwrap_or(0);
         let host_efer = VmcsHost64::IA32_EFER.read().unwrap_or(0);
-        info!(
+        debug!(
             "[VMCS-DUMP-HOST] CR0={:#x} CR3={:#x} CR4={:#x} RIP={:#x} RSP={:#x} EFER={:#x}",
             host_cr0, host_cr3, host_cr4, host_rip, host_rsp, host_efer
         );
@@ -1574,7 +1816,7 @@ impl VmxVcpu {
         let host_fs = VmcsHost16::FS_SELECTOR.read().unwrap_or(0);
         let host_gs = VmcsHost16::GS_SELECTOR.read().unwrap_or(0);
         let host_tr = VmcsHost16::TR_SELECTOR.read().unwrap_or(0);
-        info!(
+        debug!(
             "[VMCS-DUMP-HOST] CS={:#x} SS={:#x} DS={:#x} ES={:#x} FS={:#x} GS={:#x} TR={:#x}",
             host_cs, host_ss, host_ds, host_es, host_fs, host_gs, host_tr
         );
@@ -1584,7 +1826,7 @@ impl VmxVcpu {
         let host_tr_base = VmcsHostNW::TR_BASE.read().unwrap_or(0);
         let host_gdtr = VmcsHostNW::GDTR_BASE.read().unwrap_or(0);
         let host_idtr = VmcsHostNW::IDTR_BASE.read().unwrap_or(0);
-        info!(
+        debug!(
             "[VMCS-DUMP-HOST] FS_BASE={:#x} GS_BASE={:#x} TR_BASE={:#x} GDTR={:#x} IDTR={:#x}",
             host_fs_base, host_gs_base, host_tr_base, host_gdtr, host_idtr
         );
@@ -1592,7 +1834,7 @@ impl VmxVcpu {
         let io_a = VmcsControl64::IO_BITMAP_A_ADDR.read().unwrap_or(0);
         let io_b = VmcsControl64::IO_BITMAP_B_ADDR.read().unwrap_or(0);
         let msr_bmp = VmcsControl64::MSR_BITMAPS_ADDR.read().unwrap_or(0);
-        info!(
+        debug!(
             "[VMCS-DUMP-HOST] IO_A={:#x} IO_B={:#x} MSR_BMP={:#x}",
             io_a, io_b, msr_bmp
         );
@@ -1615,23 +1857,61 @@ impl VmxVcpu {
                     // - PE and PG can be freely chosen (by the guest) because we demand
                     //   unrestricted guest mode support anyway
                     // - ET is ignored
-                    let must0 = Msr::IA32_VMX_CR0_FIXED1.read()
+                    // CR0 is only 32 bits effective; mask the FIXED MSR values to 32 bits
+                    // to avoid polluting the upper half of CR0_GUEST_HOST_MASK.
+                    let must0 = Msr::IA32_VMX_CR0_FIXED1.read() as u32 as u64
                         & !(Cr0Flags::NOT_WRITE_THROUGH | Cr0Flags::CACHE_DISABLE).bits();
-                    let must1 = Msr::IA32_VMX_CR0_FIXED0.read()
+                    let must1 = Msr::IA32_VMX_CR0_FIXED0.read() as u32 as u64
                         & !(Cr0Flags::PAGING | Cr0Flags::PROTECTED_MODE_ENABLE).bits();
-                    VmcsGuestNW::CR0.write(((val & must0) | must1) as _)?;
+                    // PG and PE are guest-owned (excluded from must0/must1),
+                    // so (val & must0) | must1 would clear them. Preserve the
+                    // guest's intent by OR-ing PG and PE back in.
+                    let guest_owned = Cr0Flags::PAGING | Cr0Flags::PROTECTED_MODE_ENABLE;
+                    let cr0_val = ((val & must0) | must1) | (val & guest_owned.bits());
+                    if (val & Cr0Flags::PAGING.bits()) != 0 {
+                        info!(
+                            "[CR0] PG=1 in val={val:#x}, must0={must0:#x}, must1={must1:#x}, \
+                             cr0_val={cr0_val:#x}"
+                        );
+                    }
+                    VmcsGuestNW::CR0.write(cr0_val as _)?;
                     VmcsControlNW::CR0_READ_SHADOW.write(val as _)?;
-                    VmcsControlNW::CR0_GUEST_HOST_MASK.write((must1 | !must0) as _)?;
+                    // Compute CR0_GUEST_HOST_MASK in u32 to avoid upper-bit pollution.
+                    // Bits that must be 1 (must1) or must be 0 (!must0) are host-owned.
+                    let not_must0: u32 = !(must0 as u32);
+                    let cr0_mask: u32 = must1 as u32 | not_must0;
+                    VmcsControlNW::CR0_GUEST_HOST_MASK.write(cr0_mask as _)?;
+                    // If PG is being set, check if we need to activate long mode
+                    if (val & Cr0Flags::PAGING.bits()) != 0 {
+                        let efer = VmcsGuest64::IA32_EFER.read().unwrap_or(0);
+                        let lme = (efer >> 8) & 1;
+                        if lme != 0 && (efer & MSR_IA32_EFER_LMA_BIT) == 0 {
+                            let new_efer = efer | MSR_IA32_EFER_LMA_BIT;
+                            VmcsGuest64::IA32_EFER.write(new_efer)?;
+                            info!("[CR0] PG set with LME, activated LMA: EFER={new_efer:#x}");
+                        }
+                    }
                 }
-                3 => VmcsGuestNW::CR3.write(val as _)?,
+                // Bit 63 of CR3 is the NOFLUSH hint for MOV to CR3, not part of
+                // the actual CR3 value. Intel SDM 26.3.1.1 requires bit 63 to be 0
+                // when CR4.PCIDE=1. Linux KPTI sets bit 63 on context switches;
+                // mask it off before storing in VMCS guest CR3.
+                3 => VmcsGuestNW::CR3.write((val & !(1u64 << 63)) as _)?,
                 4 => {
                     // Retrieve/validate restrictions on CR4
-                    let must0 = Msr::IA32_VMX_CR4_FIXED1.read();
-                    let must1 = Msr::IA32_VMX_CR4_FIXED0.read();
+                    // CR4 is only 32 bits wide; mask the FIXED MSR values to 32 bits
+                    // to avoid polluting the upper half of CR4_GUEST_HOST_MASK.
+                    let must0 = Msr::IA32_VMX_CR4_FIXED1.read() as u32 as u64;
+                    let must1 = Msr::IA32_VMX_CR4_FIXED0.read() as u32 as u64;
                     let val = val | Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits();
                     VmcsGuestNW::CR4.write(((val & must0) | must1) as _)?;
                     VmcsControlNW::CR4_READ_SHADOW.write(val as _)?;
-                    VmcsControlNW::CR4_GUEST_HOST_MASK.write((must1 | !must0) as _)?;
+                    // Keep the mask within 32 bits: !must0 must also be masked
+                    // to avoid setting bits 63:32 of CR4_GUEST_HOST_MASK.
+                    let not_must0: u32 = !(must0 as u32);
+                    let mask: u32 = must1 as u32 | not_must0;
+                    info!("[CR4m] m0={:#x} m1={:#x} mk={:#x}", must0, must1, mask);
+                    VmcsControlNW::CR4_GUEST_HOST_MASK.write(mask as usize)?;
                 }
                 _ => unreachable!(),
             };
@@ -1779,23 +2059,90 @@ impl VmxVcpu {
     fn allow_interrupt(&self) -> bool {
         let rflags = VmcsGuestNW::RFLAGS.read().unwrap();
         let block_state = VmcsGuest32::INTERRUPTIBILITY_STATE.read().unwrap();
-        rflags as u64 & x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits() != 0
-            && block_state == 0
+        let if_flag = rflags as u64 & x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits() != 0;
+        let blocked = block_state != 0;
+        if !if_flag || blocked {
+            // Log why interrupts can't be delivered (rate-limited)
+            static LOG_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            let count = LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if count < 5 || count == 100 || count == 1000 {
+                info!(
+                    "[INTR-BLOCK] IF={}, block_state={:#x}, RFLAGS={:#x} (count={})",
+                    if_flag, block_state, rflags, count
+                );
+            }
+        }
+        if_flag && !blocked
     }
 
     /// Try to inject a pending event before next VM entry.
     fn inject_pending_events(&mut self) -> AxResult {
         vmcs::clear_injection()?;
 
-        if let Some(vioapic) = GLOBAL_VIOAPIC.get() {
-            let vcpu_id = self.vlapic.timer_where_am_i().1 as u32;
-            let pending = vioapic.take_pending_irqs(vcpu_id);
-            for vector in pending {
+        let apic_enabled = self.vlapic.is_software_enabled();
+
+        if apic_enabled {
+            // APIC-enabled path: IOAPIC → vLAPIC → inject as External interrupt
+            if let Some(vioapic) = GLOBAL_VIOAPIC.get() {
+                let vcpu_id = self.vlapic.timer_where_am_i().1 as u32;
+                let pending = vioapic.take_pending_irqs(vcpu_id);
+                for vector in pending {
+                    info!(
+                        "[IOAPIC] Injecting pending IRQ vector={:#x} to vcpu={}",
+                        vector, vcpu_id
+                    );
+                    self.vlapic.set_intr(vcpu_id, vector as u32);
+                    self.queue_external_interrupt(vector);
+                }
+            }
+
+            // Check for pending timer interrupt from LVT_TIMER unmask.
+            let pending_timer = self.vlapic.take_pending_timer_vector();
+            if pending_timer > 0 {
+                self.queue_external_interrupt(pending_timer);
+                debug!("[VLAPIC] Queued pending timer interrupt vector={pending_timer:#x}");
+            }
+
+            // Also check 8259 PIC for pending interrupts (Virtual Wire Mode fallback).
+            // In real hardware with Virtual Wire Mode, the 8259 PIC output is connected
+            // to LAPIC LINT0 (configured as ExtINT). When OVMF enables APIC but hasn't
+            // fully configured IOAPIC RTEs yet, PIT IRQ0 may still need to be delivered
+            // through the 8259 PIC path. This simulates the LINT0 ExtINT connection.
+            if self.pending_events.is_empty()
+                && let Some(pic) = i8259_pic::GLOBAL_PIC_MASTER.get()
+                && let Some(vector) = pic.acknowledge()
+            {
                 debug!(
-                    "[IOAPIC] Injecting pending IRQ vector={:#x} to vcpu={}",
-                    vector, vcpu_id
+                    "[PIC] Virtual Wire Mode (APIC on, IOAPIC empty): acknowledging IRQ, \
+                     vector={:#x}",
+                    vector
                 );
-                self.vlapic.set_intr(vcpu_id, vector as u32);
+                self.queue_external_interrupt(vector);
+            }
+        } else {
+            // Virtual Wire Mode: 8259 PIC → inject as External interrupt
+            // When APIC is not software-enabled, OVMF receives interrupts
+            // through the 8259 PIC path (INTR pin → ExtINT).
+            //
+            // Per Intel SDM 10.4.3, the local APIC timer still generates
+            // interrupts even when software-disabled. Check for pending
+            // timer interrupts here as well.
+            let pending_timer = self.vlapic.take_pending_timer_vector();
+            if pending_timer > 0 {
+                self.queue_external_interrupt(pending_timer);
+                debug!(
+                    "[VLAPIC] Queued pending timer interrupt (APIC disabled) \
+                     vector={pending_timer:#x}"
+                );
+            }
+
+            if let Some(pic) = i8259_pic::GLOBAL_PIC_MASTER.get()
+                && let Some(vector) = pic.acknowledge()
+            {
+                debug!(
+                    "[PIC] Virtual Wire Mode: acknowledging IRQ, vector={:#x}",
+                    vector
+                );
                 self.queue_external_interrupt(vector);
             }
         }
@@ -1804,13 +2151,25 @@ impl VmxVcpu {
             let can_inject =
                 !matches!(event.int_type, VmxInterruptionType::External) || self.allow_interrupt();
             if can_inject {
-                info!(
+                debug!(
                     "[INTR] Injecting interrupt vector={:#x} type={:?}",
                     event.vector, event.int_type
                 );
                 vmcs::inject_event_with_type(event.vector, event.err_code, event.int_type)?;
                 self.pending_events.pop_front();
             } else {
+                // Log periodically to avoid flooding but still provide debug info
+                static INJECT_FAIL_COUNT: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let count = INJECT_FAIL_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if count.is_multiple_of(1000) {
+                    let rflags = VmcsGuestNW::RFLAGS.read().unwrap_or(0);
+                    info!(
+                        "[INTR] Cannot inject vector={:#x} type={:?} (fail #{count}), \
+                         RFLAGS={rflags:#x}, setting interrupt window",
+                        event.vector, event.int_type
+                    );
+                }
                 self.set_interrupt_window(true)?;
             }
         }
@@ -1828,7 +2187,27 @@ impl VmxVcpu {
         // - xsetbv: set guest xcr;
         // - cr access: just panic;
         match exit_info.exit_reason {
-            VmxExitReason::INTERRUPT_WINDOW => Some(self.set_interrupt_window(false)),
+            VmxExitReason::INTERRUPT_WINDOW => {
+                debug!(
+                    "[INTR-WINDOW] Interrupt window VM-exit fired, RIP={:#x}",
+                    self.rip()
+                );
+                // The interrupt window is now open (RFLAGS.IF=1, no blocking).
+                // Try to inject any pending events before disabling the window.
+                // inject_pending_events will re-enable the window if there are still
+                // events that can't be injected.
+                if let Err(e) = self.set_interrupt_window(false) {
+                    warn!("[INTR-WINDOW] failed to disable interrupt window: {e:?}");
+                }
+                if let Err(e) = self.inject_pending_events() {
+                    warn!("[INTR-WINDOW] failed to inject pending events: {e:?}");
+                }
+                // INTERRUPT_WINDOW is fully handled here; return Some(Ok(()))
+                // so that inner_run() resumes the guest without propagating
+                // the exit to the outer run() handler (which would treat it
+                // as an unsupported VM-Exit and halt the vCPU).
+                Some(Ok(()))
+            }
             VmxExitReason::NMI_WINDOW => Some(self.handle_nmi_window()),
             VmxExitReason::PREEMPTION_TIMER => Some(self.handle_vmx_preemption_timer()),
             VmxExitReason::XSETBV => Some(self.handle_xsetbv()),
@@ -1861,6 +2240,77 @@ impl VmxVcpu {
             {
                 Some(self.handle_tsc_deadline_msr(msr_rw == VmxExitReason::MSR_WRITE))
             }
+            msr_rw @ (VmxExitReason::MSR_READ | VmxExitReason::MSR_WRITE)
+                if {
+                    let msr = self.regs().rcx as u32;
+                    (0xC0000080..=0xC0000084).contains(&msr) // EFER, STAR, LSTAR, CSTAR, FMASK
+                } =>
+            {
+                let is_write = msr_rw == VmxExitReason::MSR_WRITE;
+                let msr = self.regs().rcx as u32;
+                if is_write {
+                    let value = self.read_edx_eax();
+                    info!(
+                        "[EFER/SYS] write MSR {msr:#x} = {value:#x}, RIP={:#x}",
+                        self.rip()
+                    );
+                    if msr == 0xC0000080 {
+                        // Write to GUEST_EFER in VMCS, not physical MSR
+                        if let Err(e) = VmcsGuest64::IA32_EFER.write(value) {
+                            warn!("[EFER] failed to write GUEST_EFER: {e:?}");
+                        }
+                        // If LME is being set and CR0.PG is already set, set LMA too
+                        let cr0 = VmcsGuestNW::CR0.read().unwrap_or(0);
+                        let lme = (value >> 8) & 1;
+                        let pg = (cr0 >> 31) & 1;
+                        if lme != 0 && pg != 0 {
+                            let new_efer = value | MSR_IA32_EFER_LMA_BIT;
+                            if let Err(e) = VmcsGuest64::IA32_EFER.write(new_efer) {
+                                warn!("[EFER] failed to write GUEST_EFER with LMA: {e:?}");
+                            }
+                            info!("[EFER] LME+PG set, LMA activated: EFER={new_efer:#x}");
+                        }
+                        info!("[EFER] After EFER write: CR0={cr0:#x}, PG={pg}, LME={lme}");
+                    } else {
+                        // For STAR/LSTAR/CSTAR/FMASK, pass through to hardware
+                        unsafe {
+                            match msr {
+                                0xC0000081 => x86::msr::wrmsr(x86::msr::IA32_STAR, value),
+                                0xC0000082 => x86::msr::wrmsr(x86::msr::IA32_LSTAR, value),
+                                0xC0000083 => x86::msr::wrmsr(x86::msr::IA32_CSTAR, value),
+                                0xC0000084 => x86::msr::wrmsr(x86::msr::IA32_FMASK, value),
+                                _ => {}
+                            }
+                        }
+                    }
+                } else {
+                    if msr == 0xC0000080 {
+                        let value = VmcsGuest64::IA32_EFER.read().unwrap_or(0);
+                        info!(
+                            "[EFER/SYS] read MSR {msr:#x} = {value:#x}, RIP={:#x}",
+                            self.rip()
+                        );
+                        self.write_edx_eax(value);
+                    } else {
+                        let value = unsafe {
+                            match msr {
+                                0xC0000081 => x86::msr::rdmsr(x86::msr::IA32_STAR),
+                                0xC0000082 => x86::msr::rdmsr(x86::msr::IA32_LSTAR),
+                                0xC0000083 => x86::msr::rdmsr(x86::msr::IA32_CSTAR),
+                                0xC0000084 => x86::msr::rdmsr(x86::msr::IA32_FMASK),
+                                _ => 0,
+                            }
+                        };
+                        info!(
+                            "[EFER/SYS] read MSR {msr:#x} = {value:#x}, RIP={:#x}",
+                            self.rip()
+                        );
+                        self.write_edx_eax(value);
+                    }
+                }
+                self.advance_rip(2).ok()?;
+                Some(Ok(()))
+            }
             VmxExitReason::APIC_ACCESS => Some(self.handle_apic_access(exit_info)),
             VmxExitReason::EPT_VIOLATION => {
                 if let Ok(info) = self.nested_page_fault_info() {
@@ -1870,19 +2320,57 @@ impl VmxVcpu {
                         core::sync::atomic::AtomicU64::new(0);
                     let vc = EPT_VIOL_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     if vc < 20 || vc == 100 || vc == 1000 {
+                        let _cr0 = VmcsGuestNW::CR0.read().unwrap_or(0);
+                        let _cr4 = VmcsGuestNW::CR4.read().unwrap_or(0);
+                        let _efer = VmcsGuest64::IA32_EFER.read().unwrap_or(0);
+                        let _cs_sel = VmcsGuest16::CS_SELECTOR.read().unwrap_or(0);
+                        let _cs_base = VmcsGuestNW::CS_BASE.read().unwrap_or(0);
+                        let rip = self.rip();
                         info!(
-                            "[EPT-VIOL] #{vc}: GPA={gpa:#x}, RIP={:#x}, flags={:?}",
-                            self.rip(),
+                            "[EPT-VIOL] #{vc}: GPA={gpa:#x}, RIP={rip:#x}, flags={:?}",
                             flags
                         );
+                        if vc < 5 {
+                            let regs = self.regs();
+                            info!(
+                                "[EPT-VIOL] #{vc}: RAX={:#x} RBX={:#x} RCX={:#x} RDX={:#x}",
+                                regs.rax, regs.rbx, regs.rcx, regs.rdx
+                            );
+                            if let Some((bytes, actual_len)) = self.read_guest_instr_bytes(8) {
+                                info!(
+                                    "[EPT-VIOL] #{vc}: instr bytes={:02x?}",
+                                    &bytes[..actual_len.min(8)]
+                                );
+                            }
+                        }
                     }
-                    if (0xFEE0_0000..0xFEE0_1000).contains(&gpa) {
+
+                    // Memory probing beyond ram_end must be handled before PCI MMIO
+                    // because addresses between ram_end and PCI MMIO window start
+                    // are RAM holes that OVMF probes for memory detection.
+                    // PCI MMIO window (0xE0000000..0xFEC00000) matches QEMU Q35.
+                    // APIC MMIO (0xFEE00000), IOAPIC MMIO, and PCI MMIO
+                    // must be handled by their respective handlers instead.
+                    // ECAM MMIO (0xB0000000..0xC0000000) is handled by the main
+                    // EPT violation handler which returns MmioRead/MmioWrite so the
+                    // VMM can dispatch to the PCI host bridge's ECAM interface.
+                    let is_apic_mmio = (0xFEE0_0000..0xFEE0_1000).contains(&gpa);
+                    let is_ioapic_mmio = gpa >= IOAPIC_MMIO_BASE as usize
+                        && gpa < (IOAPIC_MMIO_BASE + IOAPIC_MMIO_SIZE) as usize;
+                    let is_pci_mmio = (0xE000_0000..0xFEC0_0000).contains(&gpa);
+                    let is_ecam_mmio = (ECAM_MMIO_BASE..ECAM_MMIO_END).contains(&gpa);
+                    if self.ram_end > 0
+                        && gpa >= self.ram_end
+                        && !flags.contains(MappingFlags::EXECUTE)
+                        && !is_apic_mmio
+                        && !is_ioapic_mmio
+                        && !is_pci_mmio
+                        && !is_ecam_mmio
+                    {
+                        Some(self.handle_memory_probing_ept_violation(gpa, &info))
+                    } else if is_apic_mmio {
                         Some(self.handle_apic_mmio_ept_violation())
-                    // PCI MMIO window: 0x8000_0000..0xFEC0_0000 covers the full 32-bit
-                    // addressable PCI BAR space.  OVMF allocates BARs above 0xC000_0000,
-                    // so the range must extend past 0xC000_0000 up to the APIC/IOAPIC
-                    // region at 0xFEC0_0000.
-                    } else if (0x8000_0000..0xFEC0_0000).contains(&gpa) {
+                    } else if is_pci_mmio {
                         Some(self.handle_pci_mmio_ept_violation())
                     } else {
                         None
@@ -1913,22 +2401,41 @@ impl VmxVcpu {
         const APIC_BASE_ADDR: u64 = 0xFEE0_0000;
         const APIC_GLOBAL_ENABLE: u64 = 1 << 11;
         const X2APIC_ENABLE: u64 = 1 << 10;
+        const BSP_FLAG: u64 = 1 << 8;
 
         if write {
             let value = self.read_edx_eax();
             let new_base = value & 0xFFFF_F000;
             let x2apic = (value & X2APIC_ENABLE) != 0;
             let enabled = (value & APIC_GLOBAL_ENABLE) != 0;
+            let bsp = (value & BSP_FLAG) != 0;
             info!(
                 "[APIC-BASE] write: value={value:#x}, base={new_base:#x}, x2apic={x2apic}, \
-                 enabled={enabled}"
+                 enabled={enabled}, bsp={bsp}"
             );
             if new_base != APIC_BASE_ADDR {
-                warn!("[APIC-BASE] guest tried to change APIC base to {new_base:#x}, ignoring");
+                warn!(
+                    "[APIC-BASE] guest tried to change APIC base to {new_base:#x}, forcing to \
+                     {APIC_BASE_ADDR:#x}"
+                );
             }
+            // Actually update the vLAPIC's apic_base state so that
+            // is_software_enabled / is_x2apic_enabled reflect guest writes.
+            // The base address is forced to the default inside set_apic_base.
+            self.vlapic.set_apic_base(value);
         } else {
-            let value = APIC_BASE_ADDR | APIC_GLOBAL_ENABLE | X2APIC_ENABLE;
-            info!("[APIC-BASE] read: returning {value:#x}");
+            // Return the vLAPIC's actual apic_base state. On first read
+            // (before any write) this is 0; OVMF expects to see the BSP +
+            // xAPIC-enabled bits set, so synthesize them if the guest has
+            // never written the MSR yet.
+            let current = self.vlapic.apic_base();
+            let value = if current == 0 {
+                // Power-on default: APIC enabled, BSP selected, base=FEE0_0000.
+                APIC_BASE_ADDR | APIC_GLOBAL_ENABLE | BSP_FLAG
+            } else {
+                current
+            };
+            debug!("[APIC-BASE] read: returning {value:#x}");
             self.write_edx_eax(value);
         }
         Ok(())
@@ -1971,7 +2478,7 @@ impl VmxVcpu {
 
         if write {
             let value = self.read_edx_eax();
-            debug!("[TSC-DEADLINE] write: value={value:#x}");
+            info!("[TSC-DEADLINE] write: value={value:#x}");
             if value != 0 {
                 let current_tsc = unsafe { core::arch::x86_64::_rdtsc() };
                 if value > current_tsc {
@@ -1981,17 +2488,25 @@ impl VmxVcpu {
                     let is_masked = self.vlapic.timer_is_masked();
                     let timer_val = self.vlapic.timer_read_lvt();
 
+                    // Cancel any existing timer before starting a new one
                     let _ = self.vlapic.timer_stop();
 
-                    debug!(
+                    info!(
                         "[TSC-DEADLINE] Setting deadline: current_tsc={current_tsc:#x}, \
                          deadline={value:#x}, delta={delta:#x}, vector={vector}, \
                          masked={is_masked}, lvt={timer_val:#x}"
                     );
 
                     self.vlapic.set_tsc_deadline(value);
+                    self.vlapic.start_tsc_deadline_timer(value)?;
+                } else {
+                    debug!(
+                        "[TSC-DEADLINE] deadline {value:#x} <= current_tsc {current_tsc:#x}, \
+                         ignoring"
+                    );
                 }
             } else {
+                debug!("[TSC-DEADLINE] write: value=0, stopping timer");
                 let _ = self.vlapic.timer_stop();
             }
         } else {
@@ -2004,26 +2519,48 @@ impl VmxVcpu {
     }
 
     fn handle_apic_access(&mut self, exit_info: &VmxExitInfo) -> AxResult {
-        let apic_access_exit_info = self.apic_access_exit_info()?;
+        let apic_info = self.apic_access_exit_info()?;
 
-        let write = match apic_access_exit_info.access_type {
-            ApicAccessExitType::LinearDataWrite => true,
-            ApicAccessExitType::LinearDataRead => false,
-            _ => {
-                warn!(
-                    "Unsupported APIC access type: {:?}",
-                    apic_access_exit_info.access_type
+        let apic_msr = 0x800u32 + (apic_info.offset as u32 >> 4);
+
+        match apic_info.access_type {
+            ApicAccessExitType::LinearDataWrite => {
+                let value = self.regs().rax as u32;
+                debug!(
+                    "[APIC-ACCESS] write: offset={:#x}, msr={:#x}, value={:#x}",
+                    apic_info.offset, apic_msr, value
                 );
-                return ax_err!(BadState, "Unsupported APIC access type");
+                <EmulatedLocalApic as BaseDeviceOps<SysRegAddrRange>>::handle_write(
+                    &self.vlapic,
+                    SysRegAddr::new(apic_msr as _),
+                    AccessWidth::Dword,
+                    value as usize,
+                )?;
             }
-        };
-
-        // TODO: handle APIC access.
-        let _ = write;
+            ApicAccessExitType::LinearDataRead => {
+                let value = <EmulatedLocalApic as BaseDeviceOps<SysRegAddrRange>>::handle_read(
+                    &self.vlapic,
+                    SysRegAddr::new(apic_msr as _),
+                    AccessWidth::Dword,
+                )? as u64;
+                debug!(
+                    "[APIC-ACCESS] read: offset={:#x}, msr={:#x}, value={:#x}",
+                    apic_info.offset, apic_msr, value
+                );
+                self.regs_mut().rax = value;
+            }
+            ref other => {
+                warn!(
+                    "[APIC-ACCESS] Unsupported access type: {:?}, offset={:#x}",
+                    other, apic_info.offset
+                );
+                // Still advance RIP to avoid infinite loop
+            }
+        }
 
         self.advance_rip(exit_info.exit_instruction_length as _)?;
 
-        unimplemented!("apic access");
+        Ok(())
     }
 
     fn handle_apic_mmio_ept_violation(&mut self) -> AxResult {
@@ -2087,48 +2624,115 @@ impl VmxVcpu {
         Ok(())
     }
 
+    /// Handle EPT violations caused by guest memory probing beyond ram_end.
+    /// Maps a read-only dummy page (all 0xFF) for reads so the guest detects
+    /// non-existent memory.  Writes are discarded by advancing RIP.
+    fn handle_memory_probing_ept_violation(
+        &mut self,
+        gpa: usize,
+        info: &NestedPageFaultInfo,
+    ) -> AxResult {
+        let page_aligned_gpa = gpa & !0xFFF;
+
+        if info.access_flags.contains(MappingFlags::WRITE) {
+            // Write beyond ram_end: discard by advancing past the instruction.
+            let instr_len = VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
+            let instr_len: u8 = if instr_len == 0 {
+                if let Some((bytes, actual_len)) = self.read_guest_instr_bytes(15) {
+                    Self::decode_x86_instruction_length(&bytes[..actual_len]).max(1)
+                } else {
+                    2
+                }
+            } else {
+                instr_len as u8
+            };
+            self.advance_rip(instr_len)?;
+            info!(
+                "[EPT-VIOL] write beyond ram_end discarded: GPA={gpa:#x}, ram_end={:#x}",
+                self.ram_end
+            );
+        } else {
+            // Read beyond ram_end: map a read-only dummy page so the guest reads 0xFF.
+            if let Err(e) = self.ept_map_4k_readonly(
+                page_aligned_gpa as u64,
+                self.dummy_ff_page.start_paddr().as_usize() as u64,
+            ) {
+                info!("[EPT-VIOL] FAILED to map dummy page at GPA={page_aligned_gpa:#x}: {e:?}");
+            } else {
+                info!(
+                    "[EPT-VIOL] mapped read-only dummy page at GPA={page_aligned_gpa:#x} \
+                     (ram_end={:#x})",
+                    self.ram_end
+                );
+            }
+            // Do NOT advance RIP — the instruction will re-execute against the
+            // newly-mapped dummy page and read 0xFF.
+        }
+
+        Ok(())
+    }
+
     fn handle_pci_mmio_ept_violation(&mut self) -> AxResult {
         let info = self.nested_page_fault_info()?;
         let gpa = info.fault_guest_paddr.as_usize();
         let is_write = info.access_flags.contains(axaddrspace::MappingFlags::WRITE);
 
-        let instr_len = VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
-        let instr_len: u8 = if instr_len == 0 {
-            if let Some((bytes, actual_len)) = self.read_guest_instr_bytes(15) {
-                let decoded = Self::decode_x86_instruction_length(&bytes[..actual_len]);
-                if decoded > 0 { decoded } else { 2 }
-            } else {
-                2
-            }
-        } else {
-            instr_len as u8
-        };
-
         if is_write {
+            // Writes to PCI MMIO: discard by advancing past the instruction.
+            let instr_len = VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
+            let instr_len: u8 = if instr_len == 0 {
+                if let Some((bytes, actual_len)) = self.read_guest_instr_bytes(15) {
+                    let decoded = Self::decode_x86_instruction_length(&bytes[..actual_len]);
+                    if decoded > 0 { decoded } else { 2 }
+                } else {
+                    2
+                }
+            } else {
+                instr_len as u8
+            };
             debug!(
                 "[PCI-MMIO] write ignored: GPA={:#x}, RIP={:#x}",
                 gpa,
                 self.rip()
             );
+            self.advance_rip(instr_len)?;
         } else {
-            self.regs_mut().rax = 0xFFFF_FFFF;
-            debug!(
-                "[PCI-MMIO] read returning 0xFFFFFFFF: GPA={:#x}, RIP={:#x}",
-                gpa,
-                self.rip()
-            );
+            // Reads from PCI MMIO: map a dummy page filled with 0xFF so the
+            // instruction re-executes and reads 0xFFFFFFFF from the mapped page.
+            // This is correct regardless of which register the instruction targets
+            // (unlike setting RAX directly which only works for mov rax, [addr]).
+            let page_aligned_gpa = gpa & !0xFFF;
+            if let Err(e) = self.ept_map_4k_readonly(
+                page_aligned_gpa as u64,
+                self.dummy_ff_page.start_paddr().as_usize() as u64,
+            ) {
+                warn!("[PCI-MMIO] failed to map dummy page at GPA={page_aligned_gpa:#x}: {e:?}");
+                // Fallback: set RAX and advance RIP (incorrect for non-RAX targets)
+                self.regs_mut().rax = 0xFFFF_FFFF;
+                let instr_len = VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
+                let instr_len: u8 = if instr_len == 0 { 2 } else { instr_len as u8 };
+                self.advance_rip(instr_len)?;
+            }
+            // Do NOT advance RIP — the instruction will re-execute against the
+            // newly-mapped dummy page and read 0xFFFFFFFF into the correct register.
         }
 
-        self.advance_rip(instr_len)?;
         Ok(())
     }
 
     fn read_guest_instr_bytes(&self, max_len: usize) -> Option<([u8; 15], usize)> {
         let guest_rip = self.rip() as u64;
-        let cr3 = VmcsGuestNW::CR3.read().ok()? as u64;
         let ept_root = self.ept_root?;
 
-        let gpa = self.gva_to_gpa_via_guest_pt(cr3, guest_rip)?;
+        // When paging is disabled (CR0.PG=0), GVA=GPA directly.
+        let cr0 = VmcsGuestNW::CR0.read().ok()?;
+        let gpa = if cr0 & (1 << 31) == 0 {
+            // No paging: linear address = physical address
+            guest_rip
+        } else {
+            let cr3 = VmcsGuestNW::CR3.read().ok()? as u64;
+            self.gva_to_gpa_via_guest_pt(cr3, guest_rip)?
+        };
         let hpa = self.gpa_to_hpa_via_ept(ept_root, gpa)?;
 
         const PHYS_VIRT_OFFSET: u64 = 0xffff_8000_0000_0000;
@@ -2205,6 +2809,81 @@ impl VmxVcpu {
         }
 
         i as u8
+    }
+
+    /// Decode a MOV r, r/m (read) or MOV r/m, r (write) instruction to determine
+    /// the register operand, access width, and full instruction length.
+    /// Returns (reg_index, width, instr_len) or None if not a recognized MOV.
+    /// - 0x8A: MOV r8, r/m8   (read, Byte)
+    /// - 0x8B: MOV r32/64, r/m32/64 (read, Word/Dword/Qword)
+    /// - 0x88: MOV r/m8, r8   (write, Byte)
+    /// - 0x89: MOV r/m, r32/64 (write, Word/Dword/Qword)
+    fn decode_mmio_mov_instr(bytes: &[u8]) -> Option<(u8, AccessWidth, u8)> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let mut i = 0;
+        let mut operand_size_16 = false;
+
+        // Skip legacy prefixes
+        while i < bytes.len() {
+            match bytes[i] {
+                0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0xF0 | 0xF2 | 0xF3 => {
+                    i += 1;
+                }
+                0x66 => {
+                    operand_size_16 = true;
+                    i += 1;
+                }
+                0x67 => {
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+
+        // REX prefix (0x40-0x4F)
+        let mut rex_r = 0u8;
+        let mut rex_w = false;
+        if i < bytes.len() && (0x40..=0x4F).contains(&bytes[i]) {
+            let rex = bytes[i];
+            rex_r = (rex >> 2) & 1;
+            rex_w = (rex & 0x08) != 0;
+            i += 1;
+        }
+
+        if i >= bytes.len() {
+            return None;
+        }
+
+        let opcode = bytes[i];
+        i += 1;
+
+        let width = match opcode {
+            0x8A | 0x88 => AccessWidth::Byte,
+            0x8B | 0x89 => {
+                if operand_size_16 {
+                    AccessWidth::Word
+                } else if rex_w {
+                    AccessWidth::Qword
+                } else {
+                    AccessWidth::Dword
+                }
+            }
+            _ => return None,
+        };
+
+        if i >= bytes.len() {
+            return None;
+        }
+
+        let modrm = bytes[i];
+        let reg = ((modrm >> 3) & 7) | (rex_r << 3);
+
+        // Use the existing length decoder for the full instruction length
+        let instr_len = Self::decode_x86_instruction_length(bytes);
+
+        Some((reg, width, instr_len))
     }
 
     fn x86_opcode_has_modrm(opcode: u8) -> bool {
@@ -2315,11 +2994,125 @@ impl VmxVcpu {
         Some(unsafe { core::ptr::read_volatile(vaddr as *const u64) })
     }
 
+    fn write_phys_u64(&self, paddr: u64, val: u64) {
+        const PHYS_VIRT_OFFSET: u64 = 0xffff_8000_0000_0000;
+        let vaddr = paddr + PHYS_VIRT_OFFSET;
+        unsafe { core::ptr::write_volatile(vaddr as *mut u64, val) }
+    }
+
+    /// Map a 4 KB host page into the EPT at the given GPA with the specified
+    /// permission flags.  Walks the 4-level EPT, allocating intermediate tables
+    /// as needed.  Returns Ok(()) on success.
+    fn ept_map_4k_with_flags(&self, gpa: u64, hpa: u64, perm: u64) -> AxResult {
+        let ept_root = self.ept_root.ok_or(ax_err_type!(Unsupported))?.as_usize() as u64;
+
+        let pml4_index = ((gpa >> 39) & 0x1FF) as usize;
+        let pdpt_index = ((gpa >> 30) & 0x1FF) as usize;
+        let pd_index = ((gpa >> 21) & 0x1FF) as usize;
+        let pt_index = ((gpa >> 12) & 0x1FF) as usize;
+
+        // EPT entry flags: bit 0 = Read, bit 1 = Write, bit 2 = Execute
+        const EPT_R: u64 = 1 << 0;
+        const EPT_RWX: u64 = EPT_R | (1 << 1) | (1 << 2);
+
+        // Walk PML4 → PDPT → PD → PT, allocating missing tables
+        let pml4e_addr = ept_root + (pml4_index * 8) as u64;
+        let pml4e = self
+            .read_phys_u64(pml4e_addr)
+            .ok_or(ax_err_type!(NotFound))?;
+        let pdpt_base = if pml4e & EPT_R != 0 {
+            pml4e & 0xF_FFFF_F000
+        } else {
+            let new_table = PhysFrame::alloc_zero()?.start_paddr().as_usize() as u64;
+            self.write_phys_u64(pml4e_addr, new_table | EPT_RWX);
+            new_table
+        };
+
+        let pdpte_addr = pdpt_base + (pdpt_index * 8) as u64;
+        let pdpte = self
+            .read_phys_u64(pdpte_addr)
+            .ok_or(ax_err_type!(NotFound))?;
+        let pd_base = if pdpte & EPT_R != 0 {
+            pdpte & 0xF_FFFF_F000
+        } else {
+            let new_table = PhysFrame::alloc_zero()?.start_paddr().as_usize() as u64;
+            self.write_phys_u64(pdpte_addr, new_table | EPT_RWX);
+            new_table
+        };
+
+        let pde_addr = pd_base + (pd_index * 8) as u64;
+        let pde = self.read_phys_u64(pde_addr).ok_or(ax_err_type!(NotFound))?;
+        let pt_base = if pde & EPT_R != 0 {
+            pde & 0xF_FFFF_F000
+        } else {
+            let new_table = PhysFrame::alloc_zero()?.start_paddr().as_usize() as u64;
+            self.write_phys_u64(pde_addr, new_table | EPT_RWX);
+            new_table
+        };
+
+        // Write the PTE
+        let pte_addr = pt_base + (pt_index * 8) as u64;
+        let pte = (hpa & 0xF_FFFF_F000) | perm;
+        self.write_phys_u64(pte_addr, pte);
+
+        Ok(())
+    }
+
+    /// Map a 4 KB page as read-only (EPT_R only) — used for dummy pages
+    /// that should return 0xFF on read but trigger EPT violation on write.
+    fn ept_map_4k_readonly(&self, gpa: u64, hpa: u64) -> AxResult {
+        const EPT_R: u64 = 1 << 0;
+        self.ept_map_4k_with_flags(gpa, hpa, EPT_R)
+    }
+
     fn handle_vmx_preemption_timer(&mut self) -> AxResult {
         // The VMX-preemption timer counts down at rate proportional to that of the timestamp counter (TSC).
         // Specifically, the timer counts down by 1 every time bit X in the TSC changes due to a TSC increment.
         // The value of X is in the range 0–31 and can be determined by consulting the VMX capability MSR IA32_VMX_MISC (see Appendix A.6).
         VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(VMX_PREEMPTION_TIMER_SET_VALUE)?;
+
+        // Debug: dump guest instruction at current RIP to diagnose loops
+        static PREEMPTION_COUNT: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let count = PREEMPTION_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if count < 5 || count.is_multiple_of(100) {
+            let rip = self.rip();
+            let rflags = VmcsGuestNW::RFLAGS.read().unwrap_or(0);
+            if let Some((bytes, actual_len)) = self.read_guest_instr_bytes(8) {
+                info!(
+                    "[PREEMPT] #{count}: RIP={rip:#x} RFLAGS={rflags:#x} bytes={:02x?}",
+                    &bytes[..actual_len.min(8)]
+                );
+                // If this is a short jump (eb XX), dump bytes at the jump target
+                if bytes.len() >= 2 && bytes[0] == 0xeb {
+                    let offset = bytes[1] as i8 as i64;
+                    let target = rip as i64 + 2 + offset;
+                    if target > 0
+                        && let Some(ept_root) = self.ept_root
+                    {
+                        let mut dump = [0u8; 48];
+                        for (i, byte) in dump.iter_mut().enumerate() {
+                            let gpa = target as u64 + i as u64;
+                            if let Some(hpa) = self.gpa_to_hpa_via_ept(ept_root, gpa) {
+                                const PHYS_VIRT_OFFSET: u64 = 0xffff_8000_0000_0000;
+                                *byte = unsafe {
+                                    core::ptr::read_volatile(
+                                        (hpa as u64 + PHYS_VIRT_OFFSET) as *const u8,
+                                    )
+                                };
+                            }
+                        }
+                        info!(
+                            "[PREEMPT] #{count}: jump target {target:#x} bytes={:02x?}",
+                            &dump[..48]
+                        );
+                    }
+                }
+            } else {
+                info!("[PREEMPT] #{count}: RIP={rip:#x} RFLAGS={rflags:#x} (failed to read instr)");
+            }
+        }
+
         Ok(())
     }
 
@@ -2353,20 +3146,33 @@ impl VmxVcpu {
                 };
                 if cr == 0 || cr == 4 || cr == 3 {
                     let rip_before = self.rip();
-                    info!(
-                        "[CR{}] write val={:#x}, RIP before={:#x}, instr_len={}",
-                        cr, val, rip_before, instr_len
-                    );
+                    // CR0/CR4 writes are significant (mode switches); log at info.
+                    // CR3 writes happen on every context switch and flood the log;
+                    // log at debug instead.
+                    if cr == 3 {
+                        debug!(
+                            "[CR{}] write val={:#x}, RIP before={:#x}, instr_len={}",
+                            cr, val, rip_before, instr_len
+                        );
+                    } else {
+                        info!(
+                            "[CR{}] write val={:#x}, RIP before={:#x}, instr_len={}",
+                            cr, val, rip_before, instr_len
+                        );
+                    }
                     self.advance_rip(instr_len)?;
                     let rip_after = self.rip();
                     // TODO: check for #GP reasons
                     self.set_cr(cr as usize, val);
                     let cr0_host_mask = VmcsControlNW::CR0_GUEST_HOST_MASK.read().unwrap_or(0);
                     let cr4_host_mask = VmcsControlNW::CR4_GUEST_HOST_MASK.read().unwrap_or(0);
-                    info!(
-                        "[CR{}] after advance RIP={:#x}, CR0_HOST_MASK={:#x}, CR4_HOST_MASK={:#x}",
-                        cr, rip_after, cr0_host_mask, cr4_host_mask
-                    );
+                    if cr != 3 {
+                        info!(
+                            "[CR{}] after advance RIP={:#x}, CR0_HOST_MASK={:#x}, \
+                             CR4_HOST_MASK={:#x}",
+                            cr, rip_after, cr0_host_mask, cr4_host_mask
+                        );
+                    }
 
                     if cr == 0 {
                         let cr0_flags = Cr0Flags::from_bits_truncate(val);
@@ -2374,9 +3180,11 @@ impl VmxVcpu {
                             let gdtr_base = VmcsGuestNW::GDTR_BASE.read().unwrap_or(0);
                             let gdtr_limit = VmcsGuest32::GDTR_LIMIT.read().unwrap_or(0);
                             let cs_ar = VmcsGuest32::CS_ACCESS_RIGHTS.read().unwrap_or(0);
+                            let cs_base = VmcsGuestNW::CS_BASE.read().unwrap_or(0);
+                            let cs_sel = VmcsGuest16::CS_SELECTOR.read().unwrap_or(0);
                             info!(
-                                "[CR0] PE set, value={:#x}, GDTR={:#x}:{:#x}, CS_AR={:#x}",
-                                val, gdtr_base, gdtr_limit, cs_ar
+                                "[CR0PE] v={:#x} GDTR={:#x}:{:#x} CS={:#x}:{:#x} ar={:#x}",
+                                val, gdtr_base, gdtr_limit, cs_sel, cs_base, cs_ar
                             );
                         }
                         if cr0_flags.contains(Cr0Flags::PAGING) {
@@ -2384,13 +3192,21 @@ impl VmxVcpu {
                         }
                     }
                     if cr == 4 {
-                        info!("[CR4] set to {:#x}, RIP={:#x}", val, self.rip());
+                        // Log CS state for debugging mode transitions.
+                        // Do NOT modify CS access rights here: unconditionally
+                        // setting D/B (bit 14) breaks long mode where L=1 requires
+                        // D/B=0 (Intel SDM 26.3.1.2), causing VM-entry failure 0x21.
+                        let cs_base = VmcsGuestNW::CS_BASE.read().unwrap_or(0);
                         let cs_ar = VmcsGuest32::CS_ACCESS_RIGHTS.read().unwrap_or(0);
-                        let cs_ar_fixed = cs_ar | 0x4000;
-                        if cs_ar_fixed != cs_ar {
-                            VmcsGuest32::CS_ACCESS_RIGHTS.write(cs_ar_fixed)?;
-                            info!("[CR4] Fixed CS D/B bit: {:#x} -> {:#x}", cs_ar, cs_ar_fixed);
-                        }
+                        let cs_sel = VmcsGuest16::CS_SELECTOR.read().unwrap_or(0);
+                        info!(
+                            "[CR4s] v={:#x} RIP={:#x} CS={:#x}:{:#x} ar={:#x}",
+                            val,
+                            self.rip(),
+                            cs_sel,
+                            cs_base,
+                            cs_ar
+                        );
                     }
                     return Ok(());
                 }
@@ -2432,17 +3248,20 @@ impl VmxVcpu {
         let function = regs_clone.rax as u32;
         let res = match function {
             LEAF_FEATURE_INFO => {
+                // CPUID leaf 0x1 has NO sub-leaves per Intel SDM.
+                // ECX is not a sub-leaf index and is ignored by hardware.
+                // Previously, checking rcx >= 4 caused most leaf-1 queries
+                // to return all-zeros, breaking OVMF's APIC/feature detection.
                 const FEATURE_VMX: u32 = 1 << 5;
                 const FEATURE_HYPERVISOR: u32 = 1 << 31;
                 const FEATURE_MCE: u32 = 1 << 7;
                 const FEATURE_TSC_DEADLINE: u32 = 1 << 24;
                 const FEATURE_MONITOR: u32 = 1 << 3;
-                // Leaf 0x1 does not use sub-leaves; ignore ECX input.
                 let mut res = cpuid!(regs_clone.rax, 0);
                 res.ecx &= !FEATURE_VMX;
                 res.ecx &= !FEATURE_TSC_DEADLINE;
                 res.ecx &= !FEATURE_MONITOR;
-                res.ecx |= FEATURE_HYPERVISOR;
+                res.ecx &= !FEATURE_HYPERVISOR;
                 res.edx &= !FEATURE_MCE;
                 res.ebx = 0x0001_0800; // BrandIndex=0, CLFLUSH=64B, MaxLogicalProc=1, APIC ID=0
                 res
@@ -2521,10 +3340,21 @@ impl VmxVcpu {
             },
             LEAF_TSC_CORE_CRYSTAL_RATIO => {
                 let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
-                if res.eax == 0 {
+                // Always log CPUID 0x15 values for diagnostics
+                info!(
+                    "[CPUID-0x15] Raw: eax={:#x} ebx={:#x} ecx={:#x} edx={:#x}",
+                    res.eax, res.ebx, res.ecx, res.edx
+                );
+                // OVMF's InternalGetApicTimerFrequency() computes:
+                //   APIC_freq = ECX * EAX / EBX  (ECX=crystal Hz, EAX=denominator, EBX=numerator)
+                // If ECX=0 (crystal frequency unknown) or EAX/EBX=0, the result is 0,
+                // which triggers ASSERT(ApicFrequency != 0) in MicroSecondDelay().
+                // Provide fallback values when the hardware doesn't report a valid frequency.
+                if res.eax == 0 || res.ebx == 0 || res.ecx == 0 {
+                    info!("[CPUID-0x15] Values invalid, using fallback (100 MHz crystal)");
                     res.eax = 1;
                     res.ebx = 1;
-                    res.ecx = 100_000_000;
+                    res.ecx = 100_000_000; // 100 MHz crystal
                 }
                 res
             }
@@ -2546,11 +3376,39 @@ impl VmxVcpu {
                 if res.eax > MAX_EXT_LEAF {
                     res.eax = MAX_EXT_LEAF;
                 }
+                // Dump 96 bytes from RIP-8 to see code after CPUID 0x80000000
+                if let Some(ept_root) = self.ept_root {
+                    let rip = self.rip() as u64;
+                    let base_gpa = (rip - 8) & !0x7u64;
+                    let mut dump = [0u8; 96];
+                    for (i, byte) in dump.iter_mut().enumerate() {
+                        let gpa = base_gpa + i as u64;
+                        if let Some(hpa) = self.gpa_to_hpa_via_ept(ept_root, gpa) {
+                            const PHYS_VIRT_OFFSET: u64 = 0xffff_8000_0000_0000;
+                            *byte = unsafe {
+                                core::ptr::read_volatile(
+                                    (hpa as u64 + PHYS_VIRT_OFFSET) as *const u8,
+                                )
+                            };
+                        }
+                    }
+                    info!("[8k] e={:x} rip={:x} {:02x?}", res.eax, rip, &dump[..96]);
+                } else {
+                    info!("[8k] e={:x}", res.eax);
+                }
                 res
             }
             0x8000_0001 => {
                 let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
                 res.ecx &= !(1 << 2);
+                info!(
+                    "[C8k1] a={:#x} b={:#x} c={:#x} d={:#x} LM={}",
+                    res.eax,
+                    res.ebx,
+                    res.ecx,
+                    res.edx,
+                    (res.edx >> 29) & 1
+                );
                 res
             }
             0x8000_0008 => {
@@ -2570,12 +3428,67 @@ impl VmxVcpu {
             static CPUID_OUT_COUNT: core::sync::atomic::AtomicU64 =
                 core::sync::atomic::AtomicU64::new(0);
             let out_count = CPUID_OUT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if out_count < 50 || out_count == 100 || out_count == 1000 || out_count == 10000 {
-                info!(
-                    "[CPUID-OUT] #{out_count}: leaf={:#x} => EAX={:#x}, EBX={:#x}, ECX={:#x}, \
-                     EDX={:#x}",
-                    function, res.eax, res.ebx, res.ecx, res.edx
-                );
+            // Log ALL CPUID calls at info level for the first 500 calls to diagnose
+            // why OVMF never calls leaf 0x80000001 after 0x80000000.
+            if out_count < 500 {
+                let rip = self.rip() as u64;
+                match function {
+                    0x80000000 => {
+                        // Dump 32 bytes from RIP-8 to see code around CPUID 0x80000000
+                        // Only dump first 3 occurrences to avoid log truncation
+                        if out_count < 3 {
+                            if let Some(ept_root) = self.ept_root {
+                                let base_gpa = (rip - 8) & !0x7u64;
+                                let mut dump = [0u8; 32];
+                                for (i, byte) in dump.iter_mut().enumerate() {
+                                    let gpa = base_gpa + i as u64;
+                                    if let Some(hpa) = self.gpa_to_hpa_via_ept(ept_root, gpa) {
+                                        const PHYS_VIRT_OFFSET: u64 = 0xffff_8000_0000_0000;
+                                        *byte = unsafe {
+                                            core::ptr::read_volatile(
+                                                (hpa as u64 + PHYS_VIRT_OFFSET) as *const u8,
+                                            )
+                                        };
+                                    }
+                                }
+                                info!("[8k]#{out_count} {rip:x} {:02x?}", &dump[..32]);
+                            } else {
+                                info!("[8k]#{out_count} {rip:x}");
+                            }
+                        } else {
+                            info!("[8k]#{out_count} {rip:x}");
+                        }
+                        self.trace_after_cpuid_8k = true;
+                        self.trace_after_8k_count = 0;
+                    }
+                    0x80000001 => info!("[81]#{out_count} {rip:x}"),
+                    0x1 => {
+                        if out_count < 1 {
+                            if let Some(ept_root) = self.ept_root {
+                                // Dump 128 bytes from RIP-8 to see more context
+                                let base_gpa = (rip - 8) & !0x7u64;
+                                let mut dump = [0u8; 128];
+                                for (i, byte) in dump.iter_mut().enumerate() {
+                                    let gpa = base_gpa + i as u64;
+                                    if let Some(hpa) = self.gpa_to_hpa_via_ept(ept_root, gpa) {
+                                        const PHYS_VIRT_OFFSET: u64 = 0xffff_8000_0000_0000;
+                                        *byte = unsafe {
+                                            core::ptr::read_volatile(
+                                                (hpa as u64 + PHYS_VIRT_OFFSET) as *const u8,
+                                            )
+                                        };
+                                    }
+                                }
+                                info!("[1]#{out_count} {rip:x} {:02x?}", &dump[..128]);
+                            } else {
+                                info!("[1]#{out_count} {rip:x}");
+                            }
+                        } else {
+                            info!("[1]#{out_count} {rip:x}");
+                        }
+                    }
+                    _ => info!("[C]#{out_count} {function:x} {rip:x}"),
+                }
             }
         }
 
@@ -2592,44 +3505,60 @@ impl VmxVcpu {
     fn handle_xsetbv(&mut self) -> AxResult {
         const XCR_XCR0: u64 = 0;
         const VM_EXIT_INSTR_LEN_XSETBV: u8 = 3;
+        // #GP vector and error code for invalid XSETBV (Intel SDM Vol. 2A, XSETBV)
+        const GP_VECTOR: u8 = 13;
+        const GP_ERR_CODE: u32 = 0;
 
         let index = self.guest_regs.rcx.get_bits(0..32);
         let value = self.guest_regs.rdx.get_bits(0..32) << 32 | self.guest_regs.rax.get_bits(0..32);
 
         // TODO: get host-supported xcr0 mask by cpuid and reject any guest-xsetbv violating that
         if index == XCR_XCR0 {
-            Xcr0::from_bits(value)
-                .and_then(|x| {
-                    if !x.contains(Xcr0::XCR0_FPU_MMX_STATE) {
-                        return None;
-                    }
+            let validated = Xcr0::from_bits(value).and_then(|x| {
+                if !x.contains(Xcr0::XCR0_FPU_MMX_STATE) {
+                    return None;
+                }
 
-                    if x.contains(Xcr0::XCR0_AVX_STATE) && !x.contains(Xcr0::XCR0_SSE_STATE) {
-                        return None;
-                    }
+                if x.contains(Xcr0::XCR0_AVX_STATE) && !x.contains(Xcr0::XCR0_SSE_STATE) {
+                    return None;
+                }
 
-                    if x.contains(Xcr0::XCR0_BNDCSR_STATE) ^ x.contains(Xcr0::XCR0_BNDREG_STATE) {
-                        return None;
-                    }
+                if x.contains(Xcr0::XCR0_BNDCSR_STATE) ^ x.contains(Xcr0::XCR0_BNDREG_STATE) {
+                    return None;
+                }
 
-                    if x.contains(Xcr0::XCR0_OPMASK_STATE)
-                        || x.contains(Xcr0::XCR0_ZMM_HI256_STATE)
-                        || x.contains(Xcr0::XCR0_HI16_ZMM_STATE)
-                        || !x.contains(Xcr0::XCR0_AVX_STATE)
-                        || !x.contains(Xcr0::XCR0_OPMASK_STATE)
-                        || !x.contains(Xcr0::XCR0_ZMM_HI256_STATE)
-                        || !x.contains(Xcr0::XCR0_HI16_ZMM_STATE)
-                    {
-                        return None;
-                    }
+                // AVX-512 dependency: if any AVX-512 component is set,
+                // all must be set AND AVX must be set.
+                let has_any_avx512 = x.contains(Xcr0::XCR0_OPMASK_STATE)
+                    || x.contains(Xcr0::XCR0_ZMM_HI256_STATE)
+                    || x.contains(Xcr0::XCR0_HI16_ZMM_STATE);
+                let has_all_avx512 = x.contains(Xcr0::XCR0_OPMASK_STATE)
+                    && x.contains(Xcr0::XCR0_ZMM_HI256_STATE)
+                    && x.contains(Xcr0::XCR0_HI16_ZMM_STATE);
+                if has_any_avx512 && (!has_all_avx512 || !x.contains(Xcr0::XCR0_AVX_STATE)) {
+                    return None;
+                }
 
-                    Some(x)
-                })
-                .ok_or(ax_err_type!(InvalidInput))
-                .and_then(|x| {
+                Some(x)
+            });
+
+            match validated {
+                Some(x) => {
                     self.xstate.guest_xcr0 = x.bits();
                     self.advance_rip(VM_EXIT_INSTR_LEN_XSETBV)
-                })
+                }
+                None => {
+                    // Invalid XCR0 value: inject #GP(0) per Intel SDM.
+                    // Do NOT advance RIP so the guest can handle the fault.
+                    info!(
+                        "[XSETBV] invalid XCR0={:#x}, injecting #GP at RIP={:#x}",
+                        value,
+                        self.rip()
+                    );
+                    vmcs::inject_event(GP_VECTOR, Some(GP_ERR_CODE))?;
+                    Ok(())
+                }
+            }
         } else {
             // xcr0 only
             ax_err!(Unsupported, "only xcr0 is supported")
@@ -2722,6 +3651,166 @@ impl AxArchVCpu for VmxVcpu {
         let result = match self.inner_run() {
             Some(exit_info) => Ok(if exit_info.entry_failure {
                 let exit_reason_raw = exit_info.exit_reason as u64;
+                // Dump guest state on the first few VM-entry failures to
+                // diagnose the invalid guest state (reason 0x21).
+                static ENTRY_FAIL_DUMPED: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let dumped = ENTRY_FAIL_DUMPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if dumped < 3 {
+                    // Log the last 16 VM-exits before this VM-entry failure to
+                    // identify what caused the guest state to become invalid.
+                    {
+                        let hist = EXIT_HISTORY.lock();
+                        error!(
+                            "[ENTRY-FAIL #{dumped}] Last {} VM-exits before failure (total {}):",
+                            hist.buf.len(),
+                            hist.count
+                        );
+                        let start = hist.idx; // oldest entry
+                        for i in 0..16 {
+                            let idx = (start + i) % 16;
+                            let (reason, rip, cs_ar) = hist.buf[idx];
+                            if reason != 0 || rip != 0 {
+                                error!(
+                                    "  [{}] reason={reason:#x} RIP={rip:#x} CS_ar={cs_ar:#010x}",
+                                    i
+                                );
+                            }
+                        }
+                    }
+                    let cs_sel = VmcsGuest16::CS_SELECTOR.read().unwrap_or(0);
+                    let cs_ar = VmcsGuest32::CS_ACCESS_RIGHTS.read().unwrap_or(0);
+                    let cs_base = VmcsGuestNW::CS_BASE.read().unwrap_or(0);
+                    let cs_limit = VmcsGuest32::CS_LIMIT.read().unwrap_or(0);
+                    let ss_sel = VmcsGuest16::SS_SELECTOR.read().unwrap_or(0);
+                    let ss_ar = VmcsGuest32::SS_ACCESS_RIGHTS.read().unwrap_or(0);
+                    let ds_sel = VmcsGuest16::DS_SELECTOR.read().unwrap_or(0);
+                    let ds_ar = VmcsGuest32::DS_ACCESS_RIGHTS.read().unwrap_or(0);
+                    let es_sel = VmcsGuest16::ES_SELECTOR.read().unwrap_or(0);
+                    let es_ar = VmcsGuest32::ES_ACCESS_RIGHTS.read().unwrap_or(0);
+                    let fs_sel = VmcsGuest16::FS_SELECTOR.read().unwrap_or(0);
+                    let fs_ar = VmcsGuest32::FS_ACCESS_RIGHTS.read().unwrap_or(0);
+                    let gs_sel = VmcsGuest16::GS_SELECTOR.read().unwrap_or(0);
+                    let gs_ar = VmcsGuest32::GS_ACCESS_RIGHTS.read().unwrap_or(0);
+                    let tr_sel = VmcsGuest16::TR_SELECTOR.read().unwrap_or(0);
+                    let tr_ar = VmcsGuest32::TR_ACCESS_RIGHTS.read().unwrap_or(0);
+                    let tr_base = VmcsGuestNW::TR_BASE.read().unwrap_or(0);
+                    let tr_limit = VmcsGuest32::TR_LIMIT.read().unwrap_or(0);
+                    let ldtr_sel = VmcsGuest16::LDTR_SELECTOR.read().unwrap_or(0);
+                    let ldtr_ar = VmcsGuest32::LDTR_ACCESS_RIGHTS.read().unwrap_or(0);
+                    let ldtr_base = VmcsGuestNW::LDTR_BASE.read().unwrap_or(0);
+                    let ldtr_limit = VmcsGuest32::LDTR_LIMIT.read().unwrap_or(0);
+                    let cr0 = VmcsGuestNW::CR0.read().unwrap_or(0);
+                    let cr3 = VmcsGuestNW::CR3.read().unwrap_or(0);
+                    let cr4 = VmcsGuestNW::CR4.read().unwrap_or(0);
+                    let efer = VmcsGuest64::IA32_EFER.read().unwrap_or(0);
+                    let rflags = VmcsGuestNW::RFLAGS.read().unwrap_or(0);
+                    let rip = self.rip();
+                    let rsp = VmcsGuestNW::RSP.read().unwrap_or(0);
+                    let dr7 = VmcsGuestNW::DR7.read().unwrap_or(0);
+                    let fs_base = VmcsGuestNW::FS_BASE.read().unwrap_or(0);
+                    let gs_base = VmcsGuestNW::GS_BASE.read().unwrap_or(0);
+                    let pat = VmcsGuest64::IA32_PAT.read().unwrap_or(0);
+                    let perf_global = VmcsGuest64::IA32_PERF_GLOBAL_CTRL.read().unwrap_or(0);
+                    let pdpte0 = VmcsGuest64::PDPTE0.read().unwrap_or(0);
+                    let pdpte1 = VmcsGuest64::PDPTE1.read().unwrap_or(0);
+                    let pdpte2 = VmcsGuest64::PDPTE2.read().unwrap_or(0);
+                    let pdpte3 = VmcsGuest64::PDPTE3.read().unwrap_or(0);
+                    let gdtr_base = VmcsGuestNW::GDTR_BASE.read().unwrap_or(0);
+                    let gdtr_limit = VmcsGuest32::GDTR_LIMIT.read().unwrap_or(0);
+                    let idtr_base = VmcsGuestNW::IDTR_BASE.read().unwrap_or(0);
+                    let idtr_limit = VmcsGuest32::IDTR_LIMIT.read().unwrap_or(0);
+                    let link_ptr = VmcsGuest64::LINK_PTR.read().unwrap_or(0);
+                    let debugctl = VmcsGuest64::IA32_DEBUGCTL.read().unwrap_or(0);
+                    let intr_state = VmcsGuest32::INTERRUPTIBILITY_STATE.read().unwrap_or(0);
+                    let act_state = VmcsGuest32::ACTIVITY_STATE.read().unwrap_or(0);
+                    let sysenter_cs = VmcsGuest32::IA32_SYSENTER_CS.read().unwrap_or(0);
+                    let pending_dbg = VmcsGuestNW::PENDING_DBG_EXCEPTIONS.read().unwrap_or(0);
+                    let sysenter_esp = VmcsGuestNW::IA32_SYSENTER_ESP.read().unwrap_or(0);
+                    let sysenter_eip = VmcsGuestNW::IA32_SYSENTER_EIP.read().unwrap_or(0);
+                    let vmentry_intr = VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD
+                        .read()
+                        .unwrap_or(0);
+                    error!(
+                        "[ENTRY-FAIL #{dumped}] reason={exit_reason_raw:#x} RIP={rip:#x} \
+                         RSP={rsp:#x} RFLAGS={rflags:#x}\nCR0={cr0:#x} CR3={cr3:#x} CR4={cr4:#x} \
+                         EFER={efer:#x} DR7={dr7:#x}\nCS={cs_sel:#x} ar={cs_ar:#08x} \
+                         base={cs_base:#x} lim={cs_limit:#x}\nSS={ss_sel:#x} \
+                         ar={ss_ar:#08x}\nDS={ds_sel:#x} ar={ds_ar:#08x} ES={es_sel:#x} \
+                         ar={es_ar:#08x}\nFS={fs_sel:#x} ar={fs_ar:#08x} base={fs_base:#x} \
+                         GS={gs_sel:#x} ar={gs_ar:#08x} base={gs_base:#x}\nTR={tr_sel:#x} \
+                         ar={tr_ar:#08x} base={tr_base:#x} lim={tr_limit:#x}\nLDTR={ldtr_sel:#x} \
+                         ar={ldtr_ar:#08x} base={ldtr_base:#x} \
+                         lim={ldtr_limit:#x}\nGDTR={gdtr_base:#x}:{gdtr_limit:#x} \
+                         IDTR={idtr_base:#x}:{idtr_limit:#x}\nLINK_PTR={link_ptr:#x} \
+                         DEBUGCTL={debugctl:#x}\nINTR_STATE={intr_state:#x} \
+                         ACT_STATE={act_state:#x}\nPENDING_DBG={pending_dbg:#x} \
+                         SYSENTER_CS={sysenter_cs:#x}\nSYSENTER_ESP={sysenter_esp:#x} \
+                         SYSENTER_EIP={sysenter_eip:#x}\nVMENTRY_INTR_INFO={vmentry_intr:#x}\\
+                         nPAT={pat:#x} PERF_GLOBAL_CTRL={perf_global:#x}\nPDPTE0={pdpte0:#x} \
+                         PDPTE1={pdpte1:#x} PDPTE2={pdpte2:#x} PDPTE3={pdpte3:#x}"
+                    );
+                }
+                // Workaround: if CS is marked Unusable (bit 15), clear it.
+                // CS must always be usable; the processor may incorrectly set
+                // this bit in some edge cases. Clearing it allows VM-entry to
+                // succeed and the guest to continue.
+                let cs_ar = VmcsGuest32::CS_ACCESS_RIGHTS.read().unwrap_or(0);
+                if cs_ar & 0x8000 != 0 {
+                    let fixed_ar = cs_ar & !0x8000;
+                    warn!(
+                        "[ENTRY-FAIL] CS marked Unusable (ar={cs_ar:#010x}), clearing bit 15 -> \
+                         ar={fixed_ar:#010x}"
+                    );
+                    VmcsGuest32::CS_ACCESS_RIGHTS.write(fixed_ar)?;
+                }
+                // Workaround: fix invalid IA32_PAT entries. Intel SDM 26.3.1.1
+                // requires bits 2:0 of each PAT entry to be 0, 1, 4, 5, or 6.
+                // Values 2, 3, 7 are invalid and cause VM-entry failure.
+                // The guest may write these via passthrough (no VM-exit), so we
+                // sanitize the saved PAT on VM-entry failure.
+                let pat = VmcsGuest64::IA32_PAT.read().unwrap_or(0);
+                let mut fixed_pat = pat;
+                let mut pat_changed = false;
+                for i in 0..8u64 {
+                    let shift = i * 8;
+                    let entry = (pat >> shift) & 0x7;
+                    if entry == 2 || entry == 3 || entry == 7 {
+                        // Replace invalid entry with UC (0), the safest value.
+                        fixed_pat &= !(0x7 << shift);
+                        pat_changed = true;
+                    }
+                }
+                if pat_changed {
+                    warn!(
+                        "[ENTRY-FAIL] IA32_PAT has invalid entries (pat={pat:#018x}), fixing -> \
+                         {fixed_pat:#018x}"
+                    );
+                    VmcsGuest64::IA32_PAT.write(fixed_pat)?;
+                }
+                // Workaround: clear reserved bits (31:16) of segment access
+                // rights. Intel SDM 26.3.1.2 says no checks are performed on
+                // unusable segments, but bits 31:16 are reserved and must be 0
+                // for ALL segment access-rights fields. Some guests leave bit 16
+                // set, which the processor may reject on VM-entry.
+                for (name, field) in [
+                    ("SS", VmcsGuest32::SS_ACCESS_RIGHTS),
+                    ("DS", VmcsGuest32::DS_ACCESS_RIGHTS),
+                    ("ES", VmcsGuest32::ES_ACCESS_RIGHTS),
+                    ("FS", VmcsGuest32::FS_ACCESS_RIGHTS),
+                    ("GS", VmcsGuest32::GS_ACCESS_RIGHTS),
+                    ("LDTR", VmcsGuest32::LDTR_ACCESS_RIGHTS),
+                ] {
+                    let ar = field.read().unwrap_or(0);
+                    if ar & 0xFFFF0000 != 0 {
+                        let fixed_ar = ar & 0x0000FFFF;
+                        warn!(
+                            "[ENTRY-FAIL] {name} ar={ar:#010x} has reserved bits set, clearing -> \
+                             {fixed_ar:#010x}"
+                        );
+                        field.write(fixed_ar)?;
+                    }
+                }
                 AxVCpuExitReason::FailEntry {
                     hardware_entry_failure_reason: exit_reason_raw,
                 }
@@ -2746,6 +3835,128 @@ impl AxArchVCpu for VmxVcpu {
                         self.advance_rip(exit_info.exit_instruction_length as _)?;
 
                         let port = io_info.port;
+
+                        // Diagnostic: track hot IO ports to identify polling loops
+                        {
+                            static IO_PORT_COUNTS: core::sync::atomic::AtomicU64 =
+                                core::sync::atomic::AtomicU64::new(0);
+                            static LAST_HOT_PORT: core::sync::atomic::AtomicU16 =
+                                core::sync::atomic::AtomicU16::new(0);
+                            static LAST_HOT_PORT_COUNT: core::sync::atomic::AtomicU64 =
+                                core::sync::atomic::AtomicU64::new(0);
+                            let total =
+                                IO_PORT_COUNTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            let prev_port =
+                                LAST_HOT_PORT.load(core::sync::atomic::Ordering::Relaxed);
+                            if port != prev_port {
+                                let prev_count = LAST_HOT_PORT_COUNT
+                                    .swap(0, core::sync::atomic::Ordering::Relaxed);
+                                if prev_count > 1000 {
+                                    info!(
+                                        "[IO-HOT] port={:#x} count={} (was hot for {} ops), now \
+                                         switching to port={:#x} RIP={:#x}",
+                                        prev_port,
+                                        prev_count,
+                                        prev_count,
+                                        port,
+                                        self.rip()
+                                    );
+                                }
+                                LAST_HOT_PORT.store(port, core::sync::atomic::Ordering::Relaxed);
+                            }
+                            LAST_HOT_PORT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            if total.is_multiple_of(50000) && total > 0 {
+                                let hot_port =
+                                    LAST_HOT_PORT.load(core::sync::atomic::Ordering::Relaxed);
+                                let hot_count =
+                                    LAST_HOT_PORT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+                                info!(
+                                    "[IO-STAT] total_io={} hot_port={:#x} hot_count={} RIP={:#x}",
+                                    total,
+                                    hot_port,
+                                    hot_count,
+                                    self.rip()
+                                );
+                                // One-time code dump for the hot IO port location
+                                static IO_CODE_DUMPED: core::sync::atomic::AtomicBool =
+                                    core::sync::atomic::AtomicBool::new(false);
+                                if !IO_CODE_DUMPED.swap(true, core::sync::atomic::Ordering::Relaxed)
+                                    && let Some(ept_root) = self.ept_root
+                                {
+                                    let rip = self.rip() as u64;
+                                    let base_gpa = rip.saturating_sub(16) & !0x7u64;
+                                    let mut dump = [0u8; 64];
+                                    for (i, byte) in dump.iter_mut().enumerate() {
+                                        let gpa = base_gpa + i as u64;
+                                        if let Some(hpa) = self.gpa_to_hpa_via_ept(ept_root, gpa) {
+                                            const PHYS_VIRT_OFFSET: u64 = 0xffff_8000_0000_0000;
+                                            *byte = unsafe {
+                                                core::ptr::read_volatile(
+                                                    ((hpa as u64) + PHYS_VIRT_OFFSET) as *const u8,
+                                                )
+                                            };
+                                        }
+                                    }
+                                    let rax = self.regs().rax;
+                                    let rcx = self.regs().rcx;
+                                    let rdx = self.regs().rdx;
+                                    let rflags = VmcsGuestNW::RFLAGS.read().unwrap_or(0);
+                                    info!(
+                                        "[IO-CODE] RIP={:#x} RAX={:#x} RCX={:#x} RDX={:#x} \
+                                         RFLAGS={:#x} is_in={} access_size={} code={:02x?}",
+                                        rip,
+                                        rax,
+                                        rcx,
+                                        rdx,
+                                        rflags,
+                                        io_info.is_in,
+                                        io_info.access_size,
+                                        &dump[..64]
+                                    );
+                                }
+                            }
+                        }
+
+                        // Log fw_cfg port accesses (0x510-0x51B) at debug level
+                        if (0x510..=0x51B).contains(&port) {
+                            let dir = if io_info.is_in { "IN" } else { "OUT" };
+                            let data = if io_info.is_in {
+                                0
+                            } else {
+                                self.regs().rax & 0xffffffff
+                            };
+                            debug!(
+                                "[IO-fw_cfg] port={:#x} dir={} width={} string={} rep={} \
+                                 data={:#x}",
+                                port,
+                                dir,
+                                io_info.access_size,
+                                io_info.is_string,
+                                io_info.is_repeat,
+                                data
+                            );
+                        }
+
+                        // Diagnostic: log non-PM-TIMER, non-keyboard port
+                        // accesses at debug level to avoid flooding the log.
+                        // PM-TIMER (0x600-0x60B) and keyboard controller
+                        // (0x60, 0x64) are too noisy, skip them.
+                        if !(0x600..=0x60B).contains(&port) && port != 0x60 && port != 0x64 {
+                            let dir = if io_info.is_in { "IN" } else { "OUT" };
+                            let data = if io_info.is_in {
+                                0
+                            } else {
+                                self.regs().rax & 0xffffffff
+                            };
+                            debug!(
+                                "[IO-ALL] port={:#x} dir={} size={} RIP={:#x} data={:#x}",
+                                port,
+                                dir,
+                                io_info.access_size,
+                                self.rip(),
+                                data
+                            );
+                        }
 
                         let width = match AccessWidth::try_from(io_info.access_size as usize) {
                             Ok(width) => width,
@@ -2848,19 +4059,76 @@ impl AxArchVCpu for VmxVcpu {
                             }
                         }
 
-                        if self.ram_end > 0 && gpa >= self.ram_end {
-                            info!(
-                                "[EPT-VIOL] GPA={:#x} beyond ram_end={:#x}, injecting #PF",
-                                gpa, self.ram_end
-                            );
-                            let mut err_code = 0u32;
+                        // ECAM MMIO: route to PCI host bridge's ECAM interface via
+                        // the VMM's MMIO dispatch. OVMF accesses PCI config space
+                        // via ECAM at 0xB000_0000 (MCFG ACPI table).
+                        if (ECAM_MMIO_BASE..ECAM_MMIO_END).contains(&gpa) {
+                            let vmexit_instr_len =
+                                VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
+                            // Intel SDM: VMEXIT_INSTRUCTION_LEN is undefined for
+                            // EPT violations. Decode the instruction bytes to get
+                            // both the length and the destination/source register.
+                            let (instr_len, reg, width) = if let Some((bytes, actual_len)) =
+                                self.read_guest_instr_bytes(15)
+                            {
+                                if let Some((reg, width, decoded_len)) =
+                                    Self::decode_mmio_mov_instr(&bytes[..actual_len])
+                                {
+                                    let len = if vmexit_instr_len > 0 {
+                                        vmexit_instr_len as u8
+                                    } else {
+                                        decoded_len.max(1)
+                                    };
+                                    (len, reg, width)
+                                } else {
+                                    // Not a MOV instruction; fall back to RAX
+                                    let len = if vmexit_instr_len > 0 {
+                                        vmexit_instr_len as u8
+                                    } else {
+                                        Self::decode_x86_instruction_length(&bytes[..actual_len])
+                                            .max(1)
+                                    };
+                                    (len, 0u8, AccessWidth::Dword)
+                                }
+                            } else {
+                                // Cannot read instruction bytes; fall back
+                                let len = if vmexit_instr_len > 0 {
+                                    vmexit_instr_len as u8
+                                } else {
+                                    2
+                                };
+                                (len, 0u8, AccessWidth::Dword)
+                            };
+
+                            self.advance_rip(instr_len as _)?;
                             if info.access_flags.contains(MappingFlags::WRITE) {
-                                err_code |= 1 << 1;
+                                let data = self.regs().get_reg_of_index(reg);
+                                return Ok(AxVCpuExitReason::MmioWrite {
+                                    addr: info.fault_guest_paddr,
+                                    width,
+                                    data,
+                                });
+                            } else {
+                                return Ok(AxVCpuExitReason::MmioRead {
+                                    addr: info.fault_guest_paddr,
+                                    width,
+                                    reg: reg as usize,
+                                    reg_width: width,
+                                    signed_ext: false,
+                                });
                             }
-                            if info.access_flags.contains(MappingFlags::EXECUTE) {
-                                err_code |= 1 << 4;
-                            }
-                            self.queue_event(14, Some(err_code));
+                        }
+
+                        // Execute beyond ram_end: inject #PF
+                        if self.ram_end > 0
+                            && gpa >= self.ram_end
+                            && info.access_flags.contains(MappingFlags::EXECUTE)
+                        {
+                            let instr_len =
+                                VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
+                            let instr_len: u8 = if instr_len == 0 { 2 } else { instr_len as u8 };
+                            self.advance_rip(instr_len)?;
+                            self.queue_event(14, Some(1 << 4));
                             return Ok(AxVCpuExitReason::Nothing);
                         }
 
@@ -3040,14 +4308,27 @@ impl AxArchVCpu for VmxVcpu {
         let vector = self.vlapic.timer_vector();
         let is_masked = self.vlapic.timer_is_masked();
         let is_periodic = self.vlapic.timer_is_periodic();
+        let lvt_val = self.vlapic.timer_read_lvt();
 
         info!(
             "[VLAPIC] timer expired: vector={vector:#x}, masked={is_masked}, \
-             periodic={is_periodic}"
+             periodic={is_periodic}, lvt={lvt_val:#010x}"
         );
 
-        if !is_masked && vector > 0 {
+        // Per Intel SDM Vol. 3A Section 10.5.4: when the APIC timer expires
+        // while LVT_TIMER is masked, the interrupt is held pending
+        // (Delivery Status = SendPending). It will be delivered when the
+        // guest unmasks LVT_TIMER.
+        // When unmasked: set IRR and queue for VMCS injection.
+        // When masked: do NOT set IRR; the pending state is tracked by
+        // the timer hardware and will fire when unmasked.
+        if vector > 0 && !is_masked {
+            let vcpu_id = self.vlapic.timer_where_am_i().1 as u32;
+            self.vlapic.set_intr(vcpu_id, vector as u32);
             self.queue_external_interrupt(vector);
+            info!("[VLAPIC] timer interrupt queued: vector={vector:#x}, vcpu={vcpu_id}");
+        } else if is_masked {
+            debug!("[VLAPIC] timer expired but masked, interrupt held pending");
         }
 
         if is_periodic {

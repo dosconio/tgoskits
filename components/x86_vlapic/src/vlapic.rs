@@ -90,6 +90,10 @@ pub struct VirtualApicRegs {
 
     /// Pending INIT/SIPI request from the most recent ICR write.
     pending_init_sipi: Option<PendingInitSipi>,
+
+    /// Pending timer interrupt vector to be injected when LVT_TIMER is unmasked.
+    /// Set when the timer expires while masked; cleared when the interrupt is queued.
+    pending_timer_vector: u8,
 }
 
 impl VirtualApicRegs {
@@ -113,9 +117,15 @@ impl VirtualApicRegs {
             svr_last: SpuriousInterruptVectorRegisterLocal::new(RESET_SPURIOUS_INTERRUPT_VECTOR),
             lvt_last: LocalVectorTable::default(),
             isrv: 0,
-            apic_base: ApicBaseRegisterMsr::new(0),
+            // Power-on default for IA32_APIC_BASE MSR (SDM 11.4.4):
+            //   bit 11 (xAPIC global enable) = 1
+            //   bit  8 (BSP flag)            = 1
+            //   bits 12..35 (APIC base)      = 0xFEE0_0000 >> 12
+            // We model vCPU 0 as the BSP.
+            apic_base: ApicBaseRegisterMsr::new(0xFEE0_0900 | ((vcpu_id == 0) as u64) << 8),
             virtual_timer: ApicTimer::new(vm_id, vcpu_id),
             pending_init_sipi: None,
+            pending_timer_vector: 0,
         }
     }
 
@@ -132,9 +142,23 @@ impl VirtualApicRegs {
     }
 
     /// Gets the APIC base MSR value.
-    #[allow(dead_code)]
     pub fn apic_base(&self) -> u64 {
         self.apic_base.get()
+    }
+
+    /// Sets the APIC base MSR value.
+    /// The base address is forced to the default APIC base (0xFEE0_0000)
+    /// because we do not support remapping the APIC MMIO window. The
+    /// xAPIC-global-enable, x2APIC-enable and BSP bits are honored.
+    pub fn set_apic_base(&mut self, value: u64) {
+        const APIC_BASE_ADDR: u64 = 0xFEE0_0000;
+        const APIC_GLOBAL_ENABLE: u64 = 1 << 11;
+        const X2APIC_ENABLE: u64 = 1 << 10;
+        const BSP_FLAG: u64 = 1 << 8;
+
+        // Force the APIC base address to the default; only honor enable bits.
+        let new_value = (value & (APIC_GLOBAL_ENABLE | X2APIC_ENABLE | BSP_FLAG)) | APIC_BASE_ADDR;
+        self.apic_base.set(new_value);
     }
 
     /// Returns whether the x2APIC mode is enabled.
@@ -148,6 +172,13 @@ impl VirtualApicRegs {
     pub fn is_xapic_enabled(&self) -> bool {
         self.apic_base.is_set(APIC_BASE::XAPIC_ENABLED)
             && !self.apic_base.is_set(APIC_BASE::X2APIC_Enabled)
+    }
+
+    /// Returns true if the APIC is software-enabled (SVR bit 8 set).
+    pub fn is_software_enabled(&self) -> bool {
+        self.regs()
+            .SVR
+            .is_set(SPURIOUS_INTERRUPT_VECTOR::APICSoftwareEnableDisable)
     }
 
     /// Returns the current timer mode.
@@ -192,6 +223,19 @@ impl VirtualApicRegs {
 
     pub fn timer_restart(&mut self) -> AxResult {
         self.virtual_timer.restart_timer()
+    }
+
+    /// Take the pending timer interrupt vector (if any) and clear it.
+    /// Returns the vector number, or 0 if no pending timer interrupt.
+    pub fn take_pending_timer_vector(&mut self) -> u8 {
+        let v = self.pending_timer_vector;
+        self.pending_timer_vector = 0;
+        v
+    }
+
+    /// Start a TSC-Deadline timer.
+    pub fn start_tsc_deadline_timer(&mut self, tsc_deadline: u64) -> AxResult {
+        self.virtual_timer.start_tsc_deadline_timer(tsc_deadline)
     }
 
     /// 30.1.4 EOI Virtualization
@@ -266,14 +310,14 @@ impl VirtualApicRegs {
         self.esr_firing = 1;
         if self.esr_firing == 0 {
             self.esr_firing = 1;
-            let _lvt = self.regs().LVT_ERROR.get();
-            //  if ((lvt & APIC_LVT_M) == 0U) {
-            //     vec = lvt & APIC_LVT_VECTOR;
-            //     if (vec >= 16U) {
-            //         vlapic_accept_intr(vlapic, vec, LAPIC_TRIG_EDGE);
-            //     }
-            // }
-            unimplemented!("vlapic_accept_intr(vlapic, vec, LAPIC_TRIG_EDGE)");
+            // Set error interrupt via IRR
+            let lvt = self.regs().LVT_ERROR.get();
+            let vec = lvt & APIC_LVT_VECTOR;
+            if vec >= 16 {
+                // Directly set IRR instead of calling vlapic_accept_intr
+                self.set_intr(0, vec, LAPIC_TRIG_EDGE);
+            }
+            warn!("[vLAPIC] APIC error occurred, vector={}", vec);
             // self.esr_firing = 0;
         }
     }
@@ -336,9 +380,10 @@ impl VirtualApicRegs {
             // Todo: distinguish between APIC ID and vCPU ID.
             dmask = 1 << dest;
         } else if lowprio {
-            // lowprio is not supported.
-            // Refer to 11.6.2.4 Lowest Priority Delivery Mode.
-            unimplemented!("lowprio");
+            // Lowest-priority delivery: treat as physical mode for now
+            // (single destination, no priority arbitration between CPUs).
+            warn!("[vLAPIC] lowest-priority delivery mode, treating as physical");
+            dmask = 1 << dest;
         } else {
             // Logical mode: "dest" is message destination addr
             // to be compared with the logical APIC ID in LDR.
@@ -386,7 +431,15 @@ impl VirtualApicRegs {
     }
 
     fn handle_self_ipi(&mut self) {
-        unimplemented!("x2apic handle_self_ipi");
+        // x2APIC self-IPI: trigger an IPI to self.
+        // The vector is in the lower 8 bits of ICR_LOW (Self IPI register at offset 0x3F0).
+        let self_ipi_val = self.regs().ICR_LO.get();
+        // In x2APIC Self-IPI, the vector is in bits [7:0]
+        let vector = self_ipi_val & 0xff;
+        if vector >= 16 {
+            debug!("[vLAPIC] handle_self_ipi: vector={}", vector);
+            self.set_intr(0, vector, LAPIC_TRIG_EDGE);
+        }
     }
 
     pub(crate) fn has_pending_interrupt(&self) -> bool {
@@ -404,14 +457,16 @@ impl VirtualApicRegs {
     }
 
     pub(crate) fn set_intr(&mut self, vcpu_id: u32, vector: u32, _level: bool) {
-        let apic_enabled = self
-            .regs()
-            .SVR
-            .is_set(SPURIOUS_INTERRUPT_VECTOR::APICSoftwareEnableDisable);
-        if !apic_enabled {
-            debug!("[VLAPIC] APIC disabled, ignoring interrupt vector {vector} for vcpu {vcpu_id}");
-            return;
-        }
+        // Per Intel SDM Vol. 3A Section 10.4.3: when the local APIC is software
+        // disabled (SVR bit 8 = 0), the APIC continues to respond to:
+        // - APIC timer interrupts
+        // - LINT0/LINT1 interrupts
+        // - Performance-monitoring counters interrupts
+        // - Thermal sensor interrupts
+        // Only IPIs and external interrupts (from IOAPIC) are blocked.
+        // Therefore, we do NOT block interrupt delivery based on APIC software
+        // enable/disable status. The IRR bit should always be set; the SVR enable
+        // bit only affects whether the interrupt is subsequently delivered to the CPU.
 
         let (idx, bitpos) = extract_index_and_bitpos_u32(vector);
         unsafe {
@@ -434,7 +489,9 @@ impl VirtualApicRegs {
     }
 
     fn inject_nmi(&mut self, vcpu_id: u32) {
-        unimplemented!("inject_nmi vcpu_id: {}", vcpu_id);
+        // NMI injection not yet supported from vLAPIC.
+        // NMI requires vCPU access to queue the NMI event.
+        info!("[vLAPIC] inject_nmi vcpu_id={}, dropping NMI", vcpu_id);
     }
 
     fn process_init_sipi(
@@ -519,6 +576,37 @@ impl VirtualApicRegs {
             && new.is_set(SPURIOUS_INTERRUPT_VECTOR::APICSoftwareEnableDisable)
         {
             debug!("[VLAPIC] vlapic [{}] is software-enabled", self.vapic_id);
+
+            // Per Intel SDM Vol. 3A Section 10.4.7.2: when the APIC is
+            // software-disabled, LVT mask flags are all treated as 1.
+            // When the APIC is re-enabled, the LVT entries should return
+            // to their programmed state (the values the guest wrote before
+            // the APIC was disabled).
+            //
+            // Restore each LVT register from lvt_last (which stores the
+            // guest's intended value without the forced mask bit), then
+            // call write_lvt() to propagate the unmasked value to the
+            // timer and update the register.
+            self.regs().LVT_TIMER.set(self.lvt_last.lvt_timer.get());
+            self.write_lvt(ApicRegOffset::LvtTimer)?;
+
+            self.regs().LVT_CMCI.set(self.lvt_last.lvt_cmci.get());
+            self.write_lvt(ApicRegOffset::LvtCMCI)?;
+
+            self.regs().LVT_THERMAL.set(self.lvt_last.lvt_thermal.get());
+            self.write_lvt(ApicRegOffset::LvtThermal)?;
+
+            self.regs().LVT_PMI.set(self.lvt_last.lvt_perf_count.get());
+            self.write_lvt(ApicRegOffset::LvtPmc)?;
+
+            self.regs().LVT_LINT0.set(self.lvt_last.lvt_lint0.get());
+            self.write_lvt(ApicRegOffset::LvtLint0)?;
+
+            self.regs().LVT_LINT1.set(self.lvt_last.lvt_lint1.get());
+            self.write_lvt(ApicRegOffset::LvtLint1)?;
+
+            self.regs().LVT_ERROR.set(self.lvt_last.lvt_err.get());
+            self.write_lvt(ApicRegOffset::LvtErr)?;
 
             // The apic is now enabled so restart the apic timer
             // if it is configured in periodic mode.
@@ -646,18 +734,53 @@ impl VirtualApicRegs {
                 mask |= LVT_TIMER::TimerMode::SET.mask();
                 val &= mask;
 
+                let was_masked = self.virtual_timer.is_masked();
+
+                // Per Intel SDM Vol. 3A Section 10.4.7.2: when the APIC is
+                // software-disabled, LVT mask flags are all treated as 1.
+                // However, the *register values* should reflect the guest's
+                // intent so that when the APIC is re-enabled the LVT entries
+                // return to their programmed (unmasked) state.
+                //
+                // Therefore, we pass the guest's original value (without the
+                // forced mask bit) to the timer, and only store the masked
+                // version in the vlapic register for guest readback.
+                let timer_val = if apic_disabled {
+                    val & !APIC_LVT_M
+                } else {
+                    val
+                };
+
+                let now_unmasked = (timer_val & APIC_LVT_M) == 0;
+
                 info!(
-                    "[VLAPIC] write LVT_TIMER: val={val:#010x}, apic_disabled={apic_disabled}, \
-                     guest_mask={}, timer_mask={}",
-                    val & APIC_LVT_M != 0,
-                    self.virtual_timer.is_masked()
+                    "[VLAPIC] write LVT_TIMER: val={val:#010x}, timer_val={timer_val:#010x}, \
+                     apic_disabled={apic_disabled}, was_masked={was_masked}, \
+                     now_unmasked={now_unmasked}"
                 );
 
-                self.virtual_timer.write_lvt(val)?;
+                self.virtual_timer.write_lvt(timer_val)?;
 
                 let stored_val = if apic_disabled { val | APIC_LVT_M } else { val };
                 self.regs().LVT_TIMER.set(stored_val);
-                self.lvt_last.lvt_timer.set(stored_val);
+                self.lvt_last.lvt_timer.set(val);
+
+                // Per Intel SDM Vol. 3A Section 10.5.4: if the timer expired
+                // while LVT_TIMER was masked, the interrupt is held pending.
+                // When the guest unmasks LVT_TIMER, deliver the pending
+                // interrupt by setting IRR and marking for injection.
+                if was_masked && now_unmasked && !apic_disabled {
+                    let vector = (timer_val & 0xFF) as u8;
+                    if vector > 0 {
+                        let (_, vid) = self.virtual_timer.where_am_i();
+                        info!(
+                            "[VLAPIC] LVT_TIMER unmasked with pending timer: vector={vector:#x}, \
+                             vcpu={vid}"
+                        );
+                        self.set_intr(vid as u32, vector as u32, LAPIC_TRIG_EDGE);
+                        self.pending_timer_vector = vector;
+                    }
+                }
             }
             ApicRegOffset::LvtErr => {
                 val &= mask;
@@ -722,7 +845,9 @@ impl VirtualApicRegs {
             }
             _ => {
                 warn!("[VLAPIC] write unsupported APIC register: {offset:?}");
-                return Err(AxError::InvalidInput);
+                // Silently ignore writes to unhandled registers instead of
+                // returning an error that would panic the vCPU run loop.
+                return Ok(());
             }
         }
         Ok(())
@@ -921,6 +1046,12 @@ impl VirtualApicRegs {
                 // Force APIC ID to be read-only.
                 // self.regs().ID.set(val as _);
             }
+            ApicRegOffset::TPR => {
+                // Task Priority Register: bits [7:4] are priority class,
+                // bits [3:0] are sub-class. Update PPR after writing.
+                self.regs().TPR.set(data32);
+                self.update_ppr();
+            }
             ApicRegOffset::EOI => {
                 self.process_eoi();
             }
@@ -934,6 +1065,10 @@ impl VirtualApicRegs {
             }
             ApicRegOffset::SIVR => {
                 self.regs().SVR.set(data32);
+                info!(
+                    "[VLAPIC] write SVR: data={data32:#010x}, apic_enable={}",
+                    data32 & (1 << 8) != 0
+                );
                 self.write_svr()?;
             }
             ApicRegOffset::ESR => {
@@ -1008,6 +1143,10 @@ impl VirtualApicRegs {
                     );
                     return Ok(());
                 }
+                info!(
+                    "[VLAPIC] write TimerInitCount: data={data32:#010x}, timer_mode={:?}",
+                    self.timer_mode().unwrap_or(TimerMode::OneShot)
+                );
                 self.regs().ICR_TIMER.set(data32);
                 self.write_icrtmr()?;
             }
@@ -1026,7 +1165,9 @@ impl VirtualApicRegs {
             }
             _ => {
                 warn!("[VLAPIC] write unsupported APIC register: {offset:?}");
-                return Err(AxError::InvalidInput);
+                // Silently ignore writes to unhandled registers instead of
+                // returning an error that would panic the vCPU run loop.
+                return Ok(());
             }
         }
 

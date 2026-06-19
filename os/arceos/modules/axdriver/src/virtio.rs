@@ -261,11 +261,6 @@ fn nonnull_from_hal_address(addr: HalAddress, context: &str) -> NonNull<u8> {
 }
 
 #[inline]
-fn hal_phys_to_virt_addr(paddr: PhysAddr) -> HalAddress {
-    HalAddress::new(phys_to_virt((paddr as usize).into()).as_mut_ptr() as usize)
-}
-
-#[inline]
 fn hal_virt_to_phys_addr(vaddr: usize) -> PhysAddr {
     virt_to_phys(vaddr.into()).as_usize() as PhysAddr
 }
@@ -289,9 +284,10 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
     }
 
     #[inline]
-    unsafe fn mmio_phys_to_virt(paddr: PhysAddr, _size: usize) -> NonNull<u8> {
-        let vaddr = hal_phys_to_virt_addr(paddr);
-        nonnull_from_hal_address(vaddr, "mmio_phys_to_virt")
+    unsafe fn mmio_phys_to_virt(paddr: PhysAddr, size: usize) -> NonNull<u8> {
+        let vaddr =
+            ax_mm::iomap((paddr as usize).into(), size).expect("failed to map virtio MMIO region");
+        nonnull_from_addr(vaddr.as_usize(), "mmio_phys_to_virt")
     }
 
     #[inline]

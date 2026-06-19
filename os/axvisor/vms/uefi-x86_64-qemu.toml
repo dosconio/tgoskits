@@ -1,8 +1,72 @@
-env = { AX_IP = "10.0.2.15", AX_GW = "10.0.2.2" }
-features = [
-    "ept-level-4",
-    "fs",
+# UEFI VM configuration for x86_64 QEMU
+# This configuration tests UEFI boot mode with OVMF firmware.
+#
+# Prerequisites:
+# - OVMF_CODE.fd and OVMF_VARS.fd must be available on the host
+#   On Ubuntu/Debian: sudo apt install ovmf
+#   Default path: /usr/share/OVMF/OVMF_CODE.fd and OVMF_VARS.fd
+#
+# Note: This is a Stage 1 verification config. Full UEFI boot requires
+# Stage 2 (fw_cfg, ACPI tables) and Stage 3 (PCI/virtio devices).
+# OVMF will likely hang waiting for these devices.
+
+[base]
+id = 1
+name = "uefi-vm"
+vm_type = 1
+# Only the primary vCPU (BSP) is launched by axvisor; secondary vCPUs are
+# not started. fw_cfg reports this count as FW_CFG_NB_CPUS so that OVMF's
+# MpInitLib skips AP wakeup and does not block waiting for AP responses.
+cpu_num = 1
+phys_cpu_sets = [1]
+
+[kernel]
+# Entry point is ignored in UEFI mode; BSP starts at 0xFFFFFFF0 (reset vector)
+entry_point = 0x10000000
+image_location = "fs"
+# Kernel path for fw_cfg direct kernel boot (Path A)
+kernel_path = "/guest/linux/linux-qemu"
+kernel_load_addr = 0x10000000
+# Kernel command line (passed via fw_cfg for direct kernel boot)
+cmdline = "console=ttyS0 earlyprintk=serial root=/dev/ram0 ro"
+
+# UEFI boot mode - uses OVMF firmware instead of axvm-bios
+boot_mode = "uefi"
+
+# Memory regions with format (`base_paddr`, `size`, `flags`, `map_type`).
+# For `map_type`, 0 means `MAP_ALLOC`, 1 means `MAP_IDENTICAL`, 2 means `MAP_RESERVED`.
+# Memory layout:
+# 0x0000_0000 - 0x000E_FFFF: Low RAM (960 KiB) for OVMF SEC phase
+# 0x000F_0000 - 0x000F_FFFF: Hole for pflash alias (legacy BIOS area)
+# 0x0010_0000 - 0x3FFF_FFFF: Main RAM (1 GiB)
+# 0xFF80_0000 - 0xFFBF_FFFF: pflash1 (OVMF_VARS) - 4 MiB
+# 0xFFC0_0000 - 0xFFFF_FFFF: pflash0 (OVMF_CODE) - 4 MiB (includes reset vector at 0xFFFFFFF0)
+memory_regions = [
+  [0x0000_0000, 0xF_0000, 0x7, 0],     # Low RAM 0-0xEFFFF (960 KiB) R|W|X
+  [0x0010_0000, 0x3FF0_0000, 0x7, 0],   # RAM 0x100000-0x3FFFFFFF (1 GiB) R|W|X
+  [0xFF80_0000, 0x40_0000, 0x3, 0],    # pflash1 (OVMF_VARS) 4 MiB R|W
+  [0xFFC0_0000, 0x40_0000, 0x7, 0],    # pflash0 (OVMF_CODE) 4 MiB R|W|X
 ]
-log = "Info"
-target = "x86_64-unknown-none"
-vm_configs = []
+
+# OVMF_CODE (pflash0) - Read-only firmware code (4 MiB variant)
+# Must end at 0xFFFFFFFF: 0xFFC00000 + 0x3FFFF0 = 0xFFFFFFF0 (reset vector)
+pflash0 = { path = "/guest/ovmf/OVMF_CODE.fd", base_gpa = 0xFFC00000, size = 0x400000, read_only = true }
+
+# OVMF_VARS (pflash1) - Read-write UEFI variable store (4 MiB variant)
+pflash1 = { path = "/guest/ovmf/OVMF_VARS.fd", base_gpa = 0xFF800000, size = 0x400000, read_only = false }
+
+#
+# Device specifications
+#
+[devices]
+interrupt_mode = "emulated"
+
+# fw_cfg device - provides boot info to OVMF (RAM size, CPU count, ACPI tables)
+# Note: fw_cfg is created dynamically by ImageLoader, this entry serves as a hint
+emu_devices = [
+  { name = "fw-cfg", base_gpa = 0, length = 2, irq_id = 0, emu_type = 0x10, cfg_list = [] },
+]
+
+passthrough_devices = [
+  ["HPET", 0xfed0_0000, 0xfed0_0000, 0x1000, 0x1],
+]

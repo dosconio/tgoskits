@@ -455,6 +455,11 @@ fn vcpu_run() {
 
     loop {
         super::timer::check_events();
+        // Advance PIT counters based on real time so that OVMF receives
+        // periodic IRQ0 interrupts even when it doesn't access PIT ports.
+        if let Some(pit) = i8254_pit::GLOBAL_PIT.get() {
+            pit.advance_to_now();
+        }
         match vm.run_vcpu(vcpu_id) {
             Ok(exit_reason) => {
                 exit_count += 1;
@@ -532,8 +537,10 @@ fn vcpu_run() {
                             || nothing_count == 10000
                             || nothing_count == 100000
                         {
+                            let vcpu_arch = vcpu.get_arch_vcpu();
                             info!(
-                                "VM[{vm_id}] VCpu[{vcpu_id}] Nothing count={nothing_count}, hlt_count={hlt_count}, total exits={exit_count}"
+                                "VM[{vm_id}] VCpu[{vcpu_id}] Nothing count={nothing_count}, hlt_count={hlt_count}, total exits={exit_count}, RIP={:#x}",
+                                vcpu_arch.rip()
                             );
                         }
                     }

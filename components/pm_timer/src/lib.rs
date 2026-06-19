@@ -13,6 +13,9 @@ const PM_TMR_BLK: u16 = 0x608;
 const PM_BLOCK_START: u16 = PM1A_EVT_BLK;
 const PM_BLOCK_END: u16 = PM_TMR_BLK + 3; // 0x60B
 
+/// ACPI PM Timer frequency: 3.579545 MHz (24-bit counter).
+const PM_TIMER_HZ: u64 = 3_579_545;
+
 pub struct PmTimer;
 
 impl Default for PmTimer {
@@ -31,11 +34,12 @@ impl PmTimer {
     }
 
     fn get_timer_value(&self) -> u32 {
-        let ticks = unsafe { core::arch::x86_64::_rdtsc() };
-        // PM Timer is a 24-bit counter that increments at ~3.579545 MHz
-        // We approximate using TSC (assuming ~4 GHz TSC, divide by ~1118)
-        // to get roughly 3.58 MHz equivalent
-        ((ticks / 1118) as u32) & 0xFFFFFF
+        // PM Timer is a 24-bit counter that increments at 3.579545 MHz.
+        // Use the platform-calibrated time API (based on CPUID-derived TSC
+        // frequency) instead of raw TSC, so the rate is correct regardless
+        // of the host CPU frequency.
+        let now_ns = axvisor_api::time::ticks_to_nanos(axvisor_api::time::current_ticks());
+        ((now_ns * PM_TIMER_HZ / 1_000_000_000) as u32) & 0xFFFFFF
     }
 }
 
@@ -74,13 +78,11 @@ impl BaseDeviceOps<PortRange> for PmTimer {
                 Ok(val)
             }
             0x608..=0x60B => {
-                // PM_TMR_BLK: Timer Register
+                // PM_TMR_BLK: Timer Register (accessed very frequently,
+                // skip per-read logging to avoid flooding the log).
+                // Diagnostics are handled inside get_timer_value().
                 let timer_val = self.get_timer_value();
                 let offset = (port - PM_TMR_BLK) as u32;
-                info!(
-                    "[PM-TIMER] Read port {:#x}, offset {}, width {:?}, timer_val {:#x}",
-                    port, offset, width, timer_val
-                );
                 match width {
                     AccessWidth::Byte => {
                         let val = (timer_val >> (offset * 8)) & 0xFF;
@@ -120,10 +122,7 @@ impl BaseDeviceOps<PortRange> for PmTimer {
                 );
             }
             0x608..=0x60B => {
-                info!(
-                    "[PM-TIMER] Write port {:#x}, width {:?}, val {:#x} (ignored)",
-                    port, width, val
-                );
+                // PM_TMR_BLK is read-only; silently ignore writes.
             }
             _ => {
                 info!(

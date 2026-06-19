@@ -15,4 +15,10 @@
 pub mod cache;
 
 pub fn hardware_check() {}
-pub fn inject_interrupt(_vector: u8) {}
+
+/// Inject an interrupt into the current vCPU (used for IPI self-injection).
+/// TODO: This requires access to the current vCPU's queue_external_interrupt.
+/// IPI self-injection is not needed for OVMF early boot (single CPU).
+pub fn inject_interrupt(_vector: u8) {
+    // TODO: implement IPI self-injection via current vCPU reference
+}

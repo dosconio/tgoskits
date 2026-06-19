@@ -38,6 +38,8 @@ ept-level-4 = []
 fs = ["ax-std/fs"]
 vmx = ["axvm/vmx"]
 svm = ["axvm/svm"]
+page-alloc-4g = ["ax-std/page-alloc-4g"]
+page-alloc-64g = ["ax-std/page-alloc-64g"]
 sstc = ["riscv_vcpu/sstc"]
 dyn-plat = ["ax-std/plat-dyn", "dep:axplat-dyn"]
 rockchip-soc = ["dep:axplat-dyn", "axplat-dyn/rockchip-soc"]
@@ -99,8 +101,10 @@ acpi_tables = { path = "../../components/acpi_tables" }
 pci_host = { path = "../../components/pci_host" }
 virtio_blk_pci = { path = "../../components/virtio_blk_pci" }
 i8259_pic = { path = "../../components/i8259_pic" }
+i8254_pit = { path = "../../components/i8254_pit" }
 pm_timer = { path = "../../components/pm_timer" }
 x86_vioapic = { path = "../../components/x86_vioapic" }
+mc146818_cmos = { path = "../../components/mc146818_cmos" }
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 aarch64-cpu-ext = "0.1"
 arm-gic-driver = { workspace = true, features = ["rdif"] }

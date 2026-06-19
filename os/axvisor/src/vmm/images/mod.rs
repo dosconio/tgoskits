@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ax_errno::AxResult;
+use ax_errno::{AxResult, ax_err};
 use axaddrspace::{GuestPhysAddr, HostPhysAddr, HostVirtAddr, MappingFlags};
 
 use axvm::VMMemoryRegion;
@@ -65,16 +65,73 @@ impl virtio_blk_pci::GuestMemoryAccessor for VmGuestMemoryAccessor {
 }
 
 #[cfg(target_arch = "x86_64")]
+impl fw_cfg::GuestMemoryAccessor for VmGuestMemoryAccessor {
+    fn read_guest_memory(&self, gpa: u64, buf: &mut [u8]) -> AxResult {
+        use ax_hal::mem::phys_to_virt;
+        use axaddrspace::GuestPhysAddr;
+
+        for (i, byte) in buf.iter_mut().enumerate() {
+            let gpa_addr = GuestPhysAddr::from(gpa as usize + i);
+            match self.vm.read_from_guest_of::<u8>(gpa_addr) {
+                Ok(b) => *byte = b,
+                Err(_) => {
+                    // Fallback: try EPT page table translation directly.
+                    // This handles addresses mapped by EPT violation handlers
+                    // (e.g., dummy_ff_page) that are not tracked in Address Space areas.
+                    if let Some(hpa) = self.vm.translate_gpa_pt_only(gpa_addr) {
+                        let hva = phys_to_virt(hpa);
+                        unsafe {
+                            *byte = core::ptr::read_volatile(hva.as_mut_ptr());
+                        }
+                    } else {
+                        return ax_err!(InvalidInput, "GPA not found in areas or EPT");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_guest_memory(&self, gpa: u64, buf: &[u8]) -> AxResult {
+        use ax_hal::mem::phys_to_virt;
+        use axaddrspace::GuestPhysAddr;
+
+        for (i, byte) in buf.iter().enumerate() {
+            let gpa_addr = GuestPhysAddr::from(gpa as usize + i);
+            match self.vm.write_to_guest_of(gpa_addr, byte) {
+                Ok(()) => {}
+                Err(_) => {
+                    // Fallback: try EPT page table translation directly.
+                    if let Some(hpa) = self.vm.translate_gpa_pt_only(gpa_addr) {
+                        let hva = phys_to_virt(hpa);
+                        unsafe {
+                            core::ptr::write_volatile(hva.as_mut_ptr(), *byte);
+                        }
+                    } else {
+                        return ax_err!(InvalidInput, "GPA not found in areas or EPT");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 mod guest_serial {
     use ax_errno::AxResult;
     use axaddrspace::device::{AccessWidth, Port, PortRange};
     use axdevice_base::{BaseDeviceOps, EmuDeviceType};
+    use core::sync::atomic::{AtomicU8, Ordering};
     use log::info;
 
     pub struct GuestSerial;
 
     const COM1_BASE: u16 = 0x3F8;
-    const COM1_END: u16 = 0x3FE;
+    const COM1_END: u16 = 0x3FF; // Include SCR (offset 7) for serial port detection
+
+    /// Scratch register for serial port detection (OVMF writes 0xAA/0x55 and reads back).
+    static SCRATCH: AtomicU8 = AtomicU8::new(0);
 
     impl BaseDeviceOps<PortRange> for GuestSerial {
         fn emu_type(&self) -> EmuDeviceType {
@@ -96,6 +153,15 @@ mod guest_serial {
                     // Line Status Register - Transmitter Holding Register Empty
                     Ok(0x60)
                 }
+                6 => {
+                    // Modem Status Register - DCD, DSR, CTS
+                    Ok(0x30)
+                }
+                7 => {
+                    // Scratch Register - return last written value
+                    // OVMF writes test patterns (0xAA, 0x55) to detect serial port
+                    Ok(SCRATCH.load(Ordering::Relaxed) as usize)
+                }
                 _ => Ok(0),
             }
         }
@@ -113,7 +179,75 @@ mod guest_serial {
                 } else {
                     info!("[GUEST] \\x{:02x}", ch);
                 }
+            } else if offset == 7 {
+                // Scratch Register - store for serial port detection
+                SCRATCH.store(val as u8, Ordering::Relaxed);
             }
+            Ok(())
+        }
+    }
+}
+
+/// Simple i8042 keyboard controller emulation.
+///
+/// OVMF polls port 0x64 (status register) during boot to check for
+/// keyboard input and to verify the controller self-test completed.
+/// Without this emulation, port 0x64 reads return 0 (unregistered
+/// port default), so bit 2 (SYS_FLAG / self-test passed) is never
+/// set. OVMF then spins in a polling loop reading PM-TIMER and
+/// port 0x64 repeatedly, never progressing to the boot device
+/// selection phase.
+///
+/// The status register is returned with:
+///   bit 2 = 1  (system flag: self-test passed)
+///   bit 1 = 0  (input buffer empty: ready for commands)
+///   bit 0 = 0  (output buffer empty: no data available)
+/// which gives a status value of 0x04.
+mod i8042 {
+    use ax_errno::AxResult;
+    use axaddrspace::device::{AccessWidth, Port, PortRange};
+    use axdevice_base::{BaseDeviceOps, EmuDeviceType};
+
+    pub struct I8042;
+
+    impl Default for I8042 {
+        fn default() -> Self {
+            Self
+        }
+    }
+
+    impl I8042 {
+        pub fn new() -> Self {
+            Self
+        }
+    }
+
+    impl BaseDeviceOps<PortRange> for I8042 {
+        fn emu_type(&self) -> EmuDeviceType {
+            EmuDeviceType::Dummy
+        }
+
+        fn address_range(&self) -> PortRange {
+            // i8042 keyboard controller: data port 0x60, status/command port 0x64
+            PortRange::new(Port(0x60), Port(0x64))
+        }
+
+        fn handle_read(&self, addr: Port, _width: AccessWidth) -> AxResult<usize> {
+            match addr.0 {
+                0x60 => {
+                    // Data register: no data available
+                    Ok(0)
+                }
+                0x64 => {
+                    // Status register: bit 2 (SYS_FLAG) = 1 (self-test passed)
+                    Ok(0x04)
+                }
+                _ => Ok(0),
+            }
+        }
+
+        fn handle_write(&self, addr: Port, _width: AccessWidth, _val: usize) -> AxResult {
+            // Silently ignore writes to command (0x64) and data (0x60) ports
             Ok(())
         }
     }
@@ -378,14 +512,41 @@ impl ImageLoader {
                 let region_size = pflash0_path.size;
                 let load_offset = region_size.saturating_sub(file_size);
                 let load_gpa = GuestPhysAddr::from(pflash0_gpa.as_usize() + load_offset);
+                let file_end_gpa = load_gpa.as_usize() + file_size;
                 info!(
-                    "[pflash0] Loading {} (file {} bytes, region {:#x}) at offset {:#x}, GPA {:#x}",
+                    "[pflash0] Loading {} (file {} bytes, region {:#x}) at offset {:#x}, GPA {:#x}, file_end_gpa {:#x}",
                     pflash0_path.path,
                     file_size,
                     region_size,
                     load_offset,
-                    load_gpa.as_usize()
+                    load_gpa.as_usize(),
+                    file_end_gpa
                 );
+                // Verify: file_end_gpa should equal pflash0_gpa + region_size
+                let expected_end = pflash0_gpa.as_usize() + region_size;
+                if file_end_gpa != expected_end {
+                    warn!(
+                        "[pflash0] WARNING: file_end_gpa {:#x} != expected {:#x} (gap = {:#x} bytes at end of pflash0 region!)",
+                        file_end_gpa,
+                        expected_end,
+                        expected_end - file_end_gpa
+                    );
+                }
+                // Fill the entire pflash0 region with 0xFF before loading the file.
+                // Unprogrammed Flash memory reads as 0xFF; the region was zero-initialized
+                // by vm_alloc_memorys, so the gap before the file (load_offset bytes) must
+                // be patched to 0xFF. Without this, OVMF Firmware Volume traversal may
+                // misinterpret the 0x00-filled gap as valid FV structures.
+                let mut pflash0_region_data = self
+                    .vm
+                    .get_image_load_region(pflash0_gpa, region_size)
+                    .unwrap_or_default();
+                for slice in &mut pflash0_region_data {
+                    for b in slice.iter_mut() {
+                        *b = 0xFF;
+                    }
+                }
+
                 let _pflash0_hva =
                     fs::load_vm_image(&pflash0_path.path, load_gpa, self.vm.clone())?;
 
@@ -402,6 +563,15 @@ impl ImageLoader {
                         rv_data[0].as_ptr() as usize
                     );
                     info!("[UEFI] GPA 0xFFFFFFF0 data: {:02x?}", bytes);
+                    // Check if reset vector is valid (should be 90 90 e9 ... or ea ...)
+                    let is_valid = bytes.iter().any(|&b| b != 0 && b != 0xff);
+                    if !is_valid {
+                        warn!(
+                            "[UEFI] Reset vector at GPA 0xFFFFFFF0 appears invalid (all zeros or 0xFF)!"
+                        );
+                    }
+                } else {
+                    warn!("[UEFI] Cannot read GPA 0xFFFFFFF0 - no image load region found!");
                 }
             }
             #[cfg(not(feature = "fs"))]
@@ -437,6 +607,16 @@ impl ImageLoader {
                     load_offset,
                     load_gpa.as_usize()
                 );
+                // Fill pflash1 region with 0xFF before loading (same rationale as pflash0).
+                let mut pflash1_region_data = self
+                    .vm
+                    .get_image_load_region(pflash1_gpa, region_size)
+                    .unwrap_or_default();
+                for slice in &mut pflash1_region_data {
+                    for b in slice.iter_mut() {
+                        *b = 0xFF;
+                    }
+                }
                 let _ = fs::load_vm_image(&pflash1_path.path, load_gpa, self.vm.clone())?;
             }
             #[cfg(not(feature = "fs"))]
@@ -607,6 +787,76 @@ impl ImageLoader {
                             kernel_data.len()
                         );
                         fw_cfg.add_file("opt/org.qemu/kernel", &kernel_data);
+
+                        // Parse bzImage header and set up legacy well-known
+                        // selectors for OVMF direct kernel boot.
+                        // The bzImage format: offset 0x1F1 has setup_sects (u8).
+                        // If setup_sects == 0, use 4 sectors.
+                        // Setup size = (setup_sects + 1) * 512 bytes.
+                        // Kernel data starts after the setup sectors.
+                        if kernel_data.len() > 0x1F2 {
+                            let setup_sects = kernel_data[0x1F1] as usize;
+                            let setup_sects = if setup_sects == 0 { 4 } else { setup_sects };
+                            let setup_size = (setup_sects + 1) * 512;
+                            let setup_size = setup_size.min(kernel_data.len());
+                            let kernel_size = kernel_data.len().saturating_sub(setup_size);
+
+                            info!(
+                                "[fw_cfg] bzImage: setup_sects={}, setup_size={}, \
+                                 kernel_size={}",
+                                setup_sects, setup_size, kernel_size
+                            );
+
+                            // FW_CFG_SETUP_SIZE (0x0017) + FW_CFG_SETUP_DATA (0x0018)
+                            fw_cfg.add_item_at(
+                                fw_cfg::consts::FW_CFG_SETUP_SIZE,
+                                &(setup_size as u32).to_le_bytes(),
+                            );
+                            fw_cfg.add_item_at(
+                                fw_cfg::consts::FW_CFG_SETUP_DATA,
+                                &kernel_data[..setup_size],
+                            );
+
+                            // FW_CFG_KERNEL_SIZE (0x0008) + FW_CFG_KERNEL_DATA (0x0011)
+                            fw_cfg.add_item_at(
+                                fw_cfg::consts::FW_CFG_KERNEL_SIZE,
+                                &(kernel_size as u32).to_le_bytes(),
+                            );
+                            fw_cfg.add_item_at(
+                                fw_cfg::consts::FW_CFG_KERNEL_DATA,
+                                &kernel_data[setup_size..],
+                            );
+
+                            // FW_CFG_CMDLINE_SIZE (0x0014) + FW_CFG_CMDLINE_DATA (0x0015)
+                            if let Some(cmdline) = &self.config.kernel.cmdline {
+                                let cmdline_bytes = cmdline.as_bytes();
+                                let cmdline_with_nul = if cmdline_bytes.last() != Some(&b'\0') {
+                                    let mut v = cmdline_bytes.to_vec();
+                                    v.push(0);
+                                    v
+                                } else {
+                                    cmdline_bytes.to_vec()
+                                };
+                                fw_cfg.add_item_at(
+                                    fw_cfg::consts::FW_CFG_CMDLINE_SIZE,
+                                    &(cmdline_with_nul.len() as u32).to_le_bytes(),
+                                );
+                                fw_cfg.add_item_at(
+                                    fw_cfg::consts::FW_CFG_CMDLINE_DATA,
+                                    &cmdline_with_nul,
+                                );
+                                info!(
+                                    "[fw_cfg] Registered legacy kernel cmdline ({} bytes)",
+                                    cmdline_with_nul.len()
+                                );
+                            }
+                        } else {
+                            warn!(
+                                "[fw_cfg] Kernel file too small to parse bzImage header \
+                                 ({} bytes), skipping legacy selectors",
+                                kernel_data.len()
+                            );
+                        }
                     }
                     Err(e) => {
                         warn!(
@@ -636,6 +886,13 @@ impl ImageLoader {
                             initrd_data.len()
                         );
                         fw_cfg.add_file("opt/org.qemu/initrd", &initrd_data);
+
+                        // FW_CFG_INITRD_SIZE (0x000b) + FW_CFG_INITRD_DATA (0x0012)
+                        fw_cfg.add_item_at(
+                            fw_cfg::consts::FW_CFG_INITRD_SIZE,
+                            &(initrd_data.len() as u32).to_le_bytes(),
+                        );
+                        fw_cfg.add_item_at(fw_cfg::consts::FW_CFG_INITRD_DATA, &initrd_data);
                     }
                     Err(e) => {
                         warn!(
@@ -653,22 +910,45 @@ impl ImageLoader {
             }
         }
 
+        // Always register FW_CFG_INITRD_SIZE with 0 when no initrd is provided.
+        // OVMF's QemuKernelLoaderFsDxe reads this selector unconditionally; if it
+        // returns an error (selector not found), OVMF can get stuck in a polling
+        // loop. Returning 0 tells OVMF there is no initrd, which is the correct
+        // behavior when no ramdisk is configured.
+        if !self
+            .config
+            .kernel
+            .ramdisk_path
+            .as_ref()
+            .map(|p| !p.is_empty() && fs::file_exists(p))
+            .unwrap_or(false)
+        {
+            fw_cfg.add_item_at(
+                fw_cfg::consts::FW_CFG_INITRD_SIZE,
+                &0u32.to_le_bytes(),
+            );
+            info!("[fw_cfg] Registered empty initrd (size=0) — no ramdisk configured");
+        }
+
         // Build E820 memory map
         let e820 = build_e820_table(ram_size);
 
         // Register E820 table as fw_cfg file
         fw_cfg.add_file("etc/e820", &e820);
 
-        // Set bootorder to prefer fw_cfg direct kernel boot (0x04 = fw_cfg)
-        fw_cfg.add_file("etc/bootorder", &[0x04u8]);
+        // Set up guest memory accessor for fw_cfg DMA operations
+        let gma = Arc::new(VmGuestMemoryAccessor {
+            vm: self.vm.clone(),
+        });
+        fw_cfg.set_mem_accessor(gma.clone());
 
         // Register fw_cfg as a port I/O device
         self.vm.get_devices().lock().add_port_dev(Arc::new(fw_cfg));
-        info!("Registered fw_cfg device at I/O ports 0x510-0x511");
+        info!("Registered fw_cfg device at I/O ports 0x510-0x51B (with DMA support)");
 
         // Create and register PCI Host Bridge
         use pci_host::PciHostBridge;
-        let pci_host = PciHostBridge::new();
+        let pci_host = Arc::new(PciHostBridge::new());
 
         // Create virtio-blk-pci device (Bus 0, Device 1, Function 0)
         use virtio_blk_pci::VirtioBlkPci;
@@ -677,9 +957,6 @@ impl ImageLoader {
 
         // Set up guest memory accessor so the device can read/write guest memory
         // for VirtQueue descriptor/avail/used ring processing
-        let gma = Arc::new(VmGuestMemoryAccessor {
-            vm: self.vm.clone(),
-        });
         virtio_blk_device.set_mem_accessor(gma);
         let virtio_blk = Arc::new(virtio_blk_device);
         info!(
@@ -691,12 +968,17 @@ impl ImageLoader {
         pci_host.add_device(virtio_blk.clone());
         info!("Added virtio-blk-pci to PCI host bridge device list");
 
-        // Register PCI Host Bridge as a port I/O device
-        self.vm
-            .get_devices()
-            .lock()
-            .add_port_dev(Arc::new(pci_host));
+        // Register PCI Host Bridge as a port I/O device (PIO config access at 0xCF8-0xCFF)
+        self.vm.get_devices().lock().add_port_dev(pci_host.clone());
         info!("Registered PCI Host Bridge at I/O ports 0xCF8-0xCFF");
+
+        // Register PCI Host Bridge as an MMIO device (ECAM at 0xB000_0000)
+        self.vm.get_devices().lock().add_mmio_dev(pci_host.clone());
+        info!(
+            "Registered PCI Host Bridge at ECAM MMIO {:#x}-{:#x}",
+            pci_host::ECAM_BASE,
+            pci_host::ECAM_BASE + pci_host::ECAM_SIZE
+        );
 
         // Register virtio-blk-pci as a port I/O device
         // (its I/O BAR address is dynamic, assigned by OVMF at runtime)
@@ -718,6 +1000,11 @@ impl ImageLoader {
         self.vm.get_devices().lock().add_port_dev(Arc::new(serial));
         info!("Registered Guest Serial at I/O ports 0x3F8-0x3FE");
 
+        // Create and register i8042 keyboard controller
+        let kbd = i8042::I8042::new();
+        self.vm.get_devices().lock().add_port_dev(Arc::new(kbd));
+        info!("Registered i8042 keyboard controller at I/O ports 0x60-0x64");
+
         // Create and register vIOAPIC as MMIO device
         use x86_vioapic::{GLOBAL_VIOAPIC, IoApic};
         let vioapic = Arc::new(IoApic::new(0, 0));
@@ -729,11 +1016,51 @@ impl ImageLoader {
             x86_vioapic::IOAPIC_MMIO_BASE + x86_vioapic::IOAPIC_MMIO_SIZE
         );
 
-        // Create and register i8259 PIC as port I/O device
-        use i8259_pic::I8259Pic;
-        let pic = I8259Pic::new();
-        self.vm.get_devices().lock().add_port_dev(Arc::new(pic));
+        // Create and register MC146818 CMOS/RTC device (ports 0x70-0x71)
+        // OVMF reads CMOS offsets 0x34-0x35 to determine memory size below 4 GB.
+        use mc146818_cmos::Mc146818Cmos;
+        let cmos = Mc146818Cmos::new(ram_size);
+        self.vm.get_devices().lock().add_port_dev(Arc::new(cmos));
+        info!(
+            "Registered MC146818 CMOS at I/O ports 0x70-0x71 (ram_size={:#x})",
+            ram_size
+        );
+
+        // Create and register i8259 PIC as port I/O devices (master + slave)
+        use i8259_pic::{I8259MasterPic, I8259SlavePic};
+        let pic_master = Arc::new(I8259MasterPic::new());
+        let pic_slave = Arc::new(I8259SlavePic::new());
+        // Register Master PIC as the global singleton so the vCPU run loop
+        // can check for pending ExtINT interrupts (Virtual Wire Mode).
+        let _ = i8259_pic::GLOBAL_PIC_MASTER.call_once(|| pic_master.clone());
+        self.vm.get_devices().lock().add_port_dev(pic_master);
+        self.vm.get_devices().lock().add_port_dev(pic_slave);
         info!("Registered i8259 PIC at I/O ports 0x20-0x21, 0xA0-0xA1");
+
+        // Create and register i8254 PIT as port I/O device (ports 0x40-0x43)
+        // Connect PIT counter 0 (IRQ0) to BOTH vIOAPIC and 8259 Master PIC.
+        // In Virtual Wire Mode (before APIC is enabled), OVMF receives timer
+        // interrupts through the 8259 PIC path. After APIC is enabled, the
+        // IOAPIC path takes over.
+        use i8254_pit::I8254Pit;
+        let pit = I8254Pit::new_with_irq_callback(|gsi, level| {
+            if level {
+                // Route to IOAPIC (for APIC-enabled path)
+                if let Some(vioapic) = GLOBAL_VIOAPIC.get() {
+                    vioapic.raise_irq(gsi);
+                }
+                // Route to 8259 Master PIC (for Virtual Wire Mode path)
+                if let Some(pic) = i8259_pic::GLOBAL_PIC_MASTER.get() {
+                    pic.raise_irq(gsi as u8);
+                }
+            }
+        });
+        let pit_arc: Arc<I8254Pit> = Arc::new(pit);
+        // Register PIT as the global singleton so the vCPU run loop can
+        // advance its counters based on real time.
+        i8254_pit::GLOBAL_PIT.call_once(|| pit_arc.clone());
+        self.vm.get_devices().lock().add_port_dev(pit_arc);
+        info!("Registered i8254 PIT at I/O ports 0x40-0x43 (IRQ0 -> vIOAPIC + 8259 PIC)");
 
         Ok(())
     }
@@ -772,17 +1099,31 @@ impl ImageLoader {
 fn build_e820_table(ram_size: usize) -> Vec<u8> {
     const E820_RAM: u32 = 1;
     const E820_RESERVED: u32 = 2;
+    const E820_ACPI: u32 = 3;
+    const ONE_MB: u64 = 0x10_0000;
+    const SIX40_KB: u64 = 0xA_0000;
+    const ONE_GB: u64 = 0x4000_0000;
     const FOUR_GB: u64 = 0x1_0000_0000;
 
     let ram_size = ram_size as u64;
     let mut data = Vec::new();
 
-    // Entry 0: RAM [0, ram_size)
+    // Entry 0: Low RAM [0, 640KB) — conventional memory
     data.extend_from_slice(&0u64.to_le_bytes());
-    data.extend_from_slice(&ram_size.to_le_bytes());
+    data.extend_from_slice(&SIX40_KB.to_le_bytes());
     data.extend_from_slice(&E820_RAM.to_le_bytes());
 
-    // Entry 1: Reserved [ram_size, 4GB)
+    // Entry 1: Reserved [640KB, 1MB) — legacy BIOS area, VGA, etc.
+    data.extend_from_slice(&SIX40_KB.to_le_bytes());
+    data.extend_from_slice(&(ONE_MB - SIX40_KB).to_le_bytes());
+    data.extend_from_slice(&E820_RESERVED.to_le_bytes());
+
+    // Entry 2: High RAM [1MB, ram_size)
+    data.extend_from_slice(&ONE_MB.to_le_bytes());
+    data.extend_from_slice(&(ram_size - ONE_MB).to_le_bytes());
+    data.extend_from_slice(&E820_RAM.to_le_bytes());
+
+    // Entry 3: Reserved [ram_size, 4GB)
     if ram_size < FOUR_GB {
         data.extend_from_slice(&ram_size.to_le_bytes());
         data.extend_from_slice(&(FOUR_GB - ram_size).to_le_bytes());

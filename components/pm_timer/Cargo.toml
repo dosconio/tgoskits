@@ -11,3 +11,4 @@ log = "0.4"
 ax-errno = { workspace = true }
 axaddrspace = { workspace = true }
 axdevice_base = { workspace = true }
+axvisor_api = { workspace = true }

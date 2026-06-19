@@ -88,6 +88,7 @@ members = [
     "drivers/net/fxmac_rs",
     "components/fw_cfg",
     "components/i8259_pic",
+    "components/i8254_pit",
     "components/pm_timer",
     "components/handler_table",
     "components/int_ratio",
@@ -441,6 +442,7 @@ tg-xtask = { version = "0.5.11", path = "xtask" }
 x86_vcpu = { version = "0.5.8", path = "components/x86_vcpu", default-features = false }
 x86_vlapic = { version = "0.4.9", path = "components/x86_vlapic" }
 x86_vioapic = { version = "0.1.0", path = "components/x86_vioapic" }
+i8259_pic = { version = "0.1.0", path = "components/i8259_pic" }
 page-table-generic = { version = "0.7.2", path = "components/page-table-generic" }
 someboot = { version = "0.1.15", path = "components/someboot" }
 some-serial = { version = "0.4.1", path = "drivers/serial/some-serial" }

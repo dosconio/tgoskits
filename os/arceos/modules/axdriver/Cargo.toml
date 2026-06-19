@@ -20,7 +20,7 @@ input = ["dep:ax-driver-input"]
 vsock = ["ax-driver-vsock"]
 
 # Enabled by features `virtio-*`
-virtio = ["dep:ax-driver-virtio", "dep:ax-alloc", "dep:ax-hal", "dep:ax-config"]
+virtio = ["dep:ax-driver-virtio", "dep:ax-alloc", "dep:ax-hal", "dep:ax-config", "dep:ax-mm"]
 
 # various types of drivers
 virtio-blk = ["block", "virtio", "ax-driver-virtio/block"]
@@ -33,7 +33,7 @@ bcm2835-sdhci = ["block", "ax-driver-block/bcm2835-sdhci"]
 sdmmc = ["block", "ax-driver-block/sdmmc", "dep:ax-hal", "dep:ax-config"]
 cvsd = ["block", "ax-driver-block/cvsd", "dep:ax-hal", "dep:ax-config"]
 ahci = ["block", "ax-driver-block/ahci", "dep:ax-hal", "dep:ax-config"]
-ixgbe = ["net", "ax-driver-net/ixgbe", "dep:ax-alloc", "dep:ax-hal", "dep:ax-dma"]
+ixgbe = ["net", "ax-driver-net/ixgbe", "dep:ax-alloc", "dep:ax-hal", "dep:ax-dma", "dep:ax-mm"]
 fxmac = ["net", "ax-driver-net/fxmac", "dep:ax-alloc", "dep:ax-hal", "dep:ax-dma"]
 # more devices example: e1000 = ["net", "ax-driver-net/e1000"]
 
@@ -56,6 +56,7 @@ ax-driver-virtio = { workspace = true, optional = true }
 ax-driver-vsock = { workspace = true, optional = true }
 ax-errno = { workspace = true, optional = true }
 ax-hal = { workspace = true, optional = true }
+ax-mm = { workspace = true, optional = true }
 cfg-if.workspace = true
 ax-crate-interface.workspace = true
 log.workspace = true

@@ -2,8 +2,9 @@ env = { AX_IP = "10.0.2.15", AX_GW = "10.0.2.2" }
 features = [
     "ept-level-4",
     "fs",
+    "page-alloc-4g",
     "vmx",
 ]
 log = "Info"
 target = "x86_64-unknown-none"
-vm_configs = []
+vm_configs = ["os/axvisor/vms/uefi-x86_64-qemu.toml"]

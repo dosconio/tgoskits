@@ -219,7 +219,7 @@ impl<H: PagingHandler> AddrSpace<H> {
             let mut start = vaddr;
             let end = start + len;
 
-            debug!(
+            trace!(
                 "start {:?} end {:?} area size {:#x}",
                 start,
                 end,
@@ -266,6 +266,21 @@ impl<H: PagingHandler> AddrSpace<H> {
         } else {
             None
         }
+    }
+
+    /// Translate a guest physical address to a host physical address using only
+    /// the page table, without requiring the address to be tracked in `areas`.
+    ///
+    /// This is useful for accessing guest memory that was mapped by EPT violation
+    /// handlers (e.g., dummy_ff_page for PCI MMIO probing) which update the EPT
+    /// hardware page table but not the software-level `areas` tracking.
+    ///
+    /// Returns `None` if the address is out of range or not mapped in the page table.
+    pub fn translate_pt_only(&self, vaddr: GuestPhysAddr) -> Option<PhysAddr> {
+        if !self.va_range.contains(vaddr) {
+            return None;
+        }
+        self.pt.query(vaddr).map(|(phys_addr, ..)| phys_addr).ok()
     }
 }
 

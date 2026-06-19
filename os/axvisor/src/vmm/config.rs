@@ -274,21 +274,35 @@ fn config_guest_address(vm: &VM, main_memory: &VMMemoryRegion) {
 }
 
 fn vm_alloc_memorys(vm_create_config: &AxVMCrateConfig, vm: &VM) {
+    use ax_memory_addr::PAGE_SIZE_4K;
+    use std::os::arceos::modules::ax_alloc::{UsageKind, global_allocator};
+
     const MB: usize = 1024 * 1024;
     const ALIGN: usize = 2 * MB;
 
     for memory in &vm_create_config.kernel.memory_regions {
         match memory.map_type {
-            VmMemMappingType::MapAlloc => {
-                vm.alloc_memory_region(
-                    Layout::from_size_align(memory.size, ALIGN).unwrap(),
-                    Some(GuestPhysAddr::from(memory.gpa)),
-                )
-                .expect("Failed to allocate memory region for VM");
-            }
-            VmMemMappingType::MapIdentical => {
-                vm.alloc_memory_region(Layout::from_size_align(memory.size, ALIGN).unwrap(), None)
-                    .expect("Failed to allocate memory region for VM");
+            VmMemMappingType::MapAlloc | VmMemMappingType::MapIdentical => {
+                let layout = Layout::from_size_align(memory.size, ALIGN).unwrap();
+                let gpa = if matches!(memory.map_type, VmMemMappingType::MapAlloc) {
+                    Some(GuestPhysAddr::from(memory.gpa))
+                } else {
+                    None
+                };
+
+                let num_pages = (layout.size() + PAGE_SIZE_4K - 1) / PAGE_SIZE_4K;
+                let page_align = layout.align().max(PAGE_SIZE_4K);
+
+                let hva = global_allocator()
+                    .alloc_pages(num_pages, page_align, UsageKind::VirtMem)
+                    .expect("Failed to allocate pages for VM memory region");
+
+                // Zero the allocated pages and register the region
+                unsafe {
+                    core::ptr::write_bytes(hva as *mut u8, 0, num_pages * PAGE_SIZE_4K);
+                    vm.register_memory_region(hva as *mut u8, layout, gpa, false)
+                        .expect("Failed to register memory region for VM");
+                }
             }
             VmMemMappingType::MapReserved => {
                 debug!("VM[{}] map same region: {:#x?}", vm.id(), memory);

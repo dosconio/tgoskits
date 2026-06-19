@@ -131,12 +131,38 @@ impl EmulatedLocalApic {
         self.get_mut_vlapic_regs().timer_restart()
     }
 
+    /// Take the pending timer interrupt vector (if any) and clear it.
+    pub fn take_pending_timer_vector(&self) -> u8 {
+        self.get_mut_vlapic_regs().take_pending_timer_vector()
+    }
+
+    /// Start a TSC-Deadline timer.
+    pub fn start_tsc_deadline_timer(&self, tsc_deadline: u64) -> AxResult {
+        self.get_mut_vlapic_regs()
+            .start_tsc_deadline_timer(tsc_deadline)
+    }
+
     pub fn set_intr(&self, vcpu_id: u32, vector: u32) {
         self.get_mut_vlapic_regs().set_intr(vcpu_id, vector, false);
     }
 
     pub fn has_pending_interrupt(&self) -> bool {
         self.get_vlapic_regs().has_pending_interrupt()
+    }
+
+    /// Returns true if the APIC is software-enabled (SVR bit 8 set).
+    pub fn is_software_enabled(&self) -> bool {
+        self.get_vlapic_regs().is_software_enabled()
+    }
+
+    /// Returns the current IA32_APIC_BASE MSR value.
+    pub fn apic_base(&self) -> u64 {
+        self.get_vlapic_regs().apic_base()
+    }
+
+    /// Updates the IA32_APIC_BASE MSR value (enable bits honored, base forced).
+    pub fn set_apic_base(&self, value: u64) {
+        self.get_mut_vlapic_regs().set_apic_base(value);
     }
 
     /// Take the pending INIT/SIPI request, if any. Consumes the request.

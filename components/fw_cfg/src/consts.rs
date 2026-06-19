@@ -18,9 +18,25 @@
 pub const FW_CFG_IO_SELECTOR: u16 = 0x510;
 pub const FW_CFG_IO_DATA: u16 = 0x511;
 
-/// fw_cfg version
-pub const FW_CFG_VERSION: u32 = 0x01;
+/// fw_cfg version (bit 0: traditional interface, bit 1: DMA interface)
+/// FW_CFG_VERSION: 0x01 = traditional (PIO only), 0x02 = DMA, 0x03 = both.
+/// Enable DMA (0x03) so OVMF uses bulk DMA transfers instead of byte-by-byte
+/// PIO reads. PIO mode is extremely slow in a VM because each byte requires
+/// 2 VM-exits (selector write + data read), making fw_cfg file directory
+/// reads take minutes instead of milliseconds.
+pub const FW_CFG_VERSION: u32 = 0x03;
+pub const FW_CFG_VERSION_TRADITIONAL: u32 = 0x01;
 pub const FW_CFG_VERSION_DMA: u32 = 0x02;
+
+/// fw_cfg DMA I/O port (x86)
+pub const FW_CFG_IO_DMA: u16 = 0x514;
+
+/// fw_cfg DMA control bits
+pub const FW_CFG_DMA_CTL_ERROR: u32 = 0x00000001;
+pub const FW_CFG_DMA_CTL_READ: u32 = 0x00000002;
+pub const FW_CFG_DMA_CTL_WRITE: u32 = 0x00000004;
+pub const FW_CFG_DMA_CTL_SKIP: u32 = 0x00000008;
+pub const FW_CFG_DMA_CTL_SELECT: u32 = 0x00000010;
 
 /// fw_cfg selector keys (well-known items)
 pub const FW_CFG_SIGNATURE: u16 = 0x0000;

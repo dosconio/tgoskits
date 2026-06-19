@@ -94,14 +94,12 @@ pub fn cancel_timer(token: usize) {
 
 /// Check and process any pending timer events
 pub fn check_events() {
-    // info!("Checking timer events...");
-    // info!("now is {:#?}", ax_hal::time::wall_time());
     let timer_list = unsafe { TIMER_LIST.current_ref_mut_raw() };
     loop {
         let now = ax_hal::time::wall_time();
         let event = timer_list.lock().expire_one(now);
         if let Some((_deadline, event)) = event {
-            trace!("pick one {_deadline:#?} to handle!!!");
+            info!("[VMM-TIMER] check_events: firing timer at deadline={_deadline:?}, now={now:?}");
             event.callback(now);
         } else {
             break;
