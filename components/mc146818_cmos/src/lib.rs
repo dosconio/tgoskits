@@ -154,7 +154,7 @@ impl BaseDeviceOps<PortRange> for Mc146818Cmos {
                     }
                     _ => self.ram.borrow()[idx],
                 };
-                info!("[CMOS] Read register {:#x} = {:#x}", idx, val);
+                // info!("[CMOS] Read register {:#x} = {:#x}", idx, val);
                 Ok(val as usize)
             }
             _ => Ok(0),
@@ -167,19 +167,19 @@ impl BaseDeviceOps<PortRange> for Mc146818Cmos {
         match port {
             CMOS_INDEX_PORT => {
                 // Bit 7 = NMI disable (we ignore it, just store the index)
-                let idx = val & 0x7F;
-                info!(
-                    "[CMOS] Write index register: {:#x} (NMI={})",
-                    idx,
-                    (val >> 7) & 1
-                );
+                let _idx = val & 0x7F;
+                // info!(
+                //     "[CMOS] Write index register: {:#x} (NMI={})",
+                //     idx,
+                //     (val >> 7) & 1
+                // );
                 *self.index.borrow_mut() = val;
             }
             CMOS_DATA_PORT => {
                 let idx = (*self.index.borrow()) as usize & 0x7F;
                 // Register D bit 7 (VRT) is read-only; ignore writes to it.
                 let val = if idx == 0x0D { val & 0x7F } else { val };
-                info!("[CMOS] Write register {:#x} = {:#x}", idx, val);
+                // info!("[CMOS] Write register {:#x} = {:#x}", idx, val);
                 self.ram.borrow_mut()[idx] = val;
             }
             _ => {}

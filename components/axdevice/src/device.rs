@@ -502,13 +502,13 @@ impl AxVmDevices {
         if let Some(emu_dev) = self.find_port_dev(port) {
             let val = emu_dev.handle_read(port, width)?;
             if port.0 >= 0xCF8 && port.0 <= 0xCFF {
-                debug!(
-                    "[PORT-DEBUG] read port={:#x} width={:?} val={:#x} dev_range={:#x}",
-                    port.0,
-                    width,
-                    val,
-                    emu_dev.address_range()
-                );
+                // debug!(
+                //     "[PORT-DEBUG] read port={:#x} width={:?} val={:#x} dev_range={:#x}",
+                //     port.0,
+                //     width,
+                //     val,
+                //     emu_dev.address_range()
+                // );
             }
             if port.0 >= 0x510 && port.0 <= 0x511 {
                 debug!(
@@ -532,13 +532,13 @@ impl AxVmDevices {
     pub fn handle_port_write(&self, port: Port, width: AccessWidth, val: usize) -> AxResult {
         if let Some(emu_dev) = self.find_port_dev(port) {
             if port.0 >= 0xCF8 && port.0 <= 0xCFF {
-                debug!(
-                    "[PORT-DEBUG] write port={:#x} width={:?} val={:#x} dev_range={:#x}",
-                    port.0,
-                    width,
-                    val,
-                    emu_dev.address_range()
-                );
+                // debug!(
+                //     "[PORT-DEBUG] write port={:#x} width={:?} val={:#x} dev_range={:#x}",
+                //     port.0,
+                //     width,
+                //     val,
+                //     emu_dev.address_range()
+                // );
             }
             if port.0 >= 0x510 && port.0 <= 0x511 {
                 debug!(

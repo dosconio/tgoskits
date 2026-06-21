@@ -24,10 +24,10 @@ pub(super) fn lookup<B: BlockDevice>(
     dir_inode: &Ext4Inode,
     target_name: &[u8],
 ) -> Result<HashTreeSearchResult, HashTreeError> {
-    debug!(
-        "Starting hash tree lookup: {:?}",
-        core::str::from_utf8(target_name)
-    );
+    // debug!(
+    //     "Starting hash tree lookup: {:?}",
+    //     core::str::from_utf8(target_name)
+    // );
 
     if !dir_inode.is_htree_indexed() {
         return manager.fallback_to_linear_search(fs, block_dev, dir_inode, target_name);
@@ -190,10 +190,10 @@ impl HashTreeManager {
         dir_inode: &Ext4Inode,
         target_name: &[u8],
     ) -> Result<HashTreeSearchResult, HashTreeError> {
-        debug!(
-            "Using linear search: {:?}",
-            core::str::from_utf8(target_name)
-        );
+        // debug!(
+        //     "Using linear search: {:?}",
+        //     core::str::from_utf8(target_name)
+        // );
 
         let total_size = dir_inode.size() as usize;
         let block_bytes = BLOCK_SIZE;

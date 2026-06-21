@@ -600,7 +600,7 @@ impl AxVM {
                 } => {
                     diag_mmio_count += 1;
                     if diag_mmio_count <= 10 || diag_mmio_count.is_multiple_of(100000) {
-                        info!("[DIAG] MMIO read: addr={:#x}, width={:?}", addr, width);
+                        // info!("[DIAG] MMIO read: addr={:#x}, width={:?}", addr, width);
                     }
                     let val = self.get_devices().lock().handle_mmio_read(*addr, *width)?;
                     vcpu.set_gpr(*reg, val);
@@ -609,10 +609,10 @@ impl AxVM {
                 AxVCpuExitReason::MmioWrite { addr, width, data } => {
                     diag_mmio_count += 1;
                     if diag_mmio_count <= 10 || diag_mmio_count.is_multiple_of(100000) {
-                        info!(
-                            "[DIAG] MMIO write: addr={:#x}, width={:?}, data={:#x}",
-                            addr, width, data
-                        );
+                        // info!(
+                        //     "[DIAG] MMIO write: addr={:#x}, width={:?}, data={:#x}",
+                        //     addr, width, data
+                        // );
                     }
                     self.get_devices()
                         .lock()

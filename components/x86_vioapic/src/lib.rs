@@ -121,13 +121,13 @@ impl IoApic {
         match offset {
             0x00 => {
                 let sel = *self.ioregsel.lock();
-                debug!("[IOAPIC] read IOREGSEL: {:#x}", sel);
+                // debug!("[IOAPIC] read IOREGSEL: {:#x}", sel);
                 Ok(sel as usize)
             }
             0x10 => {
                 let sel = *self.ioregsel.lock();
                 let val = self.read_reg(sel);
-                debug!("[IOAPIC] read reg[{}] = {:#x}", sel, val);
+                // debug!("[IOAPIC] read reg[{}] = {:#x}", sel, val);
                 Ok(val as usize)
             }
             _ => {
@@ -141,7 +141,7 @@ impl IoApic {
         match offset {
             0x00 => {
                 *self.ioregsel.lock() = val as u32;
-                debug!("[IOAPIC] write IOREGSEL: {:#x}", val);
+                // debug!("[IOAPIC] write IOREGSEL: {:#x}", val);
             }
             0x10 => {
                 let sel = *self.ioregsel.lock();
@@ -186,7 +186,7 @@ impl IoApic {
         }
         let rte = self.rtels[gsi as usize].lock();
         if rte.is_masked() {
-            debug!("[IOAPIC] IRQ {} masked, ignoring", gsi);
+            // debug!("[IOAPIC] IRQ {} masked, ignoring", gsi);
             return;
         }
         let vector = rte.vector();

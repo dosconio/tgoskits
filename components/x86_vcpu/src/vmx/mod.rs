@@ -19,6 +19,15 @@ mod structs;
 mod vcpu;
 mod vmcs;
 
+mod cpuid;
+mod cr_msr;
+mod diag;
+mod ept;
+mod exit_handler;
+mod interrupt;
+mod smp;
+mod vmcs_setup;
+
 use ax_errno::ax_err_type;
 
 use self::structs::VmxBasic;

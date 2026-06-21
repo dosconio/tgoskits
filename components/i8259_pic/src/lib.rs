@@ -77,7 +77,7 @@ impl PicChip {
     fn raise_irq(&mut self, irq: u8) {
         if irq < 8 {
             self.irr |= 1 << irq;
-            debug!("[i8259] raise_irq: irq={}, irr={:#04x}", irq, self.irr);
+            // debug!("[i8259] raise_irq: irq={}, irr={:#04x}", irq, self.irr);
         }
     }
 

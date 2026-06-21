@@ -511,7 +511,7 @@ fn vcpu_run() {
                         );
                     }
                     AxVCpuExitReason::ExternalInterrupt { vector } => {
-                        debug!("VM[{vm_id}] run VCpu[{vcpu_id}] get irq {vector}");
+                        // debug!("VM[{vm_id}] run VCpu[{vcpu_id}] get irq {vector}");
 
                         // TODO: maybe move this irq dispatcher to lower layer to accelerate the interrupt handling
                         ax_hal::trap::irq_handler(vector as usize);

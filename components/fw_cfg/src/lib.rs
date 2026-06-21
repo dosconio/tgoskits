@@ -322,10 +322,10 @@ impl FwCfgDevice {
     /// swap back to obtain the native (little-endian) address.
     fn handle_dma_addr_high_write(&self, val: u32) {
         let native = val.swap_bytes();
-        debug!(
-            "fw_cfg DMA: write high 32 bits = {:#x} (big-endian), native = {:#x}",
-            val, native
-        );
+        // debug!(
+        //     "fw_cfg DMA: write high 32 bits = {:#x} (big-endian), native = {:#x}",
+        //     val, native
+        // );
         self.dma_addr_high.store(native, Ordering::SeqCst);
     }
 
@@ -340,11 +340,11 @@ impl FwCfgDevice {
         let high = self.dma_addr_high.load(Ordering::SeqCst) as u64;
         let low = native_low as u64;
         let dma_gpa = (high << 32) | low;
-        debug!(
-            "fw_cfg DMA: write low 32 bits = {:#x} (big-endian), native = {:#x}, composed GPA = \
-             {:#x}",
-            val, native_low, dma_gpa
-        );
+        // debug!(
+        //     "fw_cfg DMA: write low 32 bits = {:#x} (big-endian), native = {:#x}, composed GPA = \
+        //      {:#x}",
+        //     val, native_low, dma_gpa
+        // );
         self.process_dma(dma_gpa);
     }
 
@@ -373,10 +373,10 @@ impl FwCfgDevice {
         }
 
         // Debug: dump raw bytes of FwCfgDmaAccess
-        debug!(
-            "fw_cfg DMA: raw FwCfgDmaAccess at GPA {:#x}: {:02x?}",
-            dma_gpa, dma_buf
-        );
+        // debug!(
+        //     "fw_cfg DMA: raw FwCfgDmaAccess at GPA {:#x}: {:02x?}",
+        //     dma_gpa, dma_buf
+        // );
 
         // Parse big-endian fields
         let control = u32::from_be_bytes([dma_buf[0], dma_buf[1], dma_buf[2], dma_buf[3]]);
@@ -398,19 +398,19 @@ impl FwCfgDevice {
         let is_select = (control & FW_CFG_DMA_CTL_SELECT) != 0;
         let selector_from_control = (control >> 16) as u16;
 
-        debug!(
-            "fw_cfg DMA: GPA={:#x} control={:#x} (select={} read={} write={} skip={}) \
-             selector={:#x} length={} address={:#x}",
-            dma_gpa,
-            control,
-            is_select,
-            is_read,
-            is_write,
-            is_skip,
-            selector_from_control,
-            length,
-            address
-        );
+        // debug!(
+        //     "fw_cfg DMA: GPA={:#x} control={:#x} (select={} read={} write={} skip={}) \
+        //      selector={:#x} length={} address={:#x}",
+        //     dma_gpa,
+        //     control,
+        //     is_select,
+        //     is_read,
+        //     is_write,
+        //     is_skip,
+        //     selector_from_control,
+        //     length,
+        //     address
+        // );
 
         // Handle SELECT: set the selector and reset offset
         if is_select {
@@ -455,15 +455,15 @@ impl FwCfgDevice {
             );
         }
 
-        debug!(
-            "fw_cfg DMA: completed, transferred={} bytes, new_control={:#x}, new_length={}, \
-             selector={:#x} offset={}",
-            transferred,
-            new_control,
-            new_length,
-            self.selector.load(Ordering::SeqCst),
-            *self.offset.lock()
-        );
+        // debug!(
+        //     "fw_cfg DMA: completed, transferred={} bytes, new_control={:#x}, new_length={}, \
+        //      selector={:#x} offset={}",
+        //     transferred,
+        //     new_control,
+        //     new_length,
+        //     self.selector.load(Ordering::SeqCst),
+        //     *self.offset.lock()
+        // );
     }
 
     /// DMA read: copy data from fw_cfg item to guest buffer.
@@ -587,18 +587,18 @@ impl BaseDeviceOps<PortRange> for FwCfgDevice {
             }
             0x514..=0x517 => {
                 // DMA address high 32 bits (port 0x514)
-                debug!(
-                    "fw_cfg: write port {:#x} width={:?} val={:#x}",
-                    addr.0, _width, val
-                );
+                // debug!(
+                //     "fw_cfg: write port {:#x} width={:?} val={:#x}",
+                //     addr.0, _width, val
+                // );
                 self.handle_dma_addr_high_write(val as u32);
             }
             0x518..=0x51B => {
                 // DMA address low 32 bits (port 0x518) — triggers the DMA operation
-                debug!(
-                    "fw_cfg: write port {:#x} width={:?} val={:#x}",
-                    addr.0, _width, val
-                );
+                // debug!(
+                //     "fw_cfg: write port {:#x} width={:?} val={:#x}",
+                //     addr.0, _width, val
+                // );
                 self.handle_dma_addr_low_write(val as u32);
             }
             _ => {

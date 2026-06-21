@@ -176,7 +176,7 @@ impl PciHostBridge {
             );
             Ok(val)
         } else {
-            debug!("PCI no device at Bus={} Dev={} Func={}", bus, dev, func);
+            // debug!("PCI no device at Bus={} Dev={} Func={}", bus, dev, func);
             Ok(0xFFFF_FFFF_usize)
         }
     }
@@ -312,17 +312,17 @@ impl PciHostBridge {
         if bus == 0 && dev == 0 && func == 0 {
             let full_val = self.host_bridge_config.read(reg, AccessWidth::Dword);
             let val = Self::extract_bytes(full_val, byte_offset, width);
-            debug!(
-                "[ECAM] host bridge read: bus={} dev={} func={} reg={:#x} val={:#x} offset={} \
-                 width={}",
-                bus,
-                dev,
-                func,
-                reg,
-                val,
-                byte_offset,
-                width.size()
-            );
+            // debug!(
+            //     "[ECAM] host bridge read: bus={} dev={} func={} reg={:#x} val={:#x} offset={} \
+            //      width={}",
+            //     bus,
+            //     dev,
+            //     func,
+            //     reg,
+            //     val,
+            //     byte_offset,
+            //     width.size()
+            // );
             return Ok(val);
         }
 
@@ -382,16 +382,17 @@ impl PciHostBridge {
         let (bus, dev, func, reg, byte_offset) = Self::decode_ecam_addr(addr);
 
         if bus == 0 && (dev == 0 || dev == 31) && func == 0 {
-            debug!(
-                "[ECAM] config write: bus={} dev={} func={} reg={:#x} offset={} width={} val={:#x}",
-                bus,
-                dev,
-                func,
-                reg,
-                byte_offset,
-                width.size(),
-                val
-            );
+            // debug!(
+            //     "[ECAM] config write: bus={} dev={} func={} reg={:#x} offset={} width={}
+            //      val={:#x}",
+            //     bus,
+            //     dev,
+            //     func,
+            //     reg,
+            //     byte_offset,
+            //     width.size(),
+            //     val
+            // );
         }
 
         if bus == 0 && dev == 0 && func == 0 {
@@ -494,16 +495,16 @@ impl BaseDeviceOps<PortRange> for PciHostBridge {
                 let old = *self.config_address.lock();
                 let new = val as u32;
                 if old != new {
-                    debug!(
-                        "[PCI-CF8] Config address write: {:#010x} -> {:#010x} (bus={} dev={} \
-                         func={} reg={:#x})",
-                        old,
-                        new,
-                        (new >> 16) & 0xFF,
-                        (new >> 11) & 0x1F,
-                        (new >> 8) & 0x7,
-                        new & 0xFC
-                    );
+                    // debug!(
+                    //     "[PCI-CF8] Config address write: {:#010x} -> {:#010x} (bus={} dev={} \
+                    //      func={} reg={:#x})",
+                    //     old,
+                    //     new,
+                    //     (new >> 16) & 0xFF,
+                    //     (new >> 11) & 0x1F,
+                    //     (new >> 8) & 0x7,
+                    //     new & 0xFC
+                    // );
                     *self.config_address.lock() = new;
                 }
             }

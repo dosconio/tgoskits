@@ -575,7 +575,7 @@ impl VirtualApicRegs {
         } else if !old.is_set(SPURIOUS_INTERRUPT_VECTOR::APICSoftwareEnableDisable)
             && new.is_set(SPURIOUS_INTERRUPT_VECTOR::APICSoftwareEnableDisable)
         {
-            debug!("[VLAPIC] vlapic [{}] is software-enabled", self.vapic_id);
+            // debug!("[VLAPIC] vlapic [{}] is software-enabled", self.vapic_id);
 
             // Per Intel SDM Vol. 3A Section 10.4.7.2: when the APIC is
             // software-disabled, LVT mask flags are all treated as 1.
@@ -611,7 +611,7 @@ impl VirtualApicRegs {
             // The apic is now enabled so restart the apic timer
             // if it is configured in periodic mode.
             if self.virtual_timer.is_periodic() {
-                debug!("Restarting the apic timer");
+                // debug!("Restarting the apic timer");
                 self.virtual_timer.restart_timer()?;
             }
         }
@@ -1029,7 +1029,7 @@ impl VirtualApicRegs {
                 warn!("[VLAPIC] read unknown APIC register: {offset:?}");
             }
         }
-        debug!("[VLAPIC] read {offset} register: {value:#010X}");
+        // debug!("[VLAPIC] read {offset} register: {value:#010X}");
         Ok(value)
     }
 
@@ -1159,7 +1159,7 @@ impl VirtualApicRegs {
             }
         }
 
-        debug!("[VLAPIC] write {offset} register: {val:#010X}");
+        // debug!("[VLAPIC] write {offset} register: {val:#010X}");
 
         Ok(())
     }

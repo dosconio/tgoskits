@@ -41,8 +41,8 @@ impl Ext4FileSystem {
         let result =
             self.inodetable_cahce
                 .get_or_load(block_dev, self.root_inode, block_num, offset)?;
-        debug!("Root inode i_mode: {}", result.inode.i_mode);
-        debug!("Root inode detail: {:?}", result.inode);
+        // debug!("Root inode i_mode: {}", result.inode.i_mode);
+        // debug!("Root inode detail: {:?}", result.inode);
         Ok(result.inode)
     }
 }

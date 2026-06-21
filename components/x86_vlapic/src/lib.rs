@@ -185,7 +185,7 @@ impl BaseDeviceOps<AddrRange<GuestPhysAddr>> for EmulatedLocalApic {
     }
 
     fn handle_read(&self, addr: GuestPhysAddr, width: AccessWidth) -> AxResult<usize> {
-        debug!("EmulatedLocalApic::handle_read: addr={addr:?}, width={width:?}");
+        // debug!("EmulatedLocalApic::handle_read: addr={addr:?}, width={width:?}");
         match xapic_mmio_access_reg_offset(addr) {
             Some(reg_off) => self.get_vlapic_regs().handle_read(reg_off, width),
             None => {
@@ -196,7 +196,7 @@ impl BaseDeviceOps<AddrRange<GuestPhysAddr>> for EmulatedLocalApic {
     }
 
     fn handle_write(&self, addr: GuestPhysAddr, width: AccessWidth, val: usize) -> AxResult {
-        debug!("EmulatedLocalApic::handle_write: addr={addr:?}, width={width:?}, val={val:#x}");
+        // debug!("EmulatedLocalApic::handle_write: addr={addr:?}, width={width:?}, val={val:#x}");
         match xapic_mmio_access_reg_offset(addr) {
             Some(reg_off) => self.get_mut_vlapic_regs().handle_write(reg_off, val, width),
             None => {
@@ -221,7 +221,7 @@ impl BaseDeviceOps<SysRegAddrRange> for EmulatedLocalApic {
     }
 
     fn handle_read(&self, addr: SysRegAddr, width: AccessWidth) -> AxResult<usize> {
-        debug!("EmulatedLocalApic::handle_read: addr={addr:?}, width={width:?}");
+        // debug!("EmulatedLocalApic::handle_read: addr={addr:?}, width={width:?}");
         match x2apic_msr_access_reg(addr) {
             Some(reg_off) => self.get_vlapic_regs().handle_read(reg_off, width),
             None => {
@@ -232,7 +232,7 @@ impl BaseDeviceOps<SysRegAddrRange> for EmulatedLocalApic {
     }
 
     fn handle_write(&self, addr: SysRegAddr, width: AccessWidth, val: usize) -> AxResult {
-        debug!("EmulatedLocalApic::handle_write: addr={addr:?}, width={width:?}, val={val:#x}");
+        // debug!("EmulatedLocalApic::handle_write: addr={addr:?}, width={width:?}, val={val:#x}");
         match x2apic_msr_access_reg(addr) {
             Some(reg_off) => self.get_mut_vlapic_regs().handle_write(reg_off, val, width),
             None => {
