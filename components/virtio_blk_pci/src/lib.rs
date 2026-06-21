@@ -82,6 +82,19 @@ const ISR_QUEUE_INTERRUPT: u8 = 0x01;
 const _ISR_CONFIG_CHANGE: u8 = 0x02;
 
 // ---------------------------------------------------------------------------
+// InterruptCallback — abstracts interrupt injection back to the hypervisor
+// ---------------------------------------------------------------------------
+
+/// Trait for injecting interrupts back to the guest when the device completes
+/// I/O. This decouples the virtio-blk device from the specific interrupt
+/// controller implementation (vIOAPIC, 8259 PIC, etc.).
+pub trait InterruptCallback: Send + Sync {
+    /// Raise the device's interrupt. The implementation is responsible for
+    /// routing to the correct GSI/IRQ based on PCI INTx configuration.
+    fn raise_interrupt(&self);
+}
+
+// ---------------------------------------------------------------------------
 // GuestMemoryAccessor — abstracts GPA→HVA translation for device access
 // ---------------------------------------------------------------------------
 
@@ -340,6 +353,7 @@ pub struct VirtioBlkPci {
     _disk_size: u64,
     backend: Arc<dyn BlockBackend>,
     mem_accessor: Option<Arc<dyn GuestMemoryAccessor>>,
+    interrupt_callback: Option<Arc<dyn InterruptCallback>>,
 }
 
 impl VirtioBlkPci {
@@ -361,6 +375,7 @@ impl VirtioBlkPci {
             _disk_size: disk_size,
             backend,
             mem_accessor: None,
+            interrupt_callback: None,
         }
     }
 
@@ -385,6 +400,7 @@ impl VirtioBlkPci {
             _disk_size: disk_size,
             backend,
             mem_accessor: None,
+            interrupt_callback: None,
         }
     }
 
@@ -407,6 +423,7 @@ impl VirtioBlkPci {
             _disk_size: disk_size,
             backend,
             mem_accessor: None,
+            interrupt_callback: None,
         }
     }
 
@@ -414,6 +431,12 @@ impl VirtioBlkPci {
     /// can process virtqueue requests.
     pub fn set_mem_accessor(&mut self, accessor: Arc<dyn GuestMemoryAccessor>) {
         self.mem_accessor = Some(accessor);
+    }
+
+    /// Set the interrupt callback used to notify the guest when I/O completes.
+    /// Must be called before the device can deliver interrupts.
+    pub fn set_interrupt_callback(&mut self, callback: Arc<dyn InterruptCallback>) {
+        self.interrupt_callback = Some(callback);
     }
 
     fn current_bar_addr(&self) -> u16 {
@@ -725,6 +748,15 @@ impl VirtioBlkPci {
             // Signal interrupt via ISR status
             *self.isr_status.lock() |= ISR_QUEUE_INTERRUPT;
 
+            // Inject the actual CPU interrupt via the callback so the guest
+            // is notified of I/O completion. Without this, the guest would
+            // never wake from HLT after submitting a request.
+            if let Some(cb) = &self.interrupt_callback {
+                cb.raise_interrupt();
+            } else {
+                warn!("virtio-blk: no interrupt callback set, guest will not be notified");
+            }
+
             debug!(
                 "virtio-blk: processed {} requests, used_idx={}, last_avail_idx={}",
                 processed, used_idx, last_avail_idx
@@ -986,6 +1018,16 @@ impl BaseDeviceOps<PortRange> for VirtioBlkPci {
             return Ok(0);
         }
         let offset = addr.0 - base;
+        // Rate-limited logging for BAR reads
+        static BAR_READ_COUNT: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        let count = BAR_READ_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if count < 20 {
+            info!(
+                "[virtio-blk] BAR read #{count}: offset={offset:#x}, width={width:?}, \
+                 addr={addr:#x}"
+            );
+        }
         self.handle_legacy_read(offset, width)
     }
 
@@ -995,6 +1037,16 @@ impl BaseDeviceOps<PortRange> for VirtioBlkPci {
             return Ok(());
         }
         let offset = addr.0 - base;
+        // Rate-limited logging for BAR writes
+        static BAR_WRITE_COUNT: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        let count = BAR_WRITE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if count < 20 {
+            info!(
+                "[virtio-blk] BAR write #{count}: offset={offset:#x}, width={width:?}, \
+                 val={val:#x}, addr={addr:#x}"
+            );
+        }
         self.handle_legacy_write(offset, width, val)
     }
 }

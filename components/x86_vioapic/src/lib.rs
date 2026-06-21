@@ -28,7 +28,7 @@ use ax_errno::AxResult;
 use ax_memory_addr::AddrRange;
 use axaddrspace::{GuestPhysAddr, device::AccessWidth};
 use axdevice_base::{BaseDeviceOps, EmuDeviceType};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use spin::{Mutex, Once};
 
 /// Global singleton for the virtual IOAPIC, used to dispatch interrupts
@@ -146,7 +146,25 @@ impl IoApic {
             0x10 => {
                 let sel = *self.ioregsel.lock();
                 self.write_reg(sel, val as u32);
-                debug!("[IOAPIC] write reg[{}] = {:#x}", sel, val);
+                // Log RTE writes at info level to diagnose interrupt routing.
+                // sel format: 0x10 + 2*pin (lo), 0x11 + 2*pin (hi)
+                if sel >= 0x10 {
+                    let pin = (sel - 0x10) / 2;
+                    let is_hi = (sel - 0x10) % 2 == 1;
+                    if !is_hi && val != 0x10000 {
+                        // lo write with non-default value
+                        let vector = val & 0xff;
+                        let delivery = (val >> 8) & 0x7;
+                        let dest_mode = (val >> 11) & 0x1;
+                        let masked = (val >> 16) & 0x1;
+                        let trigger = (val >> 15) & 0x1;
+                        info!(
+                            "[IOAPIC] RTE pin={} lo: vector={:#x} delivery={} dest_mode={} \
+                             trigger={} masked={}",
+                            pin, vector, delivery, dest_mode, trigger, masked
+                        );
+                    }
+                }
             }
             _ => {
                 warn!(

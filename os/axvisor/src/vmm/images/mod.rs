@@ -123,7 +123,7 @@ mod guest_serial {
     use axaddrspace::device::{AccessWidth, Port, PortRange};
     use axdevice_base::{BaseDeviceOps, EmuDeviceType};
     use core::sync::atomic::{AtomicU8, Ordering};
-    use log::info;
+    use std::print;
 
     pub struct GuestSerial;
 
@@ -171,13 +171,13 @@ mod guest_serial {
             if offset == 0 {
                 let ch = val as u8;
                 if ch >= 0x20 && ch < 0x7F {
-                    info!("[GUEST] {}", ch as char);
+                    print!("{}", ch as char);
                 } else if ch == b'\n' {
-                    info!("[GUEST] <newline>");
+                    print!("\n");
                 } else if ch == b'\r' {
                     // ignore CR
                 } else {
-                    info!("[GUEST] \\x{:02x}", ch);
+                    print!("\\x{:02x}", ch);
                 }
             } else if offset == 7 {
                 // Scratch Register - store for serial port detection
@@ -710,6 +710,11 @@ impl ImageLoader {
         }
 
         // Generate ACPI tables
+        // RSDP at 0x200000 (2MB, in main RAM) — this region is marked as
+        // E820_ACPI in the E820 map so Linux reserves it for ACPI tables.
+        // We use main RAM instead of the BIOS ROM area (0xE0000) because
+        // Linux's direct map only covers E820_RAM regions, and accessing
+        // ACPI tables in reserved memory through __va() causes page faults.
         let acpi_config = AcpiConfig {
             cpu_num,
             ram_size,
@@ -721,14 +726,14 @@ impl ImageLoader {
             ecam_segment: 0,
             ecam_bus_start: 0,
             ecam_bus_end: 0xFF,
-            rsdp_gpa: 0x01F_0000,
+            rsdp_gpa: 0x20_0000,
         };
         let acpi_tables = AcpiTableBuilder::new(acpi_config).build();
 
         // Write ACPI tables into guest memory
-        // RSDP at 0x1F0000 (avoid conflicting with legacy BIOS area 0xF0000-0xFFFFF)
-        // OVMF needs this area aliased to pflash for compatibility with legacy x86 boot
-        let rsdp_gpa = GuestPhysAddr::from(0x1F0000usize);
+        // RSDP at 0x200000 (2MB, E820_ACPI region)
+        // Tables (XSDT+FADT+MADT+MCFG+DSDT) follow immediately after RSDP.
+        let rsdp_gpa = GuestPhysAddr::from(0x20_0000usize);
         let mut rsdp_regions = self
             .vm
             .get_image_load_region(rsdp_gpa, acpi_tables.rsdp.len())?;
@@ -745,7 +750,7 @@ impl ImageLoader {
         );
 
         // Other tables follow RSDP
-        let tables_gpa = GuestPhysAddr::from(0x1F0000usize + acpi_tables.rsdp.len());
+        let tables_gpa = GuestPhysAddr::from(0x20_0000usize + acpi_tables.rsdp.len());
         let mut table_regions = self
             .vm
             .get_image_load_region(tables_gpa, acpi_tables.tables.len())?;
@@ -760,6 +765,21 @@ impl ImageLoader {
             acpi_tables.tables.len(),
             tables_gpa.as_usize()
         );
+
+        // Debug: dump DSDT bytes for AML verification
+        for (name, offset, size) in &acpi_tables.table_offsets {
+            if name == "DSDT" {
+                let dsdt_bytes = &acpi_tables.tables[*offset..*offset + *size];
+                info!("DSDT dump ({} bytes):", size);
+                for (i, chunk) in dsdt_bytes.chunks(16).enumerate() {
+                    let mut hex = alloc::string::String::new();
+                    for b in chunk {
+                        hex.push_str(&format!("{:02x} ", b));
+                    }
+                    info!("  DSDT[{:04x}]: {}", i * 16, hex);
+                }
+            }
+        }
 
         // Create fw_cfg device
         let fw_cfg = FwCfgDevice::new(ram_size, cpu_num);
@@ -923,10 +943,7 @@ impl ImageLoader {
             .map(|p| !p.is_empty() && fs::file_exists(p))
             .unwrap_or(false)
         {
-            fw_cfg.add_item_at(
-                fw_cfg::consts::FW_CFG_INITRD_SIZE,
-                &0u32.to_le_bytes(),
-            );
+            fw_cfg.add_item_at(fw_cfg::consts::FW_CFG_INITRD_SIZE, &0u32.to_le_bytes());
             info!("[fw_cfg] Registered empty initrd (size=0) — no ramdisk configured");
         }
 
@@ -958,6 +975,32 @@ impl ImageLoader {
         // Set up guest memory accessor so the device can read/write guest memory
         // for VirtQueue descriptor/avail/used ring processing
         virtio_blk_device.set_mem_accessor(gma);
+
+        // Set up interrupt callback. PCI INTA# (pin 1) on Q35 is routed to
+        // GSI 16 on the IOAPIC. In Virtual Wire Mode (8259 PIC), PCI INTA#
+        // is typically routed to IRQ 10. We raise both to cover whichever
+        // path the guest is using.
+        //
+        // The callback uses the global singletons which are initialized
+        // later in this function; at call time they will be available.
+        use i8259_pic;
+        use log::debug;
+        struct BlkInterruptCallback;
+        impl virtio_blk_pci::InterruptCallback for BlkInterruptCallback {
+            fn raise_interrupt(&self) {
+                // IOAPIC path (GSI 16 = PCI INTA# on Q35)
+                if let Some(vioapic) = x86_vioapic::GLOBAL_VIOAPIC.get() {
+                    vioapic.raise_irq(16);
+                }
+                // 8259 PIC path (IRQ 10 = common PCI INTA# PIC routing)
+                if let Some(pic) = i8259_pic::GLOBAL_PIC_MASTER.get() {
+                    pic.raise_irq(10);
+                }
+                debug!("virtio-blk: raised interrupt (GSI 16 + PIC IRQ 10)");
+            }
+        }
+        virtio_blk_device.set_interrupt_callback(Arc::new(BlkInterruptCallback));
+
         let virtio_blk = Arc::new(virtio_blk_device);
         info!(
             "Created virtio-blk-pci device: BDF=(0,1,0), disk_size={:#x}",
@@ -1102,7 +1145,8 @@ fn build_e820_table(ram_size: usize) -> Vec<u8> {
     const E820_ACPI: u32 = 3;
     const ONE_MB: u64 = 0x10_0000;
     const SIX40_KB: u64 = 0xA_0000;
-    const ONE_GB: u64 = 0x4000_0000;
+    const TWO_MB: u64 = 0x20_0000;
+    const ACPI_REGION_SIZE: u64 = 0x2_0000; // 128KB for ACPI tables
     const FOUR_GB: u64 = 0x1_0000_0000;
 
     let ram_size = ram_size as u64;
@@ -1118,12 +1162,23 @@ fn build_e820_table(ram_size: usize) -> Vec<u8> {
     data.extend_from_slice(&(ONE_MB - SIX40_KB).to_le_bytes());
     data.extend_from_slice(&E820_RESERVED.to_le_bytes());
 
-    // Entry 2: High RAM [1MB, ram_size)
+    // Entry 2: RAM [1MB, 2MB) — early kernel boot area
     data.extend_from_slice(&ONE_MB.to_le_bytes());
-    data.extend_from_slice(&(ram_size - ONE_MB).to_le_bytes());
+    data.extend_from_slice(&(TWO_MB - ONE_MB).to_le_bytes());
     data.extend_from_slice(&E820_RAM.to_le_bytes());
 
-    // Entry 3: Reserved [ram_size, 4GB)
+    // Entry 3: ACPI data [2MB, 2MB+128KB) — ACPI tables (RSDP, XSDT, FADT, MADT, MCFG, DSDT)
+    data.extend_from_slice(&TWO_MB.to_le_bytes());
+    data.extend_from_slice(&ACPI_REGION_SIZE.to_le_bytes());
+    data.extend_from_slice(&E820_ACPI.to_le_bytes());
+
+    // Entry 4: High RAM [2MB+128KB, ram_size)
+    let acpi_end = TWO_MB + ACPI_REGION_SIZE;
+    data.extend_from_slice(&acpi_end.to_le_bytes());
+    data.extend_from_slice(&(ram_size - acpi_end).to_le_bytes());
+    data.extend_from_slice(&E820_RAM.to_le_bytes());
+
+    // Entry 5: Reserved [ram_size, 4GB)
     if ram_size < FOUR_GB {
         data.extend_from_slice(&ram_size.to_le_bytes());
         data.extend_from_slice(&(FOUR_GB - ram_size).to_le_bytes());

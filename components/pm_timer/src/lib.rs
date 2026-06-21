@@ -1,9 +1,10 @@
 #![no_std]
 
+use core::sync::atomic::{AtomicU16, Ordering};
+
 use ax_errno::AxResult;
 use axaddrspace::device::{AccessWidth, Port, PortRange};
 use axdevice_base::{BaseDeviceOps, EmuDeviceType};
-use log::info;
 
 /// PM1a Event Register Block base (0x600)
 const PM1A_EVT_BLK: u16 = 0x600;
@@ -16,21 +17,31 @@ const PM_BLOCK_END: u16 = PM_TMR_BLK + 3; // 0x60B
 /// ACPI PM Timer frequency: 3.579545 MHz (24-bit counter).
 const PM_TIMER_HZ: u64 = 3_579_545;
 
-pub struct PmTimer;
+pub struct PmTimer {
+    /// PM1a Status Register (offset 0x00-0x01 within PM1a_EVT).
+    /// Write-1-to-clear semantics per ACPI spec.
+    pm1a_sts: AtomicU16,
+    /// PM1a Enable Register (offset 0x02-0x03 within PM1a_EVT).
+    /// Read/write semantics per ACPI spec.
+    pm1a_en: AtomicU16,
+}
 
 impl Default for PmTimer {
     fn default() -> Self {
-        Self
+        Self {
+            pm1a_sts: AtomicU16::new(0),
+            pm1a_en: AtomicU16::new(0),
+        }
     }
 }
 
 impl PmTimer {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
     pub fn new_default() -> Self {
-        Self
+        Self::default()
     }
 
     fn get_timer_value(&self) -> u32 {
@@ -58,29 +69,29 @@ impl BaseDeviceOps<PortRange> for PmTimer {
 
         match port {
             0x600..=0x603 => {
-                // PM1a_EVT_BLK: Event Status Register
-                // Bit 0 = Timer status, other bits reserved
-                info!(
-                    "[PM] Read PM1a_EVT port {:#x}, width {:?}, returning 0",
-                    port, width
-                );
-                Ok(0)
+                // PM1a_EVT_BLK: Status (0x600-0x601) + Enable (0x602-0x603)
+                let sts = self.pm1a_sts.load(Ordering::Relaxed) as u32;
+                let en = self.pm1a_en.load(Ordering::Relaxed) as u32;
+                // Combine into a 32-bit value: [EN_HI:EN_LO:STS_HI:STS_LO]
+                let combined: u32 = (en << 16) | sts;
+                let offset = (port - PM1A_EVT_BLK) as u32;
+                let shift = offset * 8;
+                let val = match width {
+                    AccessWidth::Byte => (combined >> shift) & 0xFF,
+                    AccessWidth::Word => (combined >> shift) & 0xFFFF,
+                    AccessWidth::Dword => combined,
+                    AccessWidth::Qword => combined,
+                };
+                Ok(val as usize)
             }
             0x604..=0x607 => {
                 // PM1a_CNT_BLK: Control Register
                 // Bit 13: SCI_EN (SCI enable), Bit 12: SLP_TYP, Bit 10: SLP_EN
                 // Return SCI_EN=1 to indicate ACPI mode is enabled
-                let val = 1 << 13; // SCI_EN = 1
-                info!(
-                    "[PM] Read PM1a_CNT port {:#x}, width {:?}, returning {:#x}",
-                    port, width, val
-                );
-                Ok(val)
+                Ok((1 << 13) as usize)
             }
             0x608..=0x60B => {
-                // PM_TMR_BLK: Timer Register (accessed very frequently,
-                // skip per-read logging to avoid flooding the log).
-                // Diagnostics are handled inside get_timer_value().
+                // PM_TMR_BLK: Timer Register
                 let timer_val = self.get_timer_value();
                 let offset = (port - PM_TMR_BLK) as u32;
                 match width {
@@ -96,40 +107,30 @@ impl BaseDeviceOps<PortRange> for PmTimer {
                     AccessWidth::Qword => Ok(timer_val as usize),
                 }
             }
-            _ => {
-                info!(
-                    "[PM] Read unknown port {:#x}, width {:?}, returning 0",
-                    port, width
-                );
-                Ok(0)
-            }
+            _ => Ok(0),
         }
     }
 
-    fn handle_write(&self, addr: Port, width: AccessWidth, val: usize) -> AxResult {
+    fn handle_write(&self, addr: Port, _width: AccessWidth, val: usize) -> AxResult {
         let port = addr.0;
         match port {
-            0x600..=0x603 => {
-                info!(
-                    "[PM] Write PM1a_EVT port {:#x}, width {:?}, val {:#x}",
-                    port, width, val
-                );
+            0x600..=0x601 => {
+                // PM1a Status: write-1-to-clear
+                let clear_mask = val as u16;
+                let _ = self.pm1a_sts.fetch_and(!clear_mask, Ordering::Relaxed);
+            }
+            0x602..=0x603 => {
+                // PM1a Enable: read/write
+                self.pm1a_en.store(val as u16, Ordering::Relaxed);
             }
             0x604..=0x607 => {
-                info!(
-                    "[PM] Write PM1a_CNT port {:#x}, width {:?}, val {:#x}",
-                    port, width, val
-                );
+                // PM1a_CNT_BLK: accept writes (sleep control, etc.)
+                // No-op for now — we don't actually sleep.
             }
             0x608..=0x60B => {
                 // PM_TMR_BLK is read-only; silently ignore writes.
             }
-            _ => {
-                info!(
-                    "[PM] Write unknown port {:#x}, width {:?}, val {:#x}",
-                    port, width, val
-                );
-            }
+            _ => {}
         }
         Ok(())
     }

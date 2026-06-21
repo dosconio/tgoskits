@@ -305,7 +305,6 @@ impl VmxVcpu {
             cr_access: core::sync::atomic::AtomicU64,
             other: core::sync::atomic::AtomicU64,
             total: core::sync::atomic::AtomicU64,
-            last_summary: core::sync::atomic::AtomicU64,
         }
         static STATS: ExitStats = ExitStats {
             cpuid: core::sync::atomic::AtomicU64::new(0),
@@ -320,7 +319,6 @@ impl VmxVcpu {
             cr_access: core::sync::atomic::AtomicU64::new(0),
             other: core::sync::atomic::AtomicU64::new(0),
             total: core::sync::atomic::AtomicU64::new(0),
-            last_summary: core::sync::atomic::AtomicU64::new(0),
         };
 
         // Run guest first, then count the exit reason after we get back
@@ -382,7 +380,7 @@ impl VmxVcpu {
         }
 
         // Update exit reason statistics
-        let total = STATS
+        STATS
             .total
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         match exit_info.exit_reason {
@@ -441,96 +439,6 @@ impl VmxVcpu {
             }
         }
 
-        // Print exit reason summary every 100 exits
-        let last = STATS
-            .last_summary
-            .load(core::sync::atomic::Ordering::Relaxed);
-        if total - last >= 1000 {
-            STATS
-                .last_summary
-                .store(total, core::sync::atomic::Ordering::Relaxed);
-            let cr0 = VmcsGuestNW::CR0.read().unwrap_or(0);
-            let efer = VmcsGuest64::IA32_EFER.read().unwrap_or(0);
-            let pe = cr0 & 1;
-            let pg = (cr0 >> 31) & 1;
-            let lma = (efer >> 10) & 1;
-            info!(
-                "[STAT] #{total}: CPUID={} IO={} MSR_R={} MSR_W={} EPT={} PREEMPT={} EXT={} \
-                 HLT={} INTR_WIN={} CR={} OTH={} RIP={:#x} PE={} PG={} LMA={}",
-                STATS.cpuid.load(core::sync::atomic::Ordering::Relaxed),
-                STATS.io.load(core::sync::atomic::Ordering::Relaxed),
-                STATS.msr_read.load(core::sync::atomic::Ordering::Relaxed),
-                STATS.msr_write.load(core::sync::atomic::Ordering::Relaxed),
-                STATS
-                    .ept_violation
-                    .load(core::sync::atomic::Ordering::Relaxed),
-                STATS.preempt.load(core::sync::atomic::Ordering::Relaxed),
-                STATS.ext_intr.load(core::sync::atomic::Ordering::Relaxed),
-                STATS.hlt.load(core::sync::atomic::Ordering::Relaxed),
-                STATS
-                    .intr_window
-                    .load(core::sync::atomic::Ordering::Relaxed),
-                STATS.cr_access.load(core::sync::atomic::Ordering::Relaxed),
-                STATS.other.load(core::sync::atomic::Ordering::Relaxed),
-                self.rip(),
-                pe,
-                pg,
-                lma
-            );
-        }
-
-        // Detect stuck loops: same RIP for CPUID exits
-        static LAST_CPUID_RIP: core::sync::atomic::AtomicU64 =
-            core::sync::atomic::AtomicU64::new(0);
-        static SAME_CPUID_RIP_COUNT: core::sync::atomic::AtomicU32 =
-            core::sync::atomic::AtomicU32::new(0);
-        static STUCK_DUMPED: core::sync::atomic::AtomicBool =
-            core::sync::atomic::AtomicBool::new(false);
-        if matches!(exit_info.exit_reason, VmxExitReason::CPUID) {
-            let rip = self.rip() as u64;
-            let last_rip = LAST_CPUID_RIP.load(core::sync::atomic::Ordering::Relaxed);
-            if rip == last_rip {
-                let c = SAME_CPUID_RIP_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if c == 20 && !STUCK_DUMPED.load(core::sync::atomic::Ordering::Relaxed) {
-                    STUCK_DUMPED.store(true, core::sync::atomic::Ordering::Relaxed);
-                    let regs = self.regs();
-                    let rflags = VmcsGuestNW::RFLAGS.read().unwrap_or(0);
-                    let cr0 = VmcsGuestNW::CR0.read().unwrap_or(0);
-                    let cr4 = VmcsGuestNW::CR4.read().unwrap_or(0);
-                    let efer = VmcsGuest64::IA32_EFER.read().unwrap_or(0);
-                    info!(
-                        "[STUCK] CPUID loop at RIP={rip:#x}: RAX={:#x} RBX={:#x} RCX={:#x} \
-                         RDX={:#x} RBP={:#x} RDI={:#x} RSI={:#x}",
-                        regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.rbp, regs.rdi, regs.rsi
-                    );
-                    info!("[STUCK] RFLAGS={rflags:#x} CR0={cr0:#x} CR4={cr4:#x} EFER={efer:#x}");
-                    // Dump 64 bytes of instructions around the CPUID call
-                    if let Some(ept_root) = self.ept_root {
-                        let base_gpa = (rip.saturating_sub(16)) & !0x7u64;
-                        let mut dump = [0u8; 80];
-                        for (i, byte) in dump.iter_mut().enumerate() {
-                            let gpa = base_gpa + i as u64;
-                            if let Some(hpa) = self.gpa_to_hpa_via_ept(ept_root, gpa) {
-                                const PHYS_VIRT_OFFSET: u64 = 0xffff_8000_0000_0000;
-                                *byte = unsafe {
-                                    core::ptr::read_volatile(
-                                        (hpa as u64 + PHYS_VIRT_OFFSET) as *const u8,
-                                    )
-                                };
-                            }
-                        }
-                        info!(
-                            "[STUCK] Code around CPUID (RIP-16..RIP+64): {:02x?}",
-                            &dump[..80]
-                        );
-                    }
-                }
-            } else {
-                LAST_CPUID_RIP.store(rip, core::sync::atomic::Ordering::Relaxed);
-                SAME_CPUID_RIP_COUNT.store(0, core::sync::atomic::Ordering::Relaxed);
-            }
-        }
-
         // Trace VM-exits after CPUID 0x80000000 to diagnose OVMF not calling 0x80000001
         // Disabled: the CPUID 0x80000001 issue has been resolved (OVMF now enters
         // long mode successfully). Keep the counter logic for potential future use.
@@ -547,7 +455,7 @@ impl VmxVcpu {
             // Log only CPUID exits (the original diagnostic target), skip noisy
             // IO/EXT/PRM exits that flood the log during OVMF timer loops.
             if matches!(reason, VmxExitReason::CPUID) {
-                info!("[T]{}{}{:x}", self.trace_after_8k_count, short_reason, rax);
+                debug!("[T]{}{}{:x}", self.trace_after_8k_count, short_reason, rax);
             }
             self.trace_after_8k_count += 1;
             if matches!(reason, VmxExitReason::CPUID) && rax == 0x80000001 {
@@ -1073,7 +981,7 @@ impl VmxVcpu {
         info!("[VMX control] PIN_CTRL={:#x}", pin_ctrl);
 
         // Intercept all I/O instructions, use MSR bitmaps, activate secondary controls,
-        // intercept HLT for UEFI wait loops.
+        // and intercept HLT for UEFI wait loops.
         // KVM nested virtualization forces both UNCOND_IO_EXITING (bit 24) and
         // USE_IO_BITMAPS (bit 25) as mandatory1, but the SDM mutual-exclusion rule
         // (SDM 26.2.1.1) prohibits both being 1 together. We clear USE_IO_BITMAPS
@@ -1194,7 +1102,7 @@ impl VmxVcpu {
         let old_sec = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
         // Write only our desired bits; hardware will set/clear its own mandatory bits.
         let new_sec = old_sec | set_bits;
-        info!(
+        debug!(
             "[VMX control] Direct SEC_CTRL write: allowed0={:#x}, allowed1={:#x}, \
              msr_mandatory1={:#x}, old={:#x}, set={:#x}, new={:#x}",
             allowed0, allowed1, msr_mandatory1, old_sec, set_bits, new_sec
@@ -1203,7 +1111,7 @@ impl VmxVcpu {
         let actual = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
         let hw_mandatory1 = actual & !new_sec;
         let hw_mandatory0 = new_sec & !actual;
-        info!(
+        debug!(
             "[VMX control] Direct SEC_CTRL read back: {:#x} (wrote {:#x}) hw_forced1={:#x} \
              hw_forced0={:#x}",
             actual, new_sec, hw_mandatory1, hw_mandatory0
@@ -1228,15 +1136,15 @@ impl VmxVcpu {
                 )?;
                 let sec_ctrl = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
                 if sec_ctrl & vmcs_shadowing_bit != 0 {
-                    info!(
+                    debug!(
                         "[VMX control] VMCS_SHADOWING is mandatory1, SEC_CTRL={:#x}",
                         sec_ctrl
                     );
                 } else {
-                    info!("[VMX control] Cleared VMCS_SHADOWING");
+                    debug!("[VMX control] Cleared VMCS_SHADOWING");
                 }
             } else {
-                info!(
+                debug!(
                     "[VMX control] VMCS_SHADOWING is mandatory1 (allowed0={:#x}), keeping it \
                      enabled, SEC_CTRL={:#x}",
                     allowed0, sec_ctrl
@@ -1253,7 +1161,7 @@ impl VmxVcpu {
         let shadowing_set = sec_ctrl & CpuCtrl2::VMCS_SHADOWING.bits() != 0;
         let vid_set = sec_ctrl & CpuCtrl2::VIRTUAL_INTERRUPT_DELIVERY.bits() != 0;
         let vmfunc_set = sec_ctrl & CpuCtrl2::ENABLE_VM_FUNCTIONS.bits() != 0;
-        info!(
+        debug!(
             "[VMX control] SEC_CTRL={:#x}: APIC={}, x2APIC={}, APIC_REG={}, VID={}, PML={}, \
              SHADOWING={}, VMFUNC={}",
             sec_ctrl,
@@ -1271,7 +1179,7 @@ impl VmxVcpu {
         // Try to set VIRTUALIZE_APIC to satisfy the SDM dependency. If KVM rejects it,
         // the VM-entry will fail with a more specific error.
         if x2apic_set && !apic_set {
-            info!(
+            debug!(
                 "[VMX control] x2APIC set but APIC not set - attempting to force-set APIC, \
                  SEC_CTRL={:#x}",
                 sec_ctrl
@@ -1279,7 +1187,7 @@ impl VmxVcpu {
             let new_sec = sec_ctrl | CpuCtrl2::VIRTUALIZE_APIC.bits();
             VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.write(new_sec)?;
             let actual = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
-            info!(
+            debug!(
                 "[VMX control] After force-setting APIC: wrote={:#x}, read={:#x}",
                 new_sec, actual
             );
@@ -1292,7 +1200,7 @@ impl VmxVcpu {
         let x2apic_set = sec_ctrl & CpuCtrl2::VIRTUALIZE_X2APIC.bits() != 0;
         let apic_reg_set = sec_ctrl & CpuCtrl2::VIRTUALIZE_APIC_REGISTER.bits() != 0;
         if x2apic_set && apic_reg_set {
-            info!(
+            debug!(
                 "[VMX control] APIC_REG=1 and x2APIC=1 conflict (SDM 26.2.1.1) - attempting to \
                  clear x2APIC, SEC_CTRL={:#x}",
                 sec_ctrl
@@ -1301,19 +1209,19 @@ impl VmxVcpu {
             VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.write(new_sec)?;
             let actual = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
             let x2apic_cleared = actual & CpuCtrl2::VIRTUALIZE_X2APIC.bits() == 0;
-            info!(
+            debug!(
                 "[VMX control] After clearing x2APIC: wrote={:#x}, read={:#x}, cleared={}",
                 new_sec, actual, x2apic_cleared
             );
             if !x2apic_cleared {
-                info!(
+                debug!(
                     "[VMX control] x2APIC could not be cleared - trying to clear APIC-register \
                      virtualization instead"
                 );
                 let new_sec = sec_ctrl & !CpuCtrl2::VIRTUALIZE_APIC_REGISTER.bits();
                 VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.write(new_sec)?;
                 let actual = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
-                info!(
+                debug!(
                     "[VMX control] After clearing APIC_REG: wrote={:#x}, read={:#x}",
                     new_sec, actual
                 );
@@ -1325,7 +1233,7 @@ impl VmxVcpu {
         // Verify that the write took effect.
         if vmfunc_set {
             let vmfunc_ctrl = VmcsControl64::VM_FUNCTION_CONTROLS.read()?;
-            info!(
+            debug!(
                 "[VMX control] ENABLE_VM_FUNCTIONS=1, VM_FUNCTION_CONTROLS={:#x}, SEC_CTRL={:#x}",
                 vmfunc_ctrl, sec_ctrl
             );
@@ -1334,19 +1242,19 @@ impl VmxVcpu {
         // Re-read SEC_CTRL after all fixups to get the final hardware-accepted value.
         let sec_ctrl = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
         let actual = sec_ctrl;
-        info!("[VMX control] Final SEC_CTRL={:#x}", actual);
+        debug!("[VMX control] Final SEC_CTRL={:#x}", actual);
 
         // SDM 26.2.1.1: If VMCS_SHADOWING is 1, LINK_PTR must point to a valid shadow VMCS.
         // Re-read shadowing_set after possible modification.
         let shadowing_set = actual & CpuCtrl2::VMCS_SHADOWING.bits() != 0;
         if shadowing_set {
-            info!(
+            debug!(
                 "[VMX control] VMCS_SHADOWING=1, LINK_PTR={:#x}",
                 VmcsGuest64::LINK_PTR.read().unwrap_or(0)
             );
         } else {
             VmcsGuest64::LINK_PTR.write(0xFFFF_FFFF_FFFF_FFFF)?;
-            info!("[VMX control] VMCS_SHADOWING=0, set LINK_PTR=0xFFFFFFFF_FFFFFFFF");
+            debug!("[VMX control] VMCS_SHADOWING=0, set LINK_PTR=0xFFFFFFFF_FFFFFFFF");
         }
 
         VmcsControl16::VPID.write(1)?;
@@ -1534,7 +1442,7 @@ impl VmxVcpu {
         VmcsControl16::POSTED_INTERRUPT_NOTIFICATION_VECTOR.write(POSTED_INTR_VECTOR)?;
         VmcsControl64::POSTED_INTERRUPT_DESC_ADDR
             .write(self.posted_interrupt_desc.start_paddr().as_usize() as u64)?;
-        info!(
+        debug!(
             "[VMX control] Posted-interrupt: vector={:#x}, desc_addr={:#x}",
             POSTED_INTR_VECTOR,
             self.posted_interrupt_desc.start_paddr().as_usize()
@@ -2066,7 +1974,7 @@ impl VmxVcpu {
             static LOG_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
             let count = LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             if count < 5 || count == 100 || count == 1000 {
-                info!(
+                trace!(
                     "[INTR-BLOCK] IF={}, block_state={:#x}, RFLAGS={:#x} (count={})",
                     if_flag, block_state, rflags, count
                 );
@@ -2087,7 +1995,7 @@ impl VmxVcpu {
                 let vcpu_id = self.vlapic.timer_where_am_i().1 as u32;
                 let pending = vioapic.take_pending_irqs(vcpu_id);
                 for vector in pending {
-                    info!(
+                    debug!(
                         "[IOAPIC] Injecting pending IRQ vector={:#x} to vcpu={}",
                         vector, vcpu_id
                     );
@@ -2151,25 +2059,19 @@ impl VmxVcpu {
             let can_inject =
                 !matches!(event.int_type, VmxInterruptionType::External) || self.allow_interrupt();
             if can_inject {
-                debug!(
-                    "[INTR] Injecting interrupt vector={:#x} type={:?}",
-                    event.vector, event.int_type
-                );
+                // Rate-limited logging for interrupt injection
+                static INJECT_COUNT: core::sync::atomic::AtomicU64 =
+                    core::sync::atomic::AtomicU64::new(0);
+                let count = INJECT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if count < 10 || count == 100 || count == 1000 || count == 10000 {
+                    info!(
+                        "[INJECT] Injecting event #{}: vector={:#x}, type={:?}",
+                        count, event.vector, event.int_type
+                    );
+                }
                 vmcs::inject_event_with_type(event.vector, event.err_code, event.int_type)?;
                 self.pending_events.pop_front();
             } else {
-                // Log periodically to avoid flooding but still provide debug info
-                static INJECT_FAIL_COUNT: core::sync::atomic::AtomicU32 =
-                    core::sync::atomic::AtomicU32::new(0);
-                let count = INJECT_FAIL_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if count.is_multiple_of(1000) {
-                    let rflags = VmcsGuestNW::RFLAGS.read().unwrap_or(0);
-                    info!(
-                        "[INTR] Cannot inject vector={:#x} type={:?} (fail #{count}), \
-                         RFLAGS={rflags:#x}, setting interrupt window",
-                        event.vector, event.int_type
-                    );
-                }
                 self.set_interrupt_window(true)?;
             }
         }
@@ -2250,7 +2152,7 @@ impl VmxVcpu {
                 let msr = self.regs().rcx as u32;
                 if is_write {
                     let value = self.read_edx_eax();
-                    info!(
+                    trace!(
                         "[EFER/SYS] write MSR {msr:#x} = {value:#x}, RIP={:#x}",
                         self.rip()
                     );
@@ -2268,9 +2170,9 @@ impl VmxVcpu {
                             if let Err(e) = VmcsGuest64::IA32_EFER.write(new_efer) {
                                 warn!("[EFER] failed to write GUEST_EFER with LMA: {e:?}");
                             }
-                            info!("[EFER] LME+PG set, LMA activated: EFER={new_efer:#x}");
+                            trace!("[EFER] LME+PG set, LMA activated: EFER={new_efer:#x}");
                         }
-                        info!("[EFER] After EFER write: CR0={cr0:#x}, PG={pg}, LME={lme}");
+                        trace!("[EFER] After EFER write: CR0={cr0:#x}, PG={pg}, LME={lme}");
                     } else {
                         // For STAR/LSTAR/CSTAR/FMASK, pass through to hardware
                         unsafe {
@@ -2286,7 +2188,7 @@ impl VmxVcpu {
                 } else {
                     if msr == 0xC0000080 {
                         let value = VmcsGuest64::IA32_EFER.read().unwrap_or(0);
-                        info!(
+                        debug!(
                             "[EFER/SYS] read MSR {msr:#x} = {value:#x}, RIP={:#x}",
                             self.rip()
                         );
@@ -2569,36 +2471,31 @@ impl VmxVcpu {
         let apic_offset = (gpa - 0xFEE0_0000) as u32;
         let is_write = info.access_flags.contains(axaddrspace::MappingFlags::WRITE);
 
-        let instr_len = VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
-        let instr_len: u8 = if instr_len == 0 {
+        // Intel SDM: VMEXIT_INSTRUCTION_LEN is undefined for EPT violations.
+        // Always decode the instruction bytes to get the length and the
+        // destination/source register, falling back to RAX/Dword if decoding
+        // fails (as the old code assumed RAX for all MMIO writes).
+        let (instr_len, reg, _width) =
             if let Some((bytes, actual_len)) = self.read_guest_instr_bytes(15) {
-                let decoded = Self::decode_x86_instruction_length(&bytes[..actual_len]);
-                warn!(
-                    "[APIC-MMIO] instr_len=0, decoded={}, RIP={:#x}, bytes={:02x?}",
-                    decoded,
-                    self.rip(),
-                    &bytes[..actual_len.min(6)]
-                );
-                if decoded > 0 { decoded } else { 2 }
+                if let Some((reg, width, decoded_len)) =
+                    Self::decode_mmio_mov_instr(&bytes[..actual_len])
+                {
+                    (decoded_len.max(1), reg, width)
+                } else {
+                    let len = Self::decode_x86_instruction_length(&bytes[..actual_len]).max(1);
+                    (len, 0u8, AccessWidth::Dword)
+                }
             } else {
-                warn!(
-                    "[APIC-MMIO] instr_len=0, failed to read guest instr, using default=2, \
-                     RIP={:#x}",
-                    self.rip()
-                );
-                2
-            }
-        } else {
-            instr_len as u8
-        };
+                (2u8, 0u8, AccessWidth::Dword)
+            };
 
         let apic_msr = 0x800 + (apic_offset >> 4);
 
         if is_write {
-            let value = self.regs().rax as u32;
-            info!(
-                "[APIC-MMIO] write: offset={:#x}, msr={:#x}, value={:#x}",
-                apic_offset, apic_msr, value
+            let value = self.regs().get_reg_of_index(reg) as u32;
+            trace!(
+                "[APIC-MMIO] write: offset={:#x}, msr={:#x}, value={:#x}, reg={}",
+                apic_offset, apic_msr, value, reg
             );
             <EmulatedLocalApic as BaseDeviceOps<SysRegAddrRange>>::handle_write(
                 &self.vlapic,
@@ -2612,11 +2509,12 @@ impl VmxVcpu {
                 SysRegAddr::new(apic_msr as _),
                 AccessWidth::Dword,
             )? as u64;
-            info!(
-                "[APIC-MMIO] read: offset={:#x}, msr={:#x}, value={:#x}",
-                apic_offset, apic_msr, value
+            trace!(
+                "[APIC-MMIO] read: offset={:#x}, msr={:#x}, value={:#x}, reg={}",
+                apic_offset, apic_msr, value, reg
             );
-            self.regs_mut().rax = value;
+            // Write the read value to the correct destination register
+            self.regs_mut().set_reg_of_index(reg, value);
         }
 
         self.advance_rip(instr_len)?;
@@ -2636,15 +2534,11 @@ impl VmxVcpu {
 
         if info.access_flags.contains(MappingFlags::WRITE) {
             // Write beyond ram_end: discard by advancing past the instruction.
-            let instr_len = VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
-            let instr_len: u8 = if instr_len == 0 {
-                if let Some((bytes, actual_len)) = self.read_guest_instr_bytes(15) {
-                    Self::decode_x86_instruction_length(&bytes[..actual_len]).max(1)
-                } else {
-                    2
-                }
+            // Intel SDM: VMEXIT_INSTRUCTION_LEN is undefined for EPT violations.
+            let instr_len: u8 = if let Some((bytes, actual_len)) = self.read_guest_instr_bytes(15) {
+                Self::decode_x86_instruction_length(&bytes[..actual_len]).max(1)
             } else {
-                instr_len as u8
+                2
             };
             self.advance_rip(instr_len)?;
             info!(
@@ -2679,16 +2573,12 @@ impl VmxVcpu {
 
         if is_write {
             // Writes to PCI MMIO: discard by advancing past the instruction.
-            let instr_len = VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
-            let instr_len: u8 = if instr_len == 0 {
-                if let Some((bytes, actual_len)) = self.read_guest_instr_bytes(15) {
-                    let decoded = Self::decode_x86_instruction_length(&bytes[..actual_len]);
-                    if decoded > 0 { decoded } else { 2 }
-                } else {
-                    2
-                }
+            // Intel SDM: VMEXIT_INSTRUCTION_LEN is undefined for EPT violations.
+            let instr_len: u8 = if let Some((bytes, actual_len)) = self.read_guest_instr_bytes(15) {
+                let decoded = Self::decode_x86_instruction_length(&bytes[..actual_len]);
+                if decoded > 0 { decoded } else { 2 }
             } else {
-                instr_len as u8
+                2
             };
             debug!(
                 "[PCI-MMIO] write ignored: GPA={:#x}, RIP={:#x}",
@@ -2709,8 +2599,13 @@ impl VmxVcpu {
                 warn!("[PCI-MMIO] failed to map dummy page at GPA={page_aligned_gpa:#x}: {e:?}");
                 // Fallback: set RAX and advance RIP (incorrect for non-RAX targets)
                 self.regs_mut().rax = 0xFFFF_FFFF;
-                let instr_len = VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
-                let instr_len: u8 = if instr_len == 0 { 2 } else { instr_len as u8 };
+                let instr_len: u8 =
+                    if let Some((bytes, actual_len)) = self.read_guest_instr_bytes(15) {
+                        let decoded = Self::decode_x86_instruction_length(&bytes[..actual_len]);
+                        if decoded > 0 { decoded } else { 2 }
+                    } else {
+                        2
+                    };
                 self.advance_rip(instr_len)?;
             }
             // Do NOT advance RIP — the instruction will re-execute against the
@@ -2790,12 +2685,20 @@ impl VmxVcpu {
             let mod_field = (modrm >> 6) & 3;
             let rm_field = modrm & 7;
 
-            if mod_field != 3 && rm_field == 4 && i < bytes.len() {
+            // Handle SIB byte: when rm_field == 4 (and mod_field != 3),
+            // a SIB byte follows.  Read it to check the base field,
+            // because if mod_field == 0 and SIB base == 5, a 32-bit
+            // displacement follows the SIB byte.
+            let sib_base = if mod_field != 3 && rm_field == 4 && i < bytes.len() {
+                let sib = bytes[i];
                 i += 1;
-            }
+                sib & 7
+            } else {
+                0
+            };
 
             match mod_field {
-                0 if rm_field == 5 => {
+                0 if rm_field == 5 || (rm_field == 4 && sib_base == 5) => {
                     i += 4;
                 }
                 1 => {
@@ -3392,9 +3295,9 @@ impl VmxVcpu {
                             };
                         }
                     }
-                    info!("[8k] e={:x} rip={:x} {:02x?}", res.eax, rip, &dump[..96]);
+                    debug!("[8k] e={:x} rip={:x} {:02x?}", res.eax, rip, &dump[..96]);
                 } else {
-                    info!("[8k] e={:x}", res.eax);
+                    debug!("[8k] e={:x}", res.eax);
                 }
                 res
             }
@@ -3451,17 +3354,17 @@ impl VmxVcpu {
                                         };
                                     }
                                 }
-                                info!("[8k]#{out_count} {rip:x} {:02x?}", &dump[..32]);
+                                debug!("[8k]#{out_count} {rip:x} {:02x?}", &dump[..32]);
                             } else {
-                                info!("[8k]#{out_count} {rip:x}");
+                                debug!("[8k]#{out_count} {rip:x}");
                             }
                         } else {
-                            info!("[8k]#{out_count} {rip:x}");
+                            debug!("[8k]#{out_count} {rip:x}");
                         }
                         self.trace_after_cpuid_8k = true;
                         self.trace_after_8k_count = 0;
                     }
-                    0x80000001 => info!("[81]#{out_count} {rip:x}"),
+                    0x80000001 => debug!("[81]#{out_count} {rip:x}"),
                     0x1 => {
                         if out_count < 1 {
                             if let Some(ept_root) = self.ept_root {
@@ -3479,15 +3382,15 @@ impl VmxVcpu {
                                         };
                                     }
                                 }
-                                info!("[1]#{out_count} {rip:x} {:02x?}", &dump[..128]);
+                                debug!("[1]#{out_count} {rip:x} {:02x?}", &dump[..128]);
                             } else {
-                                info!("[1]#{out_count} {rip:x}");
+                                debug!("[1]#{out_count} {rip:x}");
                             }
                         } else {
-                            info!("[1]#{out_count} {rip:x}");
+                            debug!("[1]#{out_count} {rip:x}");
                         }
                     }
-                    _ => info!("[C]#{out_count} {function:x} {rip:x}"),
+                    _ => debug!("[C]#{out_count} {function:x} {rip:x}"),
                 }
             }
         }
@@ -4024,6 +3927,13 @@ impl AxArchVCpu for VmxVcpu {
                         AxVCpuExitReason::Hlt
                     }
                     VmxExitReason::MSR_READ => {
+                        // RDMSR is a 2-byte instruction (0F 32).  Advance RIP
+                        // here so that the guest continues at the next
+                        // instruction after the VMM emulates the read.
+                        // Without this, the guest would re-execute the same
+                        // RDMSR forever (the built-in handler advances RIP
+                        // itself, but the propagated path did not).
+                        self.advance_rip(2).ok();
                         // `reg` is unused here.
                         AxVCpuExitReason::SysRegRead {
                             addr: SysRegAddr::new(self.regs().rcx as _),
@@ -4039,51 +3949,25 @@ impl AxArchVCpu for VmxVcpu {
                         {
                             let instr_len =
                                 VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
-                            if instr_len > 0 {
-                                self.advance_rip(instr_len as _)?;
-                                if info.access_flags.contains(MappingFlags::WRITE) {
-                                    return Ok(AxVCpuExitReason::MmioWrite {
-                                        addr: info.fault_guest_paddr,
-                                        width: AccessWidth::Dword,
-                                        data: self.regs().rax,
-                                    });
-                                } else {
-                                    return Ok(AxVCpuExitReason::MmioRead {
-                                        addr: info.fault_guest_paddr,
-                                        width: AccessWidth::Dword,
-                                        reg: 0,
-                                        reg_width: AccessWidth::Dword,
-                                        signed_ext: false,
-                                    });
-                                }
-                            }
-                        }
-
-                        // ECAM MMIO: route to PCI host bridge's ECAM interface via
-                        // the VMM's MMIO dispatch. OVMF accesses PCI config space
-                        // via ECAM at 0xB000_0000 (MCFG ACPI table).
-                        if (ECAM_MMIO_BASE..ECAM_MMIO_END).contains(&gpa) {
-                            let vmexit_instr_len =
-                                VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
                             // Intel SDM: VMEXIT_INSTRUCTION_LEN is undefined for
                             // EPT violations. Decode the instruction bytes to get
-                            // both the length and the destination/source register.
+                            // both the length and the destination/source register,
+                            // falling back to RAX/Dword if decoding fails.
                             let (instr_len, reg, width) = if let Some((bytes, actual_len)) =
                                 self.read_guest_instr_bytes(15)
                             {
                                 if let Some((reg, width, decoded_len)) =
                                     Self::decode_mmio_mov_instr(&bytes[..actual_len])
                                 {
-                                    let len = if vmexit_instr_len > 0 {
-                                        vmexit_instr_len as u8
+                                    let len = if instr_len > 0 {
+                                        instr_len as u8
                                     } else {
                                         decoded_len.max(1)
                                     };
                                     (len, reg, width)
                                 } else {
-                                    // Not a MOV instruction; fall back to RAX
-                                    let len = if vmexit_instr_len > 0 {
-                                        vmexit_instr_len as u8
+                                    let len = if instr_len > 0 {
+                                        instr_len as u8
                                     } else {
                                         Self::decode_x86_instruction_length(&bytes[..actual_len])
                                             .max(1)
@@ -4091,13 +3975,53 @@ impl AxArchVCpu for VmxVcpu {
                                     (len, 0u8, AccessWidth::Dword)
                                 }
                             } else {
-                                // Cannot read instruction bytes; fall back
-                                let len = if vmexit_instr_len > 0 {
-                                    vmexit_instr_len as u8
-                                } else {
-                                    2
-                                };
+                                let len = if instr_len > 0 { instr_len as u8 } else { 2 };
                                 (len, 0u8, AccessWidth::Dword)
+                            };
+                            self.advance_rip(instr_len)?;
+                            if info.access_flags.contains(MappingFlags::WRITE) {
+                                let data = self.regs().get_reg_of_index(reg);
+                                return Ok(AxVCpuExitReason::MmioWrite {
+                                    addr: info.fault_guest_paddr,
+                                    width,
+                                    data,
+                                });
+                            } else {
+                                return Ok(AxVCpuExitReason::MmioRead {
+                                    addr: info.fault_guest_paddr,
+                                    width,
+                                    reg: reg as usize,
+                                    reg_width: width,
+                                    signed_ext: false,
+                                });
+                            }
+                        }
+
+                        // ECAM MMIO: route to PCI host bridge's ECAM interface via
+                        // the VMM's MMIO dispatch. OVMF accesses PCI config space
+                        // via ECAM at 0xB000_0000 (MCFG ACPI table).
+                        if (ECAM_MMIO_BASE..ECAM_MMIO_END).contains(&gpa) {
+                            // Intel SDM: VMEXIT_INSTRUCTION_LEN is undefined for
+                            // EPT violations. Always decode the instruction bytes
+                            // to get both the length and the destination/source
+                            // register.
+                            let (instr_len, reg, width) = if let Some((bytes, actual_len)) =
+                                self.read_guest_instr_bytes(15)
+                            {
+                                if let Some((reg, width, decoded_len)) =
+                                    Self::decode_mmio_mov_instr(&bytes[..actual_len])
+                                {
+                                    (decoded_len.max(1), reg, width)
+                                } else {
+                                    // Not a MOV instruction; fall back to RAX
+                                    let len =
+                                        Self::decode_x86_instruction_length(&bytes[..actual_len])
+                                            .max(1);
+                                    (len, 0u8, AccessWidth::Dword)
+                                }
+                            } else {
+                                // Cannot read instruction bytes; fall back
+                                (2u8, 0u8, AccessWidth::Dword)
                             };
 
                             self.advance_rip(instr_len as _)?;
@@ -4124,10 +4048,8 @@ impl AxArchVCpu for VmxVcpu {
                             && gpa >= self.ram_end
                             && info.access_flags.contains(MappingFlags::EXECUTE)
                         {
-                            let instr_len =
-                                VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read().unwrap_or(0);
-                            let instr_len: u8 = if instr_len == 0 { 2 } else { instr_len as u8 };
-                            self.advance_rip(instr_len)?;
+                            // Intel SDM: VMEXIT_INSTRUCTION_LEN is undefined for EPT violations.
+                            self.advance_rip(2)?;
                             self.queue_event(14, Some(1 << 4));
                             return Ok(AxVCpuExitReason::Nothing);
                         }
@@ -4144,6 +4066,9 @@ impl AxArchVCpu for VmxVcpu {
                         }
                     }
                     VmxExitReason::MSR_WRITE => {
+                        // WRMSR is a 2-byte instruction (0F 30).  Advance RIP
+                        // here for the same reason as MSR_READ above.
+                        self.advance_rip(2).ok();
                         let value = (self.regs().rax & 0xffff_ffff)
                             | ((self.regs().rdx & 0xffff_ffff) << 32);
                         AxVCpuExitReason::SysRegWrite {
@@ -4308,12 +4233,17 @@ impl AxArchVCpu for VmxVcpu {
         let vector = self.vlapic.timer_vector();
         let is_masked = self.vlapic.timer_is_masked();
         let is_periodic = self.vlapic.timer_is_periodic();
-        let lvt_val = self.vlapic.timer_read_lvt();
 
-        info!(
-            "[VLAPIC] timer expired: vector={vector:#x}, masked={is_masked}, \
-             periodic={is_periodic}, lvt={lvt_val:#010x}"
-        );
+        // Rate-limited info logging for timer expirations
+        static TIMER_EXPIRE_COUNT: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        let count = TIMER_EXPIRE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if count < 3 || count == 100 || count == 1000 || count == 10000 {
+            info!(
+                "[VLAPIC] timer expired #{}: vector={:#x}, masked={}, periodic={}",
+                count, vector, is_masked, is_periodic
+            );
+        }
 
         // Per Intel SDM Vol. 3A Section 10.5.4: when the APIC timer expires
         // while LVT_TIMER is masked, the interrupt is held pending
@@ -4326,7 +4256,6 @@ impl AxArchVCpu for VmxVcpu {
             let vcpu_id = self.vlapic.timer_where_am_i().1 as u32;
             self.vlapic.set_intr(vcpu_id, vector as u32);
             self.queue_external_interrupt(vector);
-            info!("[VLAPIC] timer interrupt queued: vector={vector:#x}, vcpu={vcpu_id}");
         } else if is_masked {
             debug!("[VLAPIC] timer expired but masked, interrupt held pending");
         }

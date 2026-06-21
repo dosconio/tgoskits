@@ -154,6 +154,13 @@ impl VMVCpus {
         self.wait_queue.wait_until(condition)
     }
 
+    /// Blocks the current thread on the wait queue for at most `dur`, or until
+    /// notified by another task.  Returns `true` if the wait timed out (i.e. no
+    /// one notified us), or `false` if we were woken up by a notification.
+    fn wait_timeout(&self, dur: Duration) -> bool {
+        self.wait_queue.wait_timeout(dur)
+    }
+
     #[allow(dead_code)]
     fn notify_one(&mut self) {
         // FIXME: `WaitQueue::len` is removed
@@ -213,6 +220,17 @@ where
         .get(&vm_id)
         .unwrap()
         .wait_until(condition)
+}
+
+/// Blocks the current thread for at most `dur`, or until notified by another
+/// task, using the wait queue associated with the VCpus of the specified VM.
+///
+/// Returns `true` if the wait timed out, or `false` if woken by a notification.
+fn wait_timeout(vm_id: usize, dur: Duration) -> bool {
+    VM_VCPU_TASK_WAIT_QUEUE
+        .get(&vm_id)
+        .unwrap()
+        .wait_timeout(dur)
 }
 
 /// Notifies the primary VCpu task associated with the specified VM to wake up and resume execution.
@@ -509,27 +527,38 @@ fn vcpu_run() {
                     }
                     AxVCpuExitReason::Hlt => {
                         // Guest executed HLT – it is idle and waiting for an
-                        // interrupt.  Yield the vCPU task so the scheduler can
-                        // run other work (timers, I/O completion, etc.).  The
-                        // vCPU will be rescheduled and may find a pending
-                        // interrupt on the next VM entry.
+                        // interrupt.  Block the vCPU task for a short time so
+                        // the scheduler can run other work (timers, I/O
+                        // completion, etc.) and so we don't burn CPU in a
+                        // busy-loop.  When the timeout expires (or we are
+                        // notified by an external interrupt source), the run
+                        // loop resumes, advances the PIT (which may assert
+                        // IRQ0), and re-enters the guest so the pending
+                        // interrupt can be injected.
                         hlt_count += 1;
                         if hlt_count <= 5 {
                             info!(
                                 "VM[{vm_id}] VCpu[{vcpu_id}] HLT #{hlt_count}, total exits={exit_count}"
                             );
                         }
-                        if hlt_count == 1000 || hlt_count == 10000 || hlt_count == 100000 {
+                        if hlt_count == 1000
+                            || hlt_count == 10000
+                            || hlt_count == 100000
+                            || hlt_count == 1000000
+                        {
                             info!(
                                 "VM[{vm_id}] VCpu[{vcpu_id}] HLT count={hlt_count}, nothing_count={nothing_count}, total exits={exit_count}"
                             );
                         }
-                        ax_task::yield_now();
+                        // Block for up to 1 ms.  The PIT (typically ~1 kHz)
+                        // will be advanced when we resume, generating IRQ0 at
+                        // the correct rate.
+                        wait_timeout(vm_id, Duration::from_millis(1));
                     }
                     AxVCpuExitReason::Nothing => {
                         nothing_count += 1;
                         if nothing_count == 1 {
-                            info!(
+                            debug!(
                                 "VM[{vm_id}] VCpu[{vcpu_id}] first Nothing exit, total exits={exit_count}"
                             );
                         }
@@ -538,7 +567,7 @@ fn vcpu_run() {
                             || nothing_count == 100000
                         {
                             let vcpu_arch = vcpu.get_arch_vcpu();
-                            info!(
+                            debug!(
                                 "VM[{vm_id}] VCpu[{vcpu_id}] Nothing count={nothing_count}, hlt_count={hlt_count}, total exits={exit_count}, RIP={:#x}",
                                 vcpu_arch.rip()
                             );

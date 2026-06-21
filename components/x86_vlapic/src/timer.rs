@@ -122,12 +122,6 @@ impl ApicTimer {
             .read_as_enum(LVT_TIMER::TimerMode)
             .unwrap_or(TimerMode::OneShot);
 
-        info!(
-            "[TIMER-DEBUG] write_lvt: value={value:#010x}, old_mode={old_mode:?}, \
-             new_mode={new_mode:?}, is_tsc_deadline={}",
-            new_mode == TimerMode::TSCDeadline
-        );
-
         self.lvt_timer_register.set(value);
 
         // Per Intel SDM Vol. 3A Section 10.5.4:
@@ -220,17 +214,6 @@ impl ApicTimer {
         let period_ticks = (self.initial_count_register as u64) << self.start_divide_shift;
         let deadline_ticks = self.last_start_ticks + period_ticks;
 
-        // Rate-limited diagnostic logging for CCR reads
-        static CCR_LOG_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-        let log_count = CCR_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if log_count < 5 || log_count == 100 || log_count == 1000 {
-            info!(
-                "[CCR] #{log_count}: current={current_ticks:#x}, last_start={:#x}, ICR={:#x}, \
-                 divide_shift={}, period={period_ticks:#x}, deadline={deadline_ticks:#x}",
-                self.last_start_ticks, self.initial_count_register, self.start_divide_shift
-            );
-        }
-
         if current_ticks >= deadline_ticks {
             if self.is_periodic() && period_ticks > 0 {
                 // In periodic mode, CCR wraps around: compute remaining
@@ -310,16 +293,7 @@ impl ApicTimer {
             current_ticks + ((self.initial_count_register as u64) << self.divide_shift);
         let (vm_id, vcpu_id) = self.where_am_i;
 
-        let is_periodic = self.is_periodic();
-        let is_masked = self.is_masked();
-
         let deadline_ns = ticks_to_nanos(deadline_ticks);
-        info!(
-            "[VLAPIC-TIMER] start_timer: tick={current_ticks:#x}, \
-             deadline_tick={deadline_ticks:#x}, deadline_ns={deadline_ns:#x}, vector={vector}, \
-             masked={is_masked}, periodic={is_periodic}, icr={:#x}, divide_shift={}",
-            self.initial_count_register, self.divide_shift
-        );
 
         self.last_start_ticks = current_ticks;
         self.start_divide_shift = self.divide_shift;
@@ -328,7 +302,6 @@ impl ApicTimer {
         self.cancel_token = Some(register_timer(
             ticks_to_time(deadline_ticks),
             Box::new(move |_| {
-                info!("[VLAPIC-TIMER] callback fired: vm={vm_id}, vcpu={vcpu_id}, vector={vector}");
                 notify_vcpu_timer_expired(vm_id, vcpu_id);
             }),
         ));
@@ -396,7 +369,7 @@ impl ApicTimer {
         let (vm_id, vcpu_id) = self.where_am_i;
         let is_masked = self.is_masked();
 
-        info!(
+        trace!(
             "vlapic @ (vm {vm_id}, vcpu {vcpu_id}) starts TSC deadline timer @ tick \
              {current_ticks:?}, deadline tick {deadline_ticks:?}, vector {vector}, \
              masked={is_masked}, tsc_deadline={tsc_deadline:#x}"
@@ -409,7 +382,7 @@ impl ApicTimer {
         self.cancel_token = Some(register_timer(
             ticks_to_time(deadline_ticks),
             Box::new(move |_| {
-                info!(
+                trace!(
                     "vlapic @ (vm {vm_id}, vcpu {vcpu_id}) TSC deadline timer callback fired, \
                      vector {vector}"
                 );

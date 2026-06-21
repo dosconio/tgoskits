@@ -464,7 +464,16 @@ impl AxVmDevices {
 
             return emu_dev.handle_read(addr, width);
         }
-        panic_device_not_found("sys_reg", addr, true, width);
+        // Unknown MSR: return 0 instead of panicking.  Many guest kernels
+        // probe optional MSRs (e.g. AMD 0xC001_1029 IC_CFG, topology MSRs)
+        // that the hypervisor does not emulate.  Panicking crashes the whole
+        // system; returning 0 lets the guest continue and simply treat the
+        // feature as unsupported.
+        warn!(
+            "emu_device read: no handler for sys_reg {:#x}, returning 0",
+            addr.0
+        );
+        Ok(0)
     }
 
     /// Handle the system register write by SysRegAddr, data width and the value need to write, call specific device to write the value
@@ -479,7 +488,13 @@ impl AxVmDevices {
 
             return emu_dev.handle_write(addr, width, val);
         }
-        panic_device_not_found("sys_reg", addr, false, width);
+        // Unknown MSR: silently ignore the write (same rationale as
+        // handle_sys_reg_read above).
+        warn!(
+            "emu_device write: no handler for sys_reg {:#x}, ignoring value {:#x}",
+            addr.0, val
+        );
+        Ok(())
     }
 
     /// Handle the port read by port number and data width, return the value of the guest want to read

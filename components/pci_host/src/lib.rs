@@ -154,6 +154,22 @@ impl PciHostBridge {
         if let Some(device) = devices.get(&(bus, dev, func)) {
             let full_val = device.config_space().read(full_reg, AccessWidth::Dword);
             let val = Self::extract_bytes(full_val, port_offset, width);
+            // Rate-limited info logging for virtio-blk (BDF 0,1,0) config reads
+            if bus == 0 && dev == 1 && func == 0 {
+                static CFG_READ_COUNT: core::sync::atomic::AtomicU64 =
+                    core::sync::atomic::AtomicU64::new(0);
+                let count = CFG_READ_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if count < 30 {
+                    info!(
+                        "[PCI-CFG] virtio-blk read #{count}: reg={:#x} val={:#x} offset={} \
+                         width={}",
+                        full_reg,
+                        val,
+                        port_offset,
+                        width.size()
+                    );
+                }
+            }
             debug!(
                 "PCI device ({},{},{}) read: reg={:#x} val={:#x}",
                 bus, dev, func, full_reg, val
@@ -330,6 +346,22 @@ impl PciHostBridge {
         if let Some(device) = devices.get(&(bus, dev, func)) {
             let full_val = device.config_space().read(reg, AccessWidth::Dword);
             let val = Self::extract_bytes(full_val, byte_offset, width);
+            // Rate-limited info logging for virtio-blk (BDF 0,1,0) ECAM reads
+            if bus == 0 && dev == 1 && func == 0 {
+                static ECAM_READ_COUNT: core::sync::atomic::AtomicU64 =
+                    core::sync::atomic::AtomicU64::new(0);
+                let count = ECAM_READ_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if count < 30 {
+                    info!(
+                        "[ECAM-CFG] virtio-blk read #{count}: reg={:#x} val={:#x} offset={} \
+                         width={}",
+                        reg,
+                        val,
+                        byte_offset,
+                        width.size()
+                    );
+                }
+            }
             debug!(
                 "[ECAM] device ({},{},{}) read: reg={:#x} val={:#x}",
                 bus, dev, func, reg, val

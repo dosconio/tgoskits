@@ -28,7 +28,7 @@ image_location = "fs"
 kernel_path = "/guest/linux/linux-qemu"
 kernel_load_addr = 0x10000000
 # Kernel command line (passed via fw_cfg for direct kernel boot)
-cmdline = "console=ttyS0 earlyprintk=serial root=/dev/ram0 ro"
+cmdline = "console=ttyS0 earlyprintk=serial root=/dev/vda rw acpi_rsdp=0x200000 acpi.debug_layer=0xFFFFFFFF acpi.debug_level=0x20000"
 
 # UEFI boot mode - uses OVMF firmware instead of axvm-bios
 boot_mode = "uefi"

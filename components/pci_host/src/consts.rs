@@ -38,6 +38,7 @@ pub const PCI_BAR2: u8 = 0x18;
 pub const PCI_BAR3: u8 = 0x1C;
 pub const PCI_BAR4: u8 = 0x20;
 pub const PCI_BAR5: u8 = 0x24;
+pub const PCI_EXPANSION_ROM: u8 = 0x30;
 pub const PCI_SUBSYSTEM_VENDOR_ID: u8 = 0x2C;
 pub const PCI_SUBSYSTEM_ID: u8 = 0x2E;
 pub const PCI_INTERRUPT_LINE: u8 = 0x3C;

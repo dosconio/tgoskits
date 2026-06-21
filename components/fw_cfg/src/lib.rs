@@ -398,7 +398,7 @@ impl FwCfgDevice {
         let is_select = (control & FW_CFG_DMA_CTL_SELECT) != 0;
         let selector_from_control = (control >> 16) as u16;
 
-        info!(
+        debug!(
             "fw_cfg DMA: GPA={:#x} control={:#x} (select={} read={} write={} skip={}) \
              selector={:#x} length={} address={:#x}",
             dma_gpa,
@@ -455,7 +455,7 @@ impl FwCfgDevice {
             );
         }
 
-        info!(
+        debug!(
             "fw_cfg DMA: completed, transferred={} bytes, new_control={:#x}, new_length={}, \
              selector={:#x} offset={}",
             transferred,

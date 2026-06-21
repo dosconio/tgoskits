@@ -204,6 +204,19 @@ impl<A: AxArchVCpu> AxVCpu<A> {
     where
         F: FnOnce() -> AxResult<T>,
     {
+        // Debug: detect reentrancy before the panic
+        if self.inner_mut.try_borrow_mut().is_err() {
+            let borrow_type = if self.inner_mut.try_borrow().is_err() {
+                "mutable (reentrant with_state_transition)"
+            } else {
+                "immutable (state() called and not dropped?)"
+            };
+            panic!(
+                "REENTRANCY: with_state_transition(from={:?}, to={:?}, vcpu_id={}) \
+                 RefCell already borrowed! borrow_type={}",
+                from, to, self.id(), borrow_type
+            );
+        }
         let mut inner_mut = self.inner_mut.borrow_mut();
         if inner_mut.state != from {
             inner_mut.state = VCpuState::Invalid;

@@ -124,10 +124,15 @@ impl PicChip {
             self.irr &= !(1 << irq);
             self.isr |= 1 << irq;
             let vector = self.base + irq;
-            debug!(
-                "[i8259] acknowledge: irq={}, vector={:#x}, irr={:#04x}, isr={:#04x}",
-                irq, vector, self.irr, self.isr
-            );
+            // Rate-limited info logging: first 5 acknowledges, then every 1000th.
+            static ACK_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            let count = ACK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if count < 5 || count.is_multiple_of(1000) {
+                info!(
+                    "[i8259] acknowledge #{}: irq={}, vector={:#x}, irr={:#04x}, isr={:#04x}",
+                    count, irq, vector, self.irr, self.isr
+                );
+            }
             Some(vector)
         } else {
             None
@@ -155,10 +160,17 @@ impl PicChip {
                     if self.isr != 0 {
                         let highest = self.isr.trailing_zeros() as u8;
                         self.isr &= !(1 << highest);
-                        debug!(
-                            "[i8259] {} Non-specific EOI: cleared ISR bit {}",
-                            name, highest
-                        );
+                        static PIC_EOI_COUNT: core::sync::atomic::AtomicU64 =
+                            core::sync::atomic::AtomicU64::new(0);
+                        let count =
+                            PIC_EOI_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        if count < 10 || count.is_multiple_of(1000) {
+                            info!(
+                                "[i8259] {} Non-specific EOI #{count}: cleared ISR bit {}, \
+                                 isr={:#04x}",
+                                name, highest, self.isr
+                            );
+                        }
                     }
                 }
                 0b01 => {
@@ -175,7 +187,16 @@ impl PicChip {
                     // Specific EOI: clear the ISR bit specified by level
                     if level < 8 {
                         self.isr &= !(1 << level);
-                        debug!("[i8259] {} Specific EOI: cleared ISR bit {}", name, level);
+                        static PIC_SPEC_EOI_COUNT: core::sync::atomic::AtomicU64 =
+                            core::sync::atomic::AtomicU64::new(0);
+                        let count =
+                            PIC_SPEC_EOI_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        if count < 10 || count.is_multiple_of(1000) {
+                            info!(
+                                "[i8259] {} Specific EOI #{count}: cleared ISR bit {}, isr={:#04x}",
+                                name, level, self.isr
+                            );
+                        }
                     }
                 }
                 _ => unreachable!(),

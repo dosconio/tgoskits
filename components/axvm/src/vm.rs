@@ -578,6 +578,18 @@ impl AxVM {
         let exit_reason = loop {
             let exit_reason = vcpu.run()?;
             trace!("{exit_reason:#x?}");
+
+            // Diagnostic: log total exit count periodically to detect tight
+            // loops where the guest is stuck.  We cannot read the guest RIP
+            // here because `rip()` is not part of the `AxArchVCpu` trait, so
+            // we rely on the exit count and exit reason instead.
+            static TOTAL_EXIT_COUNT: core::sync::atomic::AtomicU64 =
+                core::sync::atomic::AtomicU64::new(0);
+            let total = TOTAL_EXIT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if total.is_multiple_of(1_000_000) {
+                info!("[DIAG] Total VM exits: {total}, current exit: {exit_reason:?}");
+            }
+
             let handled = match &exit_reason {
                 AxVCpuExitReason::MmioRead {
                     addr,

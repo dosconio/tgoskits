@@ -444,14 +444,19 @@ impl I8254Pit {
             }
             // Rising edge for the new period.
             *asserted = true;
-            if let Some(cb) = self.irq_callback {
-                debug!(
-                    "[i8254] Counter 0 period elapsed (mode={:?}, reload={:#x}, null_count={}), \
-                     pulsing IRQ0",
+            // Rate-limited info logging: first 3 IRQs, then every 1000th.
+            static PIT_IRQ_COUNT: core::sync::atomic::AtomicU64 =
+                core::sync::atomic::AtomicU64::new(0);
+            let count = PIT_IRQ_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if count < 3 || count.is_multiple_of(1000) {
+                info!(
+                    "[i8254] Counter 0 IRQ0 pulse #{} (mode={:?}, reload={:#x})",
+                    count,
                     self.counters[0].borrow().mode,
                     self.counters[0].borrow().reload_value,
-                    self.counters[0].borrow().null_count
                 );
+            }
+            if let Some(cb) = self.irq_callback {
                 cb(0, true);
             }
         }

@@ -724,7 +724,7 @@ impl VirtualApicRegs {
             .SVR
             .is_set(SPURIOUS_INTERRUPT_VECTOR::APICSoftwareEnableDisable);
 
-        info!("[VLAPIC] write_lvt({offset}): raw_val={val:#010x}, apic_disabled={apic_disabled}");
+        trace!("[VLAPIC] write_lvt({offset}): raw_val={val:#010x}, apic_disabled={apic_disabled}");
 
         // Mask::Masked, Delivery Status:SendPending, Vector::SET(0xff)
         let mut mask = APIC_LVT_M | APIC_LVT_DS | APIC_LVT_VECTOR;
@@ -753,7 +753,7 @@ impl VirtualApicRegs {
 
                 let now_unmasked = (timer_val & APIC_LVT_M) == 0;
 
-                info!(
+                trace!(
                     "[VLAPIC] write LVT_TIMER: val={val:#010x}, timer_val={timer_val:#010x}, \
                      apic_disabled={apic_disabled}, was_masked={was_masked}, \
                      now_unmasked={now_unmasked}"
@@ -773,7 +773,7 @@ impl VirtualApicRegs {
                     let vector = (timer_val & 0xFF) as u8;
                     if vector > 0 {
                         let (_, vid) = self.virtual_timer.where_am_i();
-                        info!(
+                        trace!(
                             "[VLAPIC] LVT_TIMER unmasked with pending timer: vector={vector:#x}, \
                              vcpu={vid}"
                         );
@@ -884,7 +884,7 @@ impl VirtualApicRegs {
 
     fn write_icrtmr(&mut self) -> AxResult {
         let icr = self.regs().ICR_TIMER.get();
-        info!("[VLAPIC] write ICR_TIMER: initial_count={icr:#010x}");
+        trace!("[VLAPIC] write ICR_TIMER: initial_count={icr:#010x}");
         self.virtual_timer.write_icr(icr)
     }
 
@@ -981,7 +981,7 @@ impl VirtualApicRegs {
                 let lvt_last_val = self.lvt_last.lvt_timer.get();
                 let regs_val = self.regs().LVT_TIMER.get();
                 let timer_lvt_val = self.virtual_timer.read_lvt();
-                info!(
+                trace!(
                     "[VLAPIC] read LvtTimer: lvt_last={lvt_last_val:#010x}, \
                      regs={regs_val:#010x}, timer_lvt={timer_lvt_val:#010x}"
                 );
@@ -1020,7 +1020,7 @@ impl VirtualApicRegs {
             }
             ApicRegOffset::TimerCurCount => {
                 value = self.virtual_timer.read_ccr() as _;
-                info!("[VLAPIC] read TimerCurCount (CCR): {value:#010X}");
+                trace!("[VLAPIC] read TimerCurCount (CCR): {value:#010X}");
             }
             ApicRegOffset::TimerDivConf => {
                 value = self.regs().DCR_TIMER.get() as _;
@@ -1065,10 +1065,6 @@ impl VirtualApicRegs {
             }
             ApicRegOffset::SIVR => {
                 self.regs().SVR.set(data32);
-                info!(
-                    "[VLAPIC] write SVR: data={data32:#010x}, apic_enable={}",
-                    data32 & (1 << 8) != 0
-                );
                 self.write_svr()?;
             }
             ApicRegOffset::ESR => {
@@ -1101,16 +1097,12 @@ impl VirtualApicRegs {
                 self.write_lvt(offset)?;
             }
             ApicRegOffset::LvtTimer => {
-                info!(
+                trace!(
                     "[VLAPIC] handle_write LvtTimer: data={data32:#010x}, current \
                      LVT_TIMER={:#010x}",
                     self.regs().LVT_TIMER.get()
                 );
                 self.regs().LVT_TIMER.set(data32);
-                info!(
-                    "[VLAPIC] handle_write LvtTimer: after set, LVT_TIMER={:#010x}",
-                    self.regs().LVT_TIMER.get()
-                );
                 self.write_lvt(offset)?;
             }
             ApicRegOffset::LvtThermal => {
@@ -1143,10 +1135,6 @@ impl VirtualApicRegs {
                     );
                     return Ok(());
                 }
-                info!(
-                    "[VLAPIC] write TimerInitCount: data={data32:#010x}, timer_mode={:?}",
-                    self.timer_mode().unwrap_or(TimerMode::OneShot)
-                );
                 self.regs().ICR_TIMER.set(data32);
                 self.write_icrtmr()?;
             }

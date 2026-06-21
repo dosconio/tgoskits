@@ -219,6 +219,12 @@ impl PciConfigSpace {
             self.write_bar(bar_idx, offset, width, val);
             return;
         }
+        // Expansion ROM BAR (offset 0x30): no ROM present.
+        // Ignore all writes so readback always returns 0, indicating no ROM.
+        // This prevents Linux from assigning a bogus ROM BAR during sizing.
+        if offset >= PCI_EXPANSION_ROM as usize && offset < PCI_EXPANSION_ROM as usize + 4 {
+            return;
+        }
         let offset = offset & 0xFC;
         let mut data = self.data.lock();
         let bytes = width.size();

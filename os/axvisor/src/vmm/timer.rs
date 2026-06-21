@@ -95,12 +95,26 @@ pub fn cancel_timer(token: usize) {
 /// Check and process any pending timer events
 pub fn check_events() {
     let timer_list = unsafe { TIMER_LIST.current_ref_mut_raw() };
+    // Use monotonic_time() because timer deadlines are registered in
+    // monotonic time (based on current_ticks() / current_time_nanos()).
+    // Using wall_time() here would add epochoffset_nanos() (the RTC Unix
+    // timestamp) and make every deadline appear to be in the past.
+    //
+    // Snapshot the time once at the start so that timers registered during
+    // callback execution (e.g. a periodic vLAPIC timer that restarts itself)
+    // are not fired in the same check_events() call.  Their deadlines are
+    // computed from current_ticks() inside the callback, which is already
+    // later than `start_time`, so they will be > start_time and survive the
+    // expire_one(start_time) check.  This prevents an infinite loop when the
+    // callback takes longer than the timer interval.
+    let start_time = ax_hal::time::monotonic_time();
     loop {
-        let now = ax_hal::time::wall_time();
-        let event = timer_list.lock().expire_one(now);
+        let event = timer_list.lock().expire_one(start_time);
         if let Some((_deadline, event)) = event {
-            info!("[VMM-TIMER] check_events: firing timer at deadline={_deadline:?}, now={now:?}");
-            event.callback(now);
+            trace!(
+                "[VMM-TIMER] check_events: firing timer at deadline={_deadline:?}, now={start_time:?}"
+            );
+            event.callback(start_time);
         } else {
             break;
         }
